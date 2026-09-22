@@ -1225,7 +1225,7 @@ bool CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
 	}
-	if (args.base_vertex != 0 || args.first_instance != 0) {
+	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
 		     args.base_vertex, args.first_instance);
 	}
