@@ -1146,9 +1146,13 @@ bool FlipQueue::Flip(uint32_t micros) {
 	}
 	m_requests.front().state = RequestState::Presenting;
 	m_mutex.Unlock();
+	// The port is not locked while presenting (a present can wait for the swapchain): the GPU thread reserves the
+	// next flip under it. The presented frame is its own copy; a port closed meanwhile takes no status or event.
+	r.cfg->mutex.Unlock();
 
 	m_presenter.Present(*r.frame);
 
+	r.cfg->mutex.Lock();
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
 	    m_requests.front().state != RequestState::Presenting) {
@@ -1156,18 +1160,20 @@ bool FlipQueue::Flip(uint32_t micros) {
 	}
 	m_requests.pop_front();
 
-	r.cfg->flip_status.count++;
-	r.cfg->last_flip_vblank                     = r.cfg->vblank_status.count;
-	r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
-	r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
-	r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
-	r.cfg->flip_status.flipArg                  = r.flip_arg;
-	r.cfg->flip_status.currentBuffer            = r.index;
-	r.cfg->flip_status.flipPendingNum = static_cast<int>(m_requests.size() + m_cpu_requests.size());
-	if (r.source == FlipRequestSource::GpuEop && r.cfg->flip_status.gcQueueNum > 0) {
-		r.cfg->flip_status.gcQueueNum--;
+	if (r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation) {
+		r.cfg->flip_status.count++;
+		r.cfg->last_flip_vblank                     = r.cfg->vblank_status.count;
+		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
+		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
+		r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
+		r.cfg->flip_status.flipArg                  = r.flip_arg;
+		r.cfg->flip_status.currentBuffer            = r.index;
+		r.cfg->flip_status.flipPendingNum = static_cast<int>(m_requests.size() + m_cpu_requests.size());
+		if (r.source == FlipRequestSource::GpuEop && r.cfg->flip_status.gcQueueNum > 0) {
+			r.cfg->flip_status.gcQueueNum--;
+		}
+		TriggerVideoOutEvents(*r.cfg, VideoOutEventKind::Flip, reinterpret_cast<void*>(r.flip_arg));
 	}
-	TriggerVideoOutEvents(*r.cfg, VideoOutEventKind::Flip, reinterpret_cast<void*>(r.flip_arg));
 
 	m_processing = false;
 	m_done_cond_var.SignalAll();
