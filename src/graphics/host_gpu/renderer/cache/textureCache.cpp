@@ -645,13 +645,19 @@ bool TextureCache::PartialDirtyCandidate(const Image& image) {
 	       !info.HasStencil() && info.metadata.compression == VideoOutCompression::Uncompressed;
 }
 
+// An image the GPU wrote stays GPU-owned outside the invalidated span: its other bytes are the GPU's, the span is
+// uploaded from guest memory at the next use (RefreshImage -> InitializeImage takes the partial path; a depth array
+// uploads whole layers, UploadDepthPartial; a target binding refreshes it before the GPU writes again), as on the
+// console, where a CPU write or a remap replaces only those bytes. A whole-image invalidation uploaded everything from
+// memory, which does not hold what the GPU rendered. The game's streamed shadow-map array (80 layers, 320 MiB) remaps
+// and refills one layer at a time after rendering into others: the whole array went to the GPU again every few
+// seconds (100-270 ms frames) and the rendered layers were lost.
 bool TextureCache::TryInvalidatePartial(Image& image, uint64_t address, uint64_t size,
                                         uint64_t granule) {
 	const auto& info = image.info;
 	if (!PartialDirtyCandidate(image) || !image.registered || !image.IsTracked() ||
 	    image.track_addr != info.data.address || image.track_addr_end != info.data.End() ||
-	    !image.CanTakePartialDirty() || image.IsGpuModified() || image.IsBufferModified() ||
-	    image.IsStencilModified()) {
+	    !image.CanTakePartialDirty() || image.IsBufferModified() || image.IsStencilModified()) {
 		return false;
 	}
 	const auto base  = info.data.address;
