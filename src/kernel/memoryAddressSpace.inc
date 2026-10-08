@@ -666,21 +666,29 @@ public:
 		// KYTY_ALIAS_VERIFY: every answer is compared with the full rebuild it replaces.
 		static const bool verify = std::getenv("KYTY_ALIAS_VERIFY") != nullptr;
 		if (!verify) {
+			if (size == 0 || UINT64_MAX - vaddr < size) return false; // (as FindContainingUnlocked)
 			auto lock = MapReadLock();
-			// The answers until the mappings change (every change moves the epoch under the exclusive lock): the game's
-			// per-frame copies ask about the same ranges every frame, two cold tree lookups each (~400 a frame at 1-1).
-			struct Answer {
+			// The mapping over each 4 MiB of address and whether no byte of it is mapped twice (the usual case), kept until
+			// the mappings change (every change moves the epoch under the exclusive lock): any range in such a mapping is
+			// unique. The game asks about ~1000 ranges a frame, most of them new (ring buffers), in a few mappings: two cold
+			// tree lookups each.
+			struct Owner {
 				const GuestBackingStore* store;
-				uint64_t                 vaddr, size, epoch;
+				uint64_t                 epoch;
+				MapEntry                 entry;
 				bool                     unique;
 			};
-			thread_local std::array<Answer, 64> answers {};
-			auto& answer = answers[((vaddr >> 4u) ^ (vaddr >> 12u) ^ size) % answers.size()];
-			if (answer.store == this && answer.epoch == m_mapping_epoch && answer.vaddr == vaddr && answer.size == size)
-				return answer.unique;
-			const bool unique = IsUniqueRangeUnlocked(vaddr, size);
-			answer            = {this, vaddr, size, m_mapping_epoch, unique};
-			return unique;
+			thread_local std::array<Owner, 256> owners {};
+			auto& owner = owners[(vaddr >> 22u) % owners.size()];
+			if (owner.store != this || owner.epoch != m_mapping_epoch ||
+			    !GuestFreeRangeContains(owner.entry.vaddr, owner.entry.size, vaddr, size)) {
+				MapEntry entry {};
+				if (!FindContainingUnlocked(vaddr, size, &entry)) return false;
+				owner = {this, m_mapping_epoch, entry, CoverageUnique(entry.backing_offset, entry.backing_offset + entry.size)};
+			}
+			if (owner.unique) return true;
+			const auto physical = owner.entry.backing_offset + vaddr - owner.entry.vaddr;
+			return CoverageUnique(physical, physical + size);
 		}
 		std::lock_guard lock(m_mutex); // the full rebuild writes its intervals
 		const bool unique = IsUniqueRangeUnlocked(vaddr, size);
