@@ -667,7 +667,20 @@ public:
 		static const bool verify = std::getenv("KYTY_ALIAS_VERIFY") != nullptr;
 		if (!verify) {
 			auto lock = MapReadLock();
-			return IsUniqueRangeUnlocked(vaddr, size);
+			// The answers until the mappings change (every change moves the epoch under the exclusive lock): the game's
+			// per-frame copies ask about the same ranges every frame, two cold tree lookups each (~400 a frame at 1-1).
+			struct Answer {
+				const GuestBackingStore* store;
+				uint64_t                 vaddr, size, epoch;
+				bool                     unique;
+			};
+			thread_local std::array<Answer, 64> answers {};
+			auto& answer = answers[((vaddr >> 4u) ^ (vaddr >> 12u) ^ size) % answers.size()];
+			if (answer.store == this && answer.epoch == m_mapping_epoch && answer.vaddr == vaddr && answer.size == size)
+				return answer.unique;
+			const bool unique = IsUniqueRangeUnlocked(vaddr, size);
+			answer            = {this, vaddr, size, m_mapping_epoch, unique};
+			return unique;
 		}
 		std::lock_guard lock(m_mutex); // the full rebuild writes its intervals
 		const bool unique = IsUniqueRangeUnlocked(vaddr, size);
