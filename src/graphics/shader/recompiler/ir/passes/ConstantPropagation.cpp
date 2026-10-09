@@ -273,6 +273,24 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 		case ValueOpcode::BitCastF16U16: FoldBitCast(inst, ValueOpcode::BitCastU16F16); return;
 		case ValueOpcode::BitCastU32F32: FoldBitCast(inst, ValueOpcode::BitCastF32U32); return;
 		case ValueOpcode::BitCastF32U32: FoldBitCast(inst, ValueOpcode::BitCastU32F32); return;
+		case ValueOpcode::FPCmpClass32: {
+			const auto value = Arg(inst, 0);
+			const auto mask  = Arg(inst, 1);
+			if (!IsImmediate(mask, Type::U32)) {
+				return;
+			}
+			switch (mask.U32()) {
+				case 0u: Replace(inst, Value(false)); return;
+				case 3u: {
+					const auto is_nan = block.PrependNewInst(
+					    instruction, ValueOpcode::FPIsNan32, {value});
+					Replace(inst, Value(&*is_nan));
+					return;
+				}
+				case 0x3ffu: Replace(inst, Value(true)); return;
+				default: return;
+			}
+		}
 		case ValueOpcode::ConvertU16U32: {
 			const auto value = Arg(inst, 0);
 			if (IsImmediate(value, Type::U32)) {

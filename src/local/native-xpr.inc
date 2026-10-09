@@ -203,6 +203,10 @@ struct RenderExecutor::NativeXprDrawState {
 	mutable uint64_t                 meta_epoch = 0;
 	// Texture cache resolution epoch under which the targets were what a lookup finds (0: not yet).
 	mutable uint64_t                 targets_epoch = 0;
+	// Successful target-current proof for the opt-in memo (0: not yet).
+	mutable uint64_t                 targets_checked = 0;
+	// Only registered targets participate in the texture cache's lifetime epoch.
+	bool                             targets_registered = true;
 };
 
 // One object: its resources under the compiled programs it was translated with.
@@ -1598,6 +1602,7 @@ void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRend
 		const auto& desc  = state.color_info[i].desc;
 		const auto& view  = desc.view_info;
 		const auto& image = textures.GetImage(state.color_info[i].image_id);
+		draw_state.targets_registered &= image.registered && !image.info.data.Empty();
 		draw_state.targets.push_back({state.color_info[i].image_id,
 		                              rendering.color_attachments[i].image_layout,
 		                              image.binding.attachment_access,
@@ -1608,6 +1613,7 @@ void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRend
 		const auto& desc  = state.depth_info.desc;
 		const auto& view  = desc.view_info;
 		const auto& image = textures.GetImage(state.depth_info.image_id);
+		draw_state.targets_registered &= image.registered && !image.info.data.Empty();
 		draw_state.targets.push_back({state.depth_info.image_id,
 		                              rendering.depth_stencil_attachment.image_layout,
 		                              image.binding.attachment_access,
@@ -2908,19 +2914,56 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 // now), and a newer image with the same backing as a target is what the registers now select: the
 // normal path captures the state again.
 bool RenderExecutor::NativeXprTargetsCurrent(const NativeXprDrawState& draw_state) {
-	auto& textures = m_context.GetTextureCache();
-	for (const auto& target: draw_state.targets) {
-		const auto* image = textures.m_slot_images.try_get(target.id);
-		if (image == nullptr || image->serial != target.serial) return false;
-	}
-	if (draw_state.targets_epoch != textures.ResolutionEpoch()) {
-		uint64_t proven = UINT64_MAX;
+	auto&      textures = m_context.GetTextureCache();
+	const auto mode = [] {
+		static const int value = [] {
+			const auto* text = std::getenv("KYTY_NATIVE_TARGET_CHECK_CACHE");
+			return text != nullptr && text[0] == '1' && text[1] == '\0' ? 1
+			     : text != nullptr && text[0] == '2' && text[1] == '\0' ? 2 : 0;
+		}();
+		return value;
+	}();
+	const auto checked = textures.ResolutionEpoch();
+	const bool cache_eligible = mode != 0 && checked != 0 && draw_state.targets_registered;
+	const bool memo_hit = cache_eligible && draw_state.targets_checked == checked;
+	// RegisterImage and UnregisterImage advance the epoch before a registered slot
+	// can be retired or reused. EmitTargets still performs the live GPU-ownership,
+	// serial, rebind and metadata checks; these are not covered by this memo.
+	if (memo_hit && mode == 1) return true;
+	const auto full_check = [&] {
 		for (const auto& target: draw_state.targets) {
-			auto epoch = draw_state.targets_epoch;
-			if (!textures.IsTargetCurrent(target.id, target.requested, epoch)) return false;
-			proven = std::min(proven, epoch);
+			const auto* image = textures.m_slot_images.try_get(target.id);
+			if (image == nullptr || image->serial != target.serial) return false;
 		}
-		draw_state.targets_epoch = proven != UINT64_MAX ? proven : textures.ResolutionEpoch();
+		if (draw_state.targets_epoch != textures.ResolutionEpoch()) {
+			uint64_t proven = UINT64_MAX;
+			for (const auto& target: draw_state.targets) {
+				auto epoch = draw_state.targets_epoch;
+				if (!textures.IsTargetCurrent(target.id, target.requested, epoch)) return false;
+				proven = std::min(proven, epoch);
+			}
+			draw_state.targets_epoch = proven != UINT64_MAX ? proven : textures.ResolutionEpoch();
+		}
+		return true;
+	};
+	const bool current = full_check();
+	if (memo_hit && mode == 2 && !current) {
+		EXIT("KYTY_NATIVE_TARGET_CHECK_CACHE=2: memoized target-current result disagreed with full validation\n");
+	}
+	if (memo_hit && mode == 2) {
+		// Only the verification mode reports coverage; normal draws pay no logging cost.
+		static uint64_t verified_hits = 0;
+		if (++verified_hits == 1 || verified_hits % 65536 == 0) {
+			std::printf("Native target check cache: verified hits=%" PRIu64 "\n", verified_hits);
+		}
+	}
+	if (!current) {
+		draw_state.targets_checked = 0;
+		return false;
+	}
+	if (cache_eligible) {
+		const auto validated = textures.ResolutionEpoch();
+		draw_state.targets_checked = validated != 0 && draw_state.targets_epoch == validated ? validated : 0;
 	}
 	return true;
 }

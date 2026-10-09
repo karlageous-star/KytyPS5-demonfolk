@@ -559,6 +559,23 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
 
+add_executable(float_class_fold_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FloatClassFoldTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/Block.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/Value.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ConstantPropagation.cpp"
+)
+target_compile_definitions(float_class_fold_tests PRIVATE KYTY_FINAL)
+target_include_directories(float_class_fold_tests PRIVATE ${inc_headers})
+
+add_executable(spirv_local_arrays_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SpirvLocalArraysTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/spirvLocalArrays.cpp"
+)
+target_link_libraries(spirv_local_arrays_tests spirv-tools)
+target_include_directories(spirv_local_arrays_tests PRIVATE ${inc_headers})
+
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/BdaReadPlan.cpp"

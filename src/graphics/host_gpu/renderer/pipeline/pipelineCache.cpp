@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/spirvLocalArrays.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -696,8 +697,32 @@ struct PipelineCache::ProgramCache {
 		}
 
 		vk::ShaderModuleCreateInfo create_info {};
-		create_info.codeSize    = spirv.size() * sizeof(uint32_t);
-		create_info.pCode       = spirv.data();
+		// Keep recorded SPIR-V unchanged. Only the driver module uses this optional
+		// reduction, and both forms must validate before a reduced array is used.
+		static const bool shrink_arrays = [] {
+			const auto* value = std::getenv("KYTY_FUNCTION_ARRAY_SHRINK");
+			return value != nullptr && std::string_view(value) == "1";
+		}();
+		std::vector<uint32_t> driver_spirv;
+		const auto* words = &spirv;
+		if (shrink_arrays) {
+			const auto reduced = SpirvLocalArrays::Shrink(spirv, driver_spirv);
+			if (reduced.changed) {
+				spvtools::SpirvTools validator(SPV_ENV_VULKAN_1_3);
+				if (validator.Validate(spirv) && validator.Validate(driver_spirv)) {
+					words = &driver_spirv;
+					std::printf("Function array shrink: %s hash=0x%016" PRIx64
+					            " arrays=%zu declared_bytes=%" PRIu64 "->%" PRIu64 "\n",
+					            stage_name, options.shader_hash, reduced.arrays.size(),
+					            reduced.bytes_before, reduced.bytes_after);
+				} else {
+					std::printf("Function array shrink: validation declined %s hash=0x%016" PRIx64
+					            "; using original module\n", stage_name, options.shader_hash);
+				}
+			}
+		}
+		create_info.codeSize    = words->size() * sizeof(uint32_t);
+		create_info.pCode       = words->data();
 		vk::ShaderModule module = nullptr;
 		RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
 		                     "create recompiled shader module");
