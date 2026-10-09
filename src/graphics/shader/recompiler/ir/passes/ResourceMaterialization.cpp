@@ -390,8 +390,10 @@ private:
 	std::vector<uint32_t>        m_keys;
 };
 
+// `enumeration`: what made the candidates, a description made only for a summary of dropped classes.
+template <typename Describe>
 bool FinishIndirectImage(const ImageResource& image, std::vector<DescriptorValue>& probed,
-                         bool over_approximates, std::string enumeration, IndirectImage& next,
+                         bool over_approximates, const Describe& enumeration, IndirectImage& next,
                          std::string* reason) {
 	std::vector<IndirectImageClass> classes;
 	std::vector<uint32_t>           tally;
@@ -423,7 +425,7 @@ bool FinishIndirectImage(const ImageResource& image, std::vector<DescriptorValue
 			next.dropped_shapes = static_cast<uint32_t>(classes.size() - 1u);
 		}
 		next.dropped_summary =
-		    fmt::format("{} {}={}", std::move(enumeration),
+		    fmt::format("{} {}={}", enumeration(),
 		                over_approximates ? "kept" : "exact probe, refused",
 		                ClassText(classes[dominant]));
 		for (uint32_t index = 0; index < classes.size(); index++) {
@@ -507,8 +509,10 @@ bool MaterializeDenseIndirectImage(const DescriptorSource::IndirectImage& indire
 		probed.push_back(candidate);
 	}
 	if (!FinishIndirectImage(image, probed, true,
-	                         fmt::format("dense table=0x{:x} entries={}", indirect.table_offset,
-	                                     indirect.key_bound),
+	                         [&] {
+		                         return fmt::format("dense table=0x{:x} entries={}", indirect.table_offset,
+		                                            indirect.key_bound);
+	                         },
 	                         next, reason)) {
 		return false;
 	}
@@ -541,14 +545,35 @@ bool MaterializeAddressProbeIndirectImage(const DescriptorSource::IndirectImage&
 	MakeRangeReadable(runtime, material_base + indirect.selector_offset,
 	                  (records - 1u) * indirect.selector_stride + sizeof(uint32_t));
 	KeyOrder keys(records);
-	for (uint64_t item = 0; item < records; item++) {
-		const auto address =
-		    material_base + indirect.selector_offset + item * indirect.selector_stride;
-		uint32_t key = 0;
-		if (address > AddressMask || !ReadSpecializationWord(runtime, address, key)) {
-			return note("record key is not readable");
+	// The keys of a span of records in one clean read (one GPU-ownership check for the span instead of one a key:
+	// 32 records of a light table lie within 5 KiB, read for each of its dispatches), word by word where the span
+	// read is refused (as before: the same keys, in the same order).
+	constexpr uint64_t SpanDwords = 1024; // (ReadShaderMemorySpan's limit for clean reads)
+	thread_local std::vector<uint32_t> span;
+	const uint64_t span_records = runtime.try_read_memory_span != nullptr && indirect.selector_stride % 4u == 0u &&
+	                                      indirect.selector_stride <= (SpanDwords - 1u) * 4u
+	                                  ? (SpanDwords - 1u) * 4u / indirect.selector_stride + 1u
+	                                  : 1u;
+	for (uint64_t item = 0; item < records;) {
+		const auto first = material_base + indirect.selector_offset + item * indirect.selector_stride;
+		const auto count = std::min<uint64_t>(records - item, span_records);
+		const auto words = ((count - 1u) * indirect.selector_stride) / 4u + 1u;
+		if (count > 1u && first <= AddressMask - (words - 1u) * 4u) {
+			span.resize(words);
+			if (runtime.try_read_memory_span(runtime.userdata, first, span.data(), static_cast<uint32_t>(words), true)) {
+				for (uint64_t i = 0; i < count; i++) keys.Add(span[i * indirect.selector_stride / 4u]);
+				item += count;
+				continue;
+			}
 		}
-		keys.Add(key);
+		for (const auto end = item + count; item < end; item++) {
+			const auto address = material_base + indirect.selector_offset + item * indirect.selector_stride;
+			uint32_t   key     = 0;
+			if (address > AddressMask || !ReadSpecializationWord(runtime, address, key)) {
+				return note("record key is not readable");
+			}
+			keys.Add(key);
+		}
 	}
 
 	IndirectImage next;
@@ -572,9 +597,11 @@ bool MaterializeAddressProbeIndirectImage(const DescriptorSource::IndirectImage&
 		probed.push_back(candidate);
 	}
 	if (!FinishIndirectImage(image, probed, true,
-	                         fmt::format("address probe records={} stride={} table=0x{:x} keys={}",
-	                                     indirect.item_bound, indirect.selector_stride,
-	                                     indirect.table_offset, next.keys.size()),
+	                         [&] {
+		                         return fmt::format("address probe records={} stride={} table=0x{:x} keys={}",
+		                                            indirect.item_bound, indirect.selector_stride,
+		                                            indirect.table_offset, next.keys.size());
+	                         },
 	                         next, reason)) {
 		return false;
 	}
@@ -658,9 +685,10 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 		probed.push_back(candidate);
 	}
 	if (!FinishIndirectImage(image, probed, step < indirect.selector_stride,
-	                         fmt::format("stride={} step={} probes={} keys={}",
-	                                     indirect.selector_stride, step, probe_count,
-	                                     next.keys.size()),
+	                         [&] {
+		                         return fmt::format("stride={} step={} probes={} keys={}", indirect.selector_stride,
+		                                            step, probe_count, next.keys.size());
+	                         },
 	                         next, reason)) {
 		return false;
 	}
