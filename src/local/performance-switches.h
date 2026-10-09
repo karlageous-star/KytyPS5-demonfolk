@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 extern "C" {
@@ -156,6 +157,13 @@ inline void InitializePerformanceSwitches() {
 		LocalPlatform::PinThreadToCpuList(cpus);
 		enabled += std::string(enabled.empty() ? "" : " ") + "KYTY_RENDER_CPUS=" + cpus;
 	}
+	// Above the game's threads (KYTY_RENDER_PRIORITY=0: normal). Walking into a new area, the game's threads
+	// streaming it in held the render CPUs for whole time slices: frames of 35-50 ms where the render thread
+	// ran 10-14 ms, its samples parked for 20-26 ms at one instruction.
+	if (const char* priority = std::getenv("KYTY_RENDER_PRIORITY"); priority == nullptr || std::strcmp(priority, "0") != 0)
+		LocalPlatform::MakeCriticalThread();
+	else
+		enabled += std::string(enabled.empty() ? "" : " ") + "KYTY_RENDER_PRIORITY=0";
 	if (!enabled.empty()) {
 		std::printf("Performance switches: %s\n", enabled.c_str());
 		std::fflush(stdout);

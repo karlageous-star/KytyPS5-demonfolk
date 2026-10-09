@@ -36,6 +36,9 @@ bool CurrentThreadStack(uint64_t* low, uint64_t* high);
 // Below-normal priority for the calling thread, kept off the CPUs of a list (KYTY_RENDER_CPUS; null
 // or empty: any CPU): background work that must not hold up the game's threads.
 void MakeBackgroundThread(const char* avoid_cpus);
+// The calling thread above the normal priority of the game's threads (Windows: THREAD_PRIORITY_HIGHEST; Linux:
+// unchanged): the render thread, which every frame waits for, is not time-sliced against them on its CPUs.
+void MakeCriticalThread();
 
 // The PC's physical memory in bytes; 0 when unknown.
 uint64_t PhysicalMemory();
