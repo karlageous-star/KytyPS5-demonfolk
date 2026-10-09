@@ -37,6 +37,9 @@ bool CurrentThreadStack(uint64_t* low, uint64_t* high);
 // or empty: any CPU): background work that must not hold up the game's threads.
 void MakeBackgroundThread(const char* avoid_cpus);
 
+// The PC's physical memory in bytes; 0 when unknown.
+uint64_t PhysicalMemory();
+
 // A temporary file for scratch data, deleted when it is closed or the process ends (Windows keeps it
 // in memory while it can: FILE_ATTRIBUTE_TEMPORARY); 0 when none could be made. Writes and reads go
 // to any offset, from any thread.

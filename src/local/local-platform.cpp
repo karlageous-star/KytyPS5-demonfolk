@@ -293,6 +293,12 @@ void MakeBackgroundThread(const char* avoid_cpus) {
 		(void)SetThreadAffinityMask(GetCurrentThread(), process & ~avoid);
 }
 
+uint64_t PhysicalMemory() {
+	MEMORYSTATUSEX status {};
+	status.dwLength = sizeof(status);
+	return GlobalMemoryStatusEx(&status) != 0 ? status.ullTotalPhys : 0;
+}
+
 uint64_t OpenScratchFile() {
 	wchar_t directory[MAX_PATH + 1] {}, path[MAX_PATH + 1] {};
 	if (GetTempPathW(MAX_PATH + 1, directory) == 0 || GetTempFileNameW(directory, L"kyt", 0, path) == 0) return 0;
@@ -448,6 +454,12 @@ void MakeBackgroundThread(const char* avoid_cpus) {
 }
 
 // Handles are the file descriptor + 1 (0: none).
+uint64_t PhysicalMemory() {
+	const long pages = sysconf(_SC_PHYS_PAGES);
+	const long size  = sysconf(_SC_PAGE_SIZE);
+	return pages > 0 && size > 0 ? static_cast<uint64_t>(pages) * static_cast<uint64_t>(size) : 0;
+}
+
 uint64_t OpenScratchFile() {
 	const char* directory = std::getenv("TMPDIR");
 	std::string path      = std::string(directory != nullptr && *directory != '\0' ? directory : "/tmp") + "/kyty-XXXXXX";

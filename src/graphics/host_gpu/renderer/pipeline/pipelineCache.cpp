@@ -1498,8 +1498,22 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 				}
 			}
 		}
-		m_program_cache->Warm(path, title + device, std::string_view(warmup) == "1", adopt_from);
-		if (std::string_view(warmup) == "1") {
+		// A PC with under 24 GiB of RAM records the shaders but translates and builds none at start-up
+		// (as KYTY_SHADER_WARMUP=record): their SPIR-V, modules and pipelines took ~3 GiB of RAM, ~5 GiB of
+		// commit and ~1 GiB of video memory on top of the ~10 GB the game takes, and the static prefetch
+		// translates every shader in the background anyway (chenxiao 5cf2f6d1, 4a59e94c: 16 GB at 1-1, +76 MiB
+		// instead of +3181, the same frame rate). Pipelines then come from the driver cache or the static
+		// binaries when first drawn. KYTY_WARMUP_LOW_RAM=0: the full warmup on such a PC too.
+		constexpr uint64_t WarmupMinRam = uint64_t {24} << 30u;
+		const uint64_t     ram          = LocalPlatform::PhysicalMemory();
+		const char*        low_ram_env  = std::getenv("KYTY_WARMUP_LOW_RAM");
+		const bool         low_ram      = (low_ram_env == nullptr || std::string_view(low_ram_env) != "0") && ram != 0 &&
+		                       ram < WarmupMinRam;
+		const bool compile = std::string_view(warmup) == "1" && !low_ram;
+		if (low_ram && std::string_view(warmup) == "1")
+			PipelineCacheLog("Shader warmup: recording only (RAM {} MiB)", ram >> 20u);
+		m_program_cache->Warm(path, title + device, compile, adopt_from);
+		if (compile) {
 			const auto begin = std::chrono::steady_clock::now();
 			WarmPipelines();
 			// What the driver had to compile is kept at once: the cache is otherwise written only
