@@ -4049,18 +4049,33 @@ void TextureCache::RunGarbageCollector() {
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
 		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
-		// Below the critical mark an image must also have been unused for a while: 3 s under pressure
-		// (oldest first, until usage is under the mark), 30 s otherwise. Near the budget the frame age
-		// alone still applies.
-		uint64_t below = tick - age;
-		if (!aggressive) {
-			below = std::min(below, m_tick_history.TickSecondsAgo(pressured ? 3.0 : 30.0));
-		}
+		// An image must also have been unused for a while: 10 s under pressure and near the budget
+		// (oldest first, until usage is under the mark), 30 s otherwise. With deletions working,
+		// chenxiao measured images behind a turned camera coming back after a few seconds at 160
+		// flips (5-7 MB of uploads a frame, 1% low 47 -> 27 fps) and none at 600 (~10 s).
+		const uint64_t below = std::min(tick - age, m_tick_history.TickSecondsAgo(pressured ? 10.0 : 30.0));
+		// An image the collector keeps (a depth image with its stencil association; one the GPU wrote
+		// that is tiled, or any GPU-written one below the pressure mark: no download for its data) is
+		// passed over, not counted. Never used again, kept images stay at the front of the list, and
+		// counting them meant every flip examined the same ones and deleted nothing while video memory
+		// only grew (chenxiao 45beec32: 60 candidates, 58 tiled and 2 depth, 0 deletions).
+		const auto keeps = [&](const Image* owner) {
+			if (owner == nullptr || !owner->registered || owner->depth_id) {
+				return true;
+			}
+			if (owner->IsGpuModified() && SafeToDownload(*owner) && (owner->info.IsTiled() || !pressured)) {
+				return true;
+			}
+			return false;
+		};
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
 		// first.
 		m_lru_cache.ForEachItemBelow(below, [&](ImageId id) {
+			if (keeps(m_slot_images.try_get(id))) {
+				return false;
+			}
 			candidates.push_back(id);
 			return candidates.size() == deletions;
 		});
