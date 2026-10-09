@@ -89,9 +89,12 @@ function Start-Worker([string]$name, [string[]]$arguments) {
         -RedirectStandardError (Join-Path $logs "$name.err.log")
     try {
         $null = $process.Handle
-        $job.Add($process.Handle)
-        if (!$process.HasExited) { $process.PriorityClass = [Diagnostics.ProcessPriorityClass]::BelowNormal }
+        if (!$process.HasExited) {
+            $job.Add($process.Handle)
+            if (!$process.HasExited) { $process.PriorityClass = [Diagnostics.ProcessPriorityClass]::BelowNormal }
+        }
     } catch {
+        if ($process.HasExited) { return $process }
         if (!$process.HasExited) { $process.Kill(); $process.WaitForExit() }
         throw
     }
@@ -179,6 +182,7 @@ try {
     # This emulator names static caches by title. Preserve that title's previous version when
     # the remembered game changes, rather than silently mixing pipeline inputs from two versions.
     $cacheOwnerPath = Join-Path $work "cache-owner-$title.json"
+    $owner = $null
     if (Test-Path -LiteralPath $cacheOwnerPath) {
         $owner = Get-Content -LiteralPath $cacheOwnerPath -Raw | ConvertFrom-Json
         if ($owner.version -ne $version) {
@@ -186,6 +190,12 @@ try {
             New-Item -ItemType Directory -Force -Path $backup | Out-Null
             foreach ($file in @(Get-ChildItem -LiteralPath $cache -File | Where-Object { $_.Name.StartsWith("$title.") })) {
                 Move-Item -LiteralPath $file.FullName -Destination (Join-Path $backup $file.Name)
+            }
+            $recordingRoot = Join-Path $root '_PipelineCache\warmup-v2'
+            foreach ($file in @(Get-ChildItem -LiteralPath $recordingRoot -Filter "$title.shaders" -Recurse -File -ErrorAction SilentlyContinue)) {
+                $savedRecording = Join-Path $backup $file.Directory.Name
+                New-Item -ItemType Directory -Force -Path $savedRecording | Out-Null
+                Move-Item -LiteralPath $file.FullName -Destination (Join-Path $savedRecording $file.Name)
             }
         }
     }
@@ -205,7 +215,7 @@ try {
     $recordingRoot = Join-Path $root '_PipelineCache\warmup-v2'
     $recording = Get-ChildItem -LiteralPath $recordingRoot -Filter "$title.shaders" -Recurse -File -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if ($recording -and (!(Test-Path -LiteralPath $cacheOwnerPath) -or $owner.version -eq $version -or !$owner)) {
+    if ($recording) {
         $recorded = Join-Path $work "recorded-$title-$version.seeds"
         Export-RecordedSeeds $recording.FullName $recorded
         $recordedShards = [Math]::Max(1, [Math]::Floor($Shards / 16))
