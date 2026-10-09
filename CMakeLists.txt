@@ -559,6 +559,12 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
 
+add_executable(clear_register_decode_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ClearRegisterDecodeTests.cpp"
+)
+target_link_libraries(clear_register_decode_tests Vulkan::Headers)
+target_include_directories(clear_register_decode_tests PRIVATE ${inc_headers})
+
 add_executable(float_class_fold_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/FloatClassFoldTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/Block.cpp"

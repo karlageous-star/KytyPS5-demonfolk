@@ -71,6 +71,28 @@ void TestWideScalarAndPackedFormats() {
 	CheckFloat4(clear, 1.0f, 1.0f, 1.0f, 1.0f, "B10G11R11 packed channel order");
 }
 
+void TestAllHalfFloatPatterns() {
+	for (uint32_t bits = 0; bits <= 0xffffu; ++bits) {
+		vk::ClearColorValue clear {};
+		Check(DecodePackedColorClear64(vk::Format::eR16Sfloat, bits, 0, clear),
+		      "all half-float encodings decode");
+		const auto exponent = (bits >> 10u) & 31u;
+		const auto mantissa = bits & 1023u;
+		const auto negative = (bits & 0x8000u) != 0;
+		if (exponent == 31u) {
+			Check(mantissa != 0 ? std::isnan(clear.float32[0]) : std::isinf(clear.float32[0]),
+			      "half infinity and NaN classes preserved");
+		} else {
+			const auto magnitude = exponent == 0 ? std::ldexp(static_cast<float>(mantissa), -24)
+			    : std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f,
+			                 static_cast<int>(exponent) - 15);
+			Check(clear.float32[0] == (negative ? -magnitude : magnitude),
+			      "normal and subnormal half values preserved");
+		}
+		Check(std::signbit(clear.float32[0]) == negative, "half sign preserved including zero");
+	}
+}
+
 void TestWideIntegerAndFloatWords() {
 	vk::ClearColorValue clear {};
 	Check(DecodeColorRegisterClear(vk::Format::eR32G32Uint, 0x12345678u, 0x9abcdef0u, true,
@@ -115,6 +137,7 @@ int main() {
 	TestMetadataEqualityIncludesWord1();
 	TestRgba16FloatWordsAndOptIn();
 	TestWideScalarAndPackedFormats();
+	TestAllHalfFloatPatterns();
 	TestWideIntegerAndFloatWords();
 	TestLegacyFormatsAndSwizzles();
 	std::puts("ClearRegisterDecodeTests: all passed");
