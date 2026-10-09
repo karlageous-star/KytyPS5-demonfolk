@@ -44,6 +44,13 @@ pointer aliases, valid Phi cycles, duplicate IDs, and every incomplete prefix of
 Illegal pointer initializers, Function OpPtrAccessChain, and direct arithmetic cycles are explicitly
 marked parser-safety fixtures and must fail validation before checking conservative fallback.
 
-This sidecar has no CMake or renderer integration, initialization policy, or default-on switch.
-The tests have been authored and reviewed but not built or executed here; main owns the candidate
-build and test run before game use.
+`KYTY_FUNCTION_ARRAY_SHRINK=1` applies this pass to recompiled guest shader modules in
+ProgramCache::CreateModule. The original and reduced modules both undergo Vulkan 1.3 validation
+even when ordinary shader validation is disabled. Failed validation uses the original module;
+recorded warmup SPIR-V remains unchanged. The conservative subgroup bound is 128. Declared byte
+counts in the log describe shader declarations, not measured VRAM savings. The option defaults off.
+
+The standalone `spirv_local_arrays_tests` built and passed on October 9, 2026. Game qualification
+is separate: require same-scene visual checks, repeated ASTRO boots beyond the prior device-loss
+transition, and DS gameplay before adopting a player profile. First use may compile new driver
+pipelines because their module bytes differ.

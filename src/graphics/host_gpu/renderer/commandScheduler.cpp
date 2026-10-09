@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "async-upload.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -13,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 extern "C" {
@@ -311,7 +313,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 	}
 }
 
-void CommandScheduler::PopPendingOperations() {
+void CommandScheduler::PopPendingOperations(bool at_draw_entry) {
 	// The pending queue is empty for the large majority of draws and dispatches.
 	// Refresh() issues a Vulkan timeline query and the drain takes the operation
 	// mutex, so let an atomic count prove there is nothing to retire first. The
@@ -320,7 +322,18 @@ void CommandScheduler::PopPendingOperations() {
 	    m_pending_operation_count.load(std::memory_order_acquire) == 0) {
 		return;
 	}
-	m_master.Refresh();
+	// Merge the reference build's timeline-query throttle with this branch's
+	// empty-queue hint. Explicit drains still refresh and wait every time.
+	static const bool throttle = [] {
+		const auto* value = std::getenv("KYTY_PENDING_REFRESH_THROTTLE");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	const auto now = Common::Timer::QueryPerformanceCounter();
+	if (!throttle || !at_draw_entry || m_last_pending_refresh == 0 ||
+	    now - m_last_pending_refresh >= Common::Timer::QueryPerformanceFrequency() / 5000) {
+		m_master.Refresh();
+		m_last_pending_refresh = now;
+	}
 	for (;;) {
 		PendingOperation operation;
 		{
