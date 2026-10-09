@@ -1651,8 +1651,8 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 	}
 	if (!native_calls.empty()) {
 		const auto base = reinterpret_cast<uintptr_t>(module->start);
-		std::printf("Red-zone patching: %zu guest calls left native (no RSP move), first at", native_calls.size());
-		for (size_t i = 0; i < native_calls.size() && i < 16; ++i) {
+		std::printf("Red-zone patching: %zu guest calls left native (no RSP move):", native_calls.size());
+		for (size_t i = 0; i < native_calls.size() && i < 128; ++i) {
 			std::printf(" +0x%" PRIx64, static_cast<u64>(native_calls[i] - base));
 		}
 		std::printf("\n");
