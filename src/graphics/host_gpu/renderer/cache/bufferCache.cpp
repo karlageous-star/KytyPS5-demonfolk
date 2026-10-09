@@ -1077,7 +1077,8 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 			for (const auto& copy: batch) {
 				const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
 				download.CopyFrom(m_scheduler.Current(), *copy.buffer, source_begin, base_offset + cursor,
-				                  envelope_size, vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
+				                  envelope_size, vk::AccessFlagBits::eMemoryWrite,
+				                  vk::AccessFlagBits::eTransferWrite,
 				                  vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
 				                  vk::AccessFlagBits::eHostRead);
 				cursor += AlignDownload(envelope_size);
