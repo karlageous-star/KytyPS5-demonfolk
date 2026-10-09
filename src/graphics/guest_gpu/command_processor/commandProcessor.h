@@ -184,6 +184,8 @@ private:
 	bool     m_ce_complete = false;
 
 	uint32_t m_const_ram[0x3000] = {0};
+	// All words at or above this limit remain zero between resets.
+	uint32_t m_const_ram_used = 0;
 
 	FlipInfo  m_flip;
 	const int m_interrupt_event_id;

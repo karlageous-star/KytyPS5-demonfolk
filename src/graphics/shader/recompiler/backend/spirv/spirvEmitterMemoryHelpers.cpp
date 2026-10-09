@@ -56,13 +56,16 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 }
 
 void EmitMemoryOffsets(EmitterState& state) {
-	for (uint32_t i = 0; i < state.program.bindings.memory_offset_count; i++) {
+	for (uint32_t i = 0; i < state.program.bindings.memory_offset_count; i += 4u) {
 		const auto word =
 		    EmitShaderDataDwordLoad(state, state.program.bindings.memory_offset_dword + i / 4u);
-		const auto shift             = ConstantU32(state, (i % 4u) * 8u);
-		state.memory_byte_offsets[i] = EmitBinaryU32(
-		    state, OpBitwiseAnd, EmitBinaryU32(state, OpShiftRightLogical, word, shift),
-		    ConstantU32(state, 0xffu));
+		// Upstream 13e3ca31: one shader-data load serves four packed byte offsets.
+		for (uint32_t lane = 0; lane < std::min(4u, state.program.bindings.memory_offset_count - i); ++lane) {
+			const auto shift = ConstantU32(state, lane * 8u);
+			state.memory_byte_offsets[i + lane] = EmitBinaryU32(
+			    state, OpBitwiseAnd, EmitBinaryU32(state, OpShiftRightLogical, word, shift),
+			    ConstantU32(state, 0xffu));
+		}
 	}
 	for (uint32_t i = 0; i < state.program.bindings.buffer_word_count; i++) {
 		state.buffer_words[i] = EmitShaderDataDwordLoad(state, state.program.bindings.BufferWordDword() + i);

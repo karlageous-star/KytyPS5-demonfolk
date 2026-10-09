@@ -16484,6 +16484,12 @@ void CompareGraphicsWords(const GraphicsCase &test,
 
 void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->SubgroupSize() : 64u);
+  if (std::string_view(test.name).starts_with("NativeMisalignedBufferByteExact_")) {
+    Require(test.name, "misaligned descriptor specialization",
+            compiled.program.info.buffers.size() == 1 &&
+                compiled.program.info.buffers[0].byte_base_offset,
+            "fixture must exercise one shared byte-offset descriptor for loads and stores");
+  }
   if (test.image_descriptor_swizzle != DstSel(4, 5, 6, 7) &&
       !compiled.program.info.images.empty()) {
     Require(test.name, "resource specialization",
@@ -22406,7 +22412,10 @@ TestCase NativeMisalignedBufferByteExact(u32 base_remainder) {
   };
   const auto emit_store = [&](u32 opcode, u32 src, u32 offset) {
     AppendVMovU32(&code, 20, offset);
-    AppendBufferStoreOpcode(&code, opcode, src, 20);
+    // The common store helper uses s48; this fixture must read and write the
+    // same misaligned descriptor in s0, including its packed byte displacement.
+    code.push_back(EncodeMubuf0(opcode, 0, false, true));
+    code.push_back(EncodeMubuf1(src, 0, 20));
   };
 
   emit_load(0x0c, 0, 0);                         // raw dword at the base remainder
@@ -22465,6 +22474,7 @@ TestCase NativeMisalignedBufferByteExact(u32 base_remainder) {
   test.storage_buffer_offsets = {base_remainder};
   test.user_data = MakeNativeUserData(nullptr);
   test.user_data[0] = base_remainder;
+  test.user_data[2] = static_cast<u32>(test.initial.size() * sizeof(u32)) - base_remainder;
   test.has_user_data = true;
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_LOAD_USHORT,
                   O::BUFFER_LOAD_SSHORT, O::BUFFER_STORE_DWORD, O::BUFFER_STORE_SHORT,
@@ -31042,6 +31052,37 @@ void CheckVulkan13FeatureRequirements() {
   std::printf("[host]    %-32s ok\n", "Vulkan13FeatureRequirements");
 }
 
+void CheckConstRamReset(RenderContext &renderer) {
+  CommandProcessor processor(renderer, 0);
+  constexpr u32 words = 0x3000;
+  std::array<u32, words> actual{};
+  const auto check_zero = [&] {
+    actual.fill(0xdeadbeefu);
+    processor.DumpConstRam(actual.data(), 0, words);
+    Require("ConstRamReset", "zero state",
+            std::ranges::all_of(actual, [](u32 value) { return value == 0; }),
+            "reset left a stale word in constant RAM");
+  };
+  check_zero();
+  const std::array<u32, 3> low{0x12345678u, 0xabcdef01u, 0xdeadbeefu};
+  processor.WriteConstRam(12, low.data(), static_cast<u32>(low.size()));
+  const u32 high = 0x87654321u;
+  processor.WriteConstRam((words - 1) * sizeof(u32), &high, 1);
+  processor.DumpConstRam(actual.data(), 0, words);
+  Require("ConstRamReset", "sparse writes",
+          actual[2] == 0 && actual[3] == low[0] && actual[4] == low[1] &&
+              actual[5] == low[2] && actual[6] == 0 && actual.back() == high,
+          "sparse constant RAM writes changed their holes or endpoints");
+  processor.Reset();
+  check_zero();
+  processor.WriteConstRam(0, low.data(), static_cast<u32>(low.size()));
+  processor.Reset();
+  check_zero();
+  processor.Reset();
+  check_zero();
+  std::printf("[host]    %-32s ok\n", "ConstRamReset");
+}
+
 void CheckPm4AcquireMemNoOp(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
@@ -32460,7 +32501,13 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-command-lane-only") == 0) {
     VulkanHarness vulkan;
+    CheckConstRamReset(vulkan.RuntimeRenderer());
     vulkan.CheckGpuCommandLane();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--const-ram-only") == 0) {
+    VulkanHarness vulkan;
+    CheckConstRamReset(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--default-interpolator-only") == 0) {

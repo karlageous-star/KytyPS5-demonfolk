@@ -325,7 +325,8 @@ void CommandProcessor::Reset() {
 	m_draw_indirect_args_base_addr     = 0;
 	m_dispatch_indirect_args_base_addr = 0;
 
-	std::memset(m_const_ram, 0, sizeof(m_const_ram));
+	std::memset(m_const_ram, 0, static_cast<size_t>(m_const_ram_used) * sizeof(uint32_t));
+	m_const_ram_used = 0;
 	// Every register changed: the native path's clean-draw shadow no longer matches.
 	DrawStateObserver::Invalidate();
 }
@@ -406,6 +407,8 @@ void CommandProcessor::IncrementCe() {
 
 void CommandProcessor::WriteConstRam(uint32_t offset, const uint32_t* src, uint32_t dw_num) {
 	memcpy(m_const_ram + offset / 4, src, static_cast<size_t>(dw_num) * 4);
+	m_const_ram_used = std::min(std::max(m_const_ram_used, offset / 4 + dw_num),
+	                            static_cast<uint32_t>(std::size(m_const_ram)));
 }
 
 void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num) {
