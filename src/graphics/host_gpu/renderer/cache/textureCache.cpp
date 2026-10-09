@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/image/clearRegister.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -110,7 +111,8 @@ void TraceColorDirty(const Image& image, const char* cause, uint64_t address = 0
 		// Clear-to-register is a color-buffer operation; the texture pipe cannot decode it.
 		return desc.type == TextureCache::BindingType::RenderTarget &&
 		       metadata.dcc_clear_register_valid &&
-		       DecodePackedColorClear(format, metadata.dcc_clear_word, clear);
+		       DecodeColorRegisterClear(format, metadata.dcc_clear_word, metadata.dcc_clear_word1,
+		                                ClearRegisterWideEnabled(), clear);
 	}
 	if (code != 0x00 && code != 0x40 && code != 0x80 && code != 0xc0) {
 		return false;

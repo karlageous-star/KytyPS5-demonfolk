@@ -28,6 +28,7 @@ struct ImageMetadataInfo {
 	bool                stencil_compressed = false;
 	bool                dcc_clear_register_valid = false;
 	bool                dcc_alpha_msb            = true;
+	uint32_t            dcc_clear_word1          = 0; // CB_COLORn_CLEAR_WORD1, texel bits 32..63.
 	bool                operator==(const ImageMetadataInfo&) const = default;
 };
 
