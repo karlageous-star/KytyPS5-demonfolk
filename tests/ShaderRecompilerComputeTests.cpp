@@ -22433,9 +22433,9 @@ TestCase NativeMisalignedBufferByteExact(u32 base_remainder) {
   test.initial[1] = 0x88776655u;
   test.expected = test.initial;
   const auto get_byte = [](const std::vector<u32> &words, u32 address) {
-    return static_cast<u8>(words[address / 4u] >> ((address & 3u) * 8u));
+    return static_cast<uint8_t>(words[address / 4u] >> ((address & 3u) * 8u));
   };
-  const auto set_byte = [](std::vector<u32> *words, u32 address, u8 value) {
+  const auto set_byte = [](std::vector<u32> *words, u32 address, uint8_t value) {
     const auto shift = (address & 3u) * 8u;
     (*words)[address / 4u] = ((*words)[address / 4u] & ~(0xffu << shift)) |
                              (static_cast<u32>(value) << shift);
@@ -22451,7 +22451,7 @@ TestCase NativeMisalignedBufferByteExact(u32 base_remainder) {
   test.expected = test.initial;
   const auto write_u32 = [&](u32 address, u32 value) {
     for (u32 byte = 0; byte < 4; byte++) {
-      set_byte(&test.expected, address + byte, static_cast<u8>(value >> (byte * 8u)));
+      set_byte(&test.expected, address + byte, static_cast<uint8_t>(value >> (byte * 8u)));
     }
   };
   write_u32(64, read_u32(base_remainder));
