@@ -480,6 +480,9 @@ add_kyty_full_emulator_test(xpr_replay_tests "${KYTY_TESTS_DIR}/XprReplayTests.c
 # sources, built like the emulator (the same SPIR-V), with the precompile code of pipelineCache.cpp.
 add_kyty_full_emulator_test(kyty_shader_precompile "${KYTY_SOURCE_DIR}/local/shader-precompile.cpp")
 target_compile_definitions(kyty_shader_precompile PRIVATE KYTY_STATIC_PRECOMPILE=1)
+target_sources(kyty_shader_precompile PRIVATE
+	"${KYTY_SOURCE_DIR}/local/static-seeds.cpp"
+	"${KYTY_SOURCE_DIR}/local/static-seeds.h")
 if (WIN32)
 	target_link_libraries(kyty_shader_precompile opengl32 setupapi ws2_32)
 endif()

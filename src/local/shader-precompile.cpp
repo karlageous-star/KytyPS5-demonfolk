@@ -29,6 +29,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "loader/systemContent.h"
+#include "static-seeds.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -43,7 +44,8 @@ static int Usage() {
 	std::fprintf(stderr, "usage: kyty_shader_precompile --game <dir> --seeds <file> [--shard <i>/<n>] "
 	                     "[--threads <n>] [--out <file> | --static-inputs] [--timings <file>] [--no-pipelines]\n"
 	                     "       kyty_shader_precompile --game <dir> --merge [--prune]\n"
-	                     "       kyty_shader_precompile --game <dir> --seeds <file> --status\n");
+	                     "       kyty_shader_precompile --game <dir> --seeds <file> --status\n"
+	                     "       kyty_shader_precompile --game <dir> --make-seeds <file> [--states <file>]\n");
 	return 2;
 }
 
@@ -53,6 +55,7 @@ int main(int argc, char* argv[]) {
 	bool                           prune  = false;
 	bool                           status = false;
 	PipelineCache::PrecompileOptions options;
+	StaticSeeds::Options make_seeds;
 	options.threads = std::max(1u, std::thread::hardware_concurrency());
 	for (int i = 1; i < argc; i++) {
 		const std::string_view arg   = argv[i];
@@ -75,6 +78,10 @@ int main(int argc, char* argv[]) {
 			options.seeds = argv[++i];
 		} else if (arg == "--out") {
 			options.out = argv[++i];
+		} else if (arg == "--make-seeds") {
+			make_seeds.out = argv[++i];
+		} else if (arg == "--states") {
+			make_seeds.states = argv[++i];
 		} else if (arg == "--timings") {
 			options.timings = argv[++i];
 		} else if (arg == "--threads") {
@@ -85,7 +92,10 @@ int main(int argc, char* argv[]) {
 			return Usage();
 		}
 	}
-	if (game.empty() || (!merge && options.seeds.empty()) || options.threads == 0 || options.shards == 0 ||
+	const bool generating = !make_seeds.out.empty();
+	if (game.empty() || (!generating && !merge && options.seeds.empty()) ||
+	    (generating && (merge || status || !options.seeds.empty())) ||
+	    (!generating && !make_seeds.states.empty()) || options.threads == 0 || options.shards == 0 ||
 	    options.shard >= options.shards)
 		return Usage();
 
@@ -108,6 +118,20 @@ int main(int argc, char* argv[]) {
 	if (!Libs::Graphics::CreateHeadlessGraphicContext(graphics)) {
 		std::fprintf(stderr, "no Vulkan device\n");
 		return 1;
+	}
+	if (generating) {
+		make_seeds.game = game;
+		if (!Loader::SystemContentParamSfoGetString("TITLE_ID", &make_seeds.title_id) || make_seeds.title_id.empty()) {
+			std::fprintf(stderr, "no title ID in param.json\n");
+			std::_Exit(1);
+		}
+		make_seeds.host_subgroup_size = graphics.SupportsComputeWave64() ? 64u : 32u;
+		make_seeds.lod_stats_subgroup = graphics.fragment_subgroup_reduction ? 1u : 0u;
+		std::printf("Seed inputs: %s, host compute subgroup %u, fragment subgroup reduction %u\n",
+		            make_seeds.title_id.c_str(), make_seeds.host_subgroup_size, make_seeds.lod_stats_subgroup);
+		const int code = StaticSeeds::Make(make_seeds);
+		std::fflush(nullptr);
+		std::_Exit(code);
 	}
 	if (status) {
 		std::printf("inputs %s\nstatic cache %s\n",
