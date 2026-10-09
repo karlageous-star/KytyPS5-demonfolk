@@ -57,6 +57,10 @@ extern "C" void __llvm_profile_set_filename(const char*);
 extern "C" int  __llvm_profile_write_file(void);
 #endif
 
+namespace Loader {
+std::string DescribeGuestAddressForDiagnostics(uint64_t vaddr);
+} // namespace Loader
+
 namespace LiveControl {
 
 inline std::atomic_uint64_t g_flips {0};
@@ -77,6 +81,13 @@ inline std::atomic_bool      g_process {false};
 
 // The render thread's time waiting for guest work (GuestGpu::ThreadRun), in steady-clock ns.
 inline int64_t g_render_idle_ns = 0;
+// When the render thread began waiting for the guest's next submission (steady-clock ns; 0 while it has one): its
+// idle waits set it once, a submission taken clears it (guest commands do not: a guest thread may wait on them).
+inline std::atomic<int64_t> g_render_idle_since {0};
+inline void NoteRenderIdle(int64_t now_ns) {
+	int64_t expected = 0;
+	(void)g_render_idle_since.compare_exchange_strong(expected, now_ns, std::memory_order_relaxed);
+}
 
 // Render thread. With KYTY_HITCH_LOG_MS (or KYTY_SLOW_LOG_MS), a frame (flip to flip) that long and
 // at least 50 ms is a SLOW line too, on the same TSC timeline: the hitch the slow calls before it explain.
@@ -642,6 +653,68 @@ inline void Run(uint64_t id, const std::string& line) {
 }
 
 // Called on the render thread before it consumes commands.
+#if defined(_WIN32)
+// KYTY_STALL_DUMP_MS: the game stopped submitting work for that long in the middle of play (the 60 frames before the
+// wait averaged under 50 ms): every thread but the emulator's own (Kyty.*) and SDL's audio threads is sampled, three times 150 ms apart,
+// to show what the game waits on. STALL lines: the frames of each thread's stack, guest code as module+offset, host
+// code as addresses (symbolize with the build's map). Not with a live `prof` (both prepare the unwind tables).
+inline void StallWatch(int64_t threshold_ns) {
+	LocalPlatform::SetThreadName("Kyty.StallWatch");
+	int64_t stall = 0;
+	int     dumps = 0;
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		const int64_t since = g_render_idle_since.load(std::memory_order_relaxed);
+		if (since == 0) continue;
+		const int64_t idle = std::chrono::steady_clock::now().time_since_epoch().count() - since;
+		if (since != stall) {
+			stall = since;
+			dumps = 0;
+		}
+		if (dumps >= 3 || idle < threshold_ns + dumps * int64_t {150'000'000}) continue;
+		const auto flips = g_flips.load(std::memory_order_acquire);
+		if (flips < 120) continue;
+		const int64_t last  = g_flip_times[(flips - 1) % FlipTimes].load(std::memory_order_relaxed);
+		const int64_t first = g_flip_times[(flips - 61) % FlipTimes].load(std::memory_order_relaxed);
+		if ((last - first) / 60 > 50'000'000 || since - last > 50'000'000) {
+			dumps = 3; // (a loading screen or a pause: not play)
+			continue;
+		}
+		++dumps;
+		LocalPlatform::PrepareSampling();
+		const auto self = LocalPlatform::ThreadId();
+		std::string out;
+		char        line[160];
+		std::snprintf(line, sizeof(line), "STALL idle=%.0f ms (dump %d), render thread waiting since %.0f ms after the last flip\n",
+		              static_cast<double>(idle) / 1e6, dumps, static_cast<double>(since - last) / 1e6);
+		out += line;
+		for (const auto& [tid, name]: LocalPlatform::ProcessThreads()) {
+			if (tid == self || name.rfind("Kyty.", 0) == 0 || name.rfind("SDLAudio", 0) == 0) continue;
+			const auto handle = LocalPlatform::OpenThreadForSampling(tid);
+			if (handle == 0) continue;
+			uint64_t words[SampleWords] {};
+			const bool sampled = LocalPlatform::SampleThread(handle, 0, 0, words, SampleWords);
+			LocalPlatform::CloseThreadForSampling(handle);
+			if (!sampled) continue;
+			std::snprintf(line, sizeof(line), "STALL   %u %s:", tid, name.empty() ? "-" : name.c_str());
+			out += line;
+			for (const auto word: words) {
+				if (word == 0) break;
+				const auto guest = Loader::DescribeGuestAddressForDiagnostics(word);
+				if (!guest.empty()) out += " " + guest;
+				else {
+					std::snprintf(line, sizeof(line), " %llx", static_cast<unsigned long long>(word));
+					out += line;
+				}
+			}
+			out += "\n";
+		}
+		std::fputs(out.c_str(), stdout);
+		std::fflush(stdout);
+	}
+}
+#endif
+
 inline void Start() {
 	g_render_thread = LocalPlatform::CurrentThreadHandle();
 	g_render_tid.store(LocalPlatform::ThreadId());
@@ -649,6 +722,10 @@ inline void Start() {
 	LiveCounters::g_single_writer = true;
 	(void)LocalPlatform::CurrentThreadStack(&g_stack_low, &g_stack_high);
 	g_render_known.store(true);
+#if defined(_WIN32)
+	if (const char* stall = std::getenv("KYTY_STALL_DUMP_MS"); stall != nullptr && std::atoi(stall) > 0)
+		std::thread(StallWatch, int64_t {std::atoi(stall)} * 1'000'000).detach();
+#endif
 	static const char* const path = std::getenv("KYTY_LIVE_FILE");
 	if (path == nullptr) return;
 	std::thread([] {
