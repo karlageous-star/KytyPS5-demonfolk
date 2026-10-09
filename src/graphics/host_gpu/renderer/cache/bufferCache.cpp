@@ -176,28 +176,6 @@ struct BufferCache::GuestReadback {
 
 // With the frame pipeline, guest reads of GPU-written memory are copied out
 // asynchronously; read-only GPU bindings may overlap the copy.
-// Borrow each thread's temporary storage for one call. Nested readbacks borrow
-// separate storage; request-owned pages and parts are never placed in this pool.
-template <typename T>
-class ReadbackScratchValue {
-public:
-	explicit ReadbackScratchValue(T& home): m_home(home), m_value(std::exchange(home, T {})) {}
-	~ReadbackScratchValue() {
-		if constexpr (requires { m_value.capacity(); }) {
-			// Keep a fragmented request from retaining large scratch allocations.
-			if (m_value.capacity() > 4096) return;
-		}
-		m_home = std::move(m_value);
-	}
-	ReadbackScratchValue(const ReadbackScratchValue&) = delete;
-	ReadbackScratchValue& operator=(const ReadbackScratchValue&) = delete;
-	T& operator*() { return m_value; }
-
-private:
-	T& m_home;
-	T  m_value;
-};
-
 static bool GuestReadbacksEnabled() {
 	return kyty_local_frame_pipeline_mode.load(std::memory_order_relaxed) != 0;
 }
@@ -255,10 +233,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 			return {};
 		}
 	}
-	thread_local RangeSet available_home;
-	ReadbackScratchValue available_scratch(available_home);
-	auto& available_pages = *available_scratch;
-	available_pages.Clear();
+	RangeSet available_pages;
 	m_memory_tracker.ForEachDownloadRange<false>(begin, end - begin,
 	    [&](uint64_t a, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, a, bytes, "guest readback");
@@ -272,12 +247,8 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		if (pending) for (const auto& page: pending->pages)
 			available_pages.Subtract(page.address, page.size);
 	}
-	thread_local std::vector<DownloadCopy> copies_home;
-	ReadbackScratchValue copies_scratch(copies_home);
-	auto& copies = *copies_scratch;
-	copies.clear();
+	std::vector<DownloadCopy> copies;
 	std::vector<GuestRange> pages;
-	pages.reserve(available_pages.Count());
 	available_pages.ForEach([&](uint64_t a, uint64_t end) {
 		pages.push_back({a, end - a});
 		m_gpu_modified_ranges.ForEachIntersection(a, end - a, [&](RangeSet::Range range) {
@@ -296,10 +267,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		uint64_t source, size, cursor;
 	};
 	constexpr uint64_t      Gap = 64 * 1024;
-	thread_local std::vector<Envelope> envelopes_home;
-	ReadbackScratchValue envelopes_scratch(envelopes_home);
-	auto& envelopes = *envelopes_scratch;
-	envelopes.clear();
+	std::vector<Envelope>   envelopes;
 	std::vector<GuestReadback::Part> parts;
 	parts.reserve(copies.size());
 	uint64_t packed_size = 0;
@@ -357,10 +325,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	    ReadbackQueueReady(window, true, request->producer_tick)) {
 		// Also after the slot's last graphics-queue copy (it is submitted: that path flushes).
 		request->producer_tick = std::max(request->producer_tick, m_download_ticks[slot]);
-		thread_local std::vector<ReadbackQueue::Queue::Region> regions_home;
-		ReadbackScratchValue regions_scratch(regions_home);
-		auto& regions = *regions_scratch;
-		regions.clear();
+		std::vector<ReadbackQueue::Queue::Region> regions;
 		regions.reserve(envelopes.size());
 		for (const auto& envelope: envelopes)
 			regions.push_back({buffer.Handle(), {envelope.source, envelope.cursor, envelope.size}});
