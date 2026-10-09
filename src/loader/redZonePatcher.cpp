@@ -1079,8 +1079,16 @@ static void PrintRedZoneProbe(const PatchModule& module, u64 probe, uintptr_t fu
 }
 
 RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
-                                                  std::span<const uintptr_t> function_starts) {
+                                                  std::span<const uintptr_t> function_starts,
+                                                  u64 synthetic_call_begin, u64 synthetic_call_end) {
 	RedZonePatchResult result {};
+	// KYTY_REDZONE_ORDINARY_CALLS=1: every direct call the liveness analysis marks live is moved
+	// below the red zone again (before 2026-10-09; it shifts the callee's stack arguments).
+	static const bool ordinary_calls = [] {
+		const char* value = std::getenv("KYTY_REDZONE_ORDINARY_CALLS");
+		return value != nullptr && value[0] == '1';
+	}();
+	std::vector<uintptr_t> native_calls;
 	auto*              module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
 	if (module == nullptr || function_starts.empty()) {
 		return result;
@@ -1127,7 +1135,15 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 				    GetRelativeTarget(decoded) != 0 && !rewrite_sites.contains(address)) {
 					// A direct call while red-zone data is live: compilers never emit one, the
 					// loader's TLS patch does (`mov reg, fs:[0]` becomes a call). Its return
-					// address would land on the red zone; call from below it instead.
+					// address would land on the red zone; call from below it instead. A guest
+					// call the analysis only conservatively marks live runs as it is: moving RSP
+					// for it would move the callee's stack arguments by the red zone's size.
+					const auto target = GetRelativeTarget(decoded);
+					if (!ordinary_calls && (target < synthetic_call_begin || target >= synthetic_call_end)) {
+						++result.native_call_count;
+						native_calls.push_back(address);
+						continue;
+					}
 					++result.live_call_count;
 					rewrite_sites[address].protect_red_zone = true;
 					continue;
@@ -1633,12 +1649,20 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 			std::fflush(stdout);
 		}
 	}
+	if (!native_calls.empty()) {
+		const auto base = reinterpret_cast<uintptr_t>(module->start);
+		std::printf("Red-zone patching: %zu guest calls left native (no RSP move), first at", native_calls.size());
+		for (size_t i = 0; i < native_calls.size() && i < 16; ++i) {
+			std::printf(" +0x%" PRIx64, static_cast<u64>(native_calls[i] - base));
+		}
+		std::printf("\n");
+	}
 	return result;
 }
 
 #else
 
-RedZonePatchResult PatchRedZoneMemoryInstructions(u64, u64, std::span<const uintptr_t>) {
+RedZonePatchResult PatchRedZoneMemoryInstructions(u64, u64, std::span<const uintptr_t>, u64, u64) {
 	return {};
 }
 

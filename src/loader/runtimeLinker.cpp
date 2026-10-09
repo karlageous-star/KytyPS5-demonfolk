@@ -2348,9 +2348,12 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			LOGF("Windows guest red-zone patching could not decode function boundaries for %s\n",
 			     Common::PathToString(program->file_name).c_str());
 		}
+		// The TLS patch's calls (PatchProgram) go to the handler area after the image.
+		const uint64_t tls_call_begin = is_shared ? 0 : program->tls.handler_vaddr;
+		const uint64_t tls_call_end   = is_shared ? 0 : program->tls.handler_vaddr + Jit::SafeCall::GetSize();
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
-			const auto result =
-			    PatchRedZoneMemoryInstructions(segment_addr, segment_size, function_starts);
+			const auto result = PatchRedZoneMemoryInstructions(segment_addr, segment_size, function_starts,
+			                                                   tls_call_begin, tls_call_end);
 			LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 			     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
 			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
@@ -2362,7 +2365,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			     result.unrelocatable_memory_instruction_count);
 			std::printf("Red-zone patching %s: functions=%" PRIu64 " red_zone=%" PRIu64 " memory=%" PRIu64
 			            " patched=%" PRIu64 " stack=%" PRIu64 " control=%" PRIu64 " unrelocatable=%" PRIu64
-			            " indirect=%" PRIu64 " swept=%" PRIu64 " calls=%" PRIu64 "\n",
+			            " indirect=%" PRIu64 " swept=%" PRIu64 " calls=%" PRIu64 " native_calls=%" PRIu64 "\n",
 			            Common::PathToString(program->file_name.filename()).c_str(), result.function_count,
 			            result.red_zone_function_count, result.memory_instruction_count,
 			            result.patched_memory_instruction_count,
@@ -2370,7 +2373,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			            result.control_flow_memory_instruction_count,
 			            result.unrelocatable_memory_instruction_count,
 			            result.indirect_red_zone_function_count, result.swept_instruction_count,
-			            result.live_call_count);
+			            result.live_call_count, result.native_call_count);
 			Common::VirtualMemory::FlushInstructionCache(segment_addr, segment_size);
 		}
 		Common::VirtualMemory::FlushInstructionCache(program->red_zone_trampoline_vaddr,
