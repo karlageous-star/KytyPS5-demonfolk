@@ -2394,14 +2394,19 @@ RenderExecutor::NativeXprPatch RenderExecutor::NativeXprPatchDescriptors(NativeX
 // evaluation's readers. The page answer is kept for one validation.
 class NativeXprReader {
 public:
-	explicit NativeXprReader(GpuResourceManager& resources): m_resources(resources) {}
+	explicit NativeXprReader(GpuResourceManager& resources)
+	    : m_resources(resources), m_granules(resources.ReadGranules()) {}
 	void Read(uint64_t address, uint32_t count, uint32_t* out) {
 		const uint64_t bytes = uint64_t {count} * 4u;
 		const uint64_t first = address >> 12u, last = (address + bytes - 1u) >> 12u;
 		if (first == last) {
 			if (first != m_page) {
-				m_page   = first;
-				m_direct = !m_resources.HasReadWatchers(first << 12u, 4096);
+				m_page = first;
+				// (The page's granule bit first, here: a call per page was ~1% of the GPU thread at 1-1.)
+				const auto granule = first >> (PageManager::READ_GRANULE_BITS - 12u);
+				m_direct           = (address < TRACKER_ADDRESS_SIZE &&
+				            ((m_granules[granule / 64u].load(std::memory_order_acquire) >> (granule % 64u)) & 1u) == 0) ||
+				           !m_resources.HasReadWatchers(first << 12u, 4096);
 			}
 			if (m_direct) {
 				std::memcpy(out, reinterpret_cast<const void*>(address), bytes);
@@ -2412,9 +2417,10 @@ public:
 	}
 
 private:
-	GpuResourceManager& m_resources;
-	uint64_t            m_page   = UINT64_MAX;
-	bool                m_direct = false;
+	GpuResourceManager&          m_resources;
+	const std::atomic<uint64_t>* m_granules;
+	uint64_t                     m_page   = UINT64_MAX;
+	bool                         m_direct = false;
 };
 
 // Traced records: false when a structural read changed (the caller evaluates

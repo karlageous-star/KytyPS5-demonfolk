@@ -436,6 +436,11 @@ uint64_t PageManager::GetPageSize() const {
 	return PAGE_SIZE;
 }
 
+const std::atomic<uint64_t>* PageManager::ReadGranules() const noexcept {
+	static_assert(READ_GRANULE_SIZE == uint64_t {1} << READ_GRANULE_BITS);
+	return m_impl->read_granules.get();
+}
+
 bool PageManager::HasReadWatchers(uint64_t vaddr, uint64_t size) const noexcept {
 	if (!GuestRange {vaddr, size}.Valid()) return false;
 	if (!m_impl->MayHaveReadWatchers(vaddr, vaddr + size - 1)) return false;

@@ -29,6 +29,7 @@ public:
 	[[nodiscard]] bool          HasReadWatchers(uint64_t vaddr, uint64_t size) const noexcept {
         return m_page_manager.HasReadWatchers(vaddr, size);
 	}
+	[[nodiscard]] const std::atomic<uint64_t>* ReadGranules() const noexcept { return m_page_manager.ReadGranules(); }
 	void                        SetGpu(GuestGpu* gpu) noexcept { m_gpu = gpu; }
 	// After a guest protection change: tracked pages get the tracker's protection back.
 	void ReapplyProtection(uint64_t vaddr, uint64_t size) { m_page_manager.ReapplyProtection(vaddr, size); }

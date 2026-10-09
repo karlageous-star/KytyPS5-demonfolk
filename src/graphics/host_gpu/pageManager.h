@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -23,6 +24,10 @@ public:
 	// A hint only: callers must still check exact GPU ownership before reading
 	// a backing alias. A missing hint retains the normal faulting guest load.
 	[[nodiscard]] bool HasReadWatchers(uint64_t vaddr, uint64_t size) const noexcept;
+	// HasReadWatchers' filter, for callers that test it inline: bit g of word g / 64 is clear when no page of the
+	// 64 KiB granule g (of the tracker's address space) has read watchers.
+	static constexpr uint64_t                   READ_GRANULE_BITS = 16;
+	[[nodiscard]] const std::atomic<uint64_t>* ReadGranules() const noexcept;
 
 	// Restores the watchers' protection after the host protection of watched pages was
 	// changed behind the tracker's back (a guest mprotect). Unwatched pages keep theirs.
