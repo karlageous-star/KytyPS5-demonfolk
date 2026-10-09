@@ -324,10 +324,14 @@ private:
 	[[nodiscard]] bool RegistrationsSince(uint64_t address, uint64_t size, uint64_t epoch) const;
 	// KYTY_IMAGE_GRANULES: a bit per 64 KiB granule that a registered image covered
 	// since the last rebuild (a superset); region queries skip the page walk on a miss.
+	// Allocated with the cache (never moved): MayHaveImagesRead reads it without m_lock.
 	mutable std::vector<uint64_t> m_image_granules;
 	mutable uint32_t              m_image_granule_releases = 0;
 	void                          MarkImageGranules(uint64_t address, uint64_t size) const;
 	[[nodiscard]] bool            MayHaveImages(uint64_t address, uint64_t size) const;
+	// MayHaveImages without the rebuild (true while one is due): only reads what holders of m_lock write, so
+	// m_lock.ReadShared can ask it.
+	[[nodiscard]] bool            MayHaveImagesRead(uint64_t address, uint64_t size) const;
 	bool             m_readback_linear_images = false;
 
 	friend struct TextureCacheTestAccess;
