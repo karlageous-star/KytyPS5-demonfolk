@@ -24,6 +24,9 @@ volatile std::atomic_uint32_t kyty_local_dispatch_batch {32};
 // 1: prove the pending-operation queue empty before the timeline query and the
 //    operation lock. Draws and dispatches call this with nothing to retire.
 volatile std::atomic<uint32_t> kyty_local_pending_drain_mode {0};
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+extern volatile std::atomic<uint32_t> kyty_local_vulkan_recording_mode;
+#endif
 }
 
 namespace Libs::Graphics {
@@ -31,6 +34,16 @@ namespace Libs::Graphics {
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
 namespace {
+
+bool OrdinaryAsyncSubmitRequested() {
+	const auto* value = std::getenv("KYTY_ASYNC_SUBMIT");
+	if (value == nullptr || value[0] != '1' || value[1] != '\0') return false;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	// The recording stream owns its submit ordering. Do not nest two workers.
+	if (kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0) return false;
+#endif
+	return true;
+}
 
 void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint32_t debug_op,
                        uint64_t debug_submit, uint32_t arg0, uint32_t arg1, uint32_t arg2,
@@ -239,6 +252,8 @@ void CommandScheduler::Shutdown() {
 	if (m_priority_thread.joinable()) {
 		m_priority_thread.join();
 	}
+	// The final timeline wait above proves all queued command buffers completed.
+	StopSubmitThread();
 	{
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(!m_pending_operations.empty() || !m_priority_operations.empty() ||
@@ -540,6 +555,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
+	EXIT_IF(m_async_submit && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0);
 	if (LocalVulkanRecording::DeferredSubmitEnabled()) {
 		m_command.EndRendering();
 		// A compute chain's pending barrier closes this buffer, as End() records it on the direct path
@@ -581,6 +597,37 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 #endif
 	m_command.End();
+	if (m_async_submit || OrdinaryAsyncSubmitRequested()) {
+		if (!m_async_submit) {
+			m_async_submit = true;
+			m_submit_thread = std::jthread([this](std::stop_token stop) { SubmitThread(stop); });
+			LOGF("Scheduler: ordinary FIFO queue-submit worker enabled\n");
+		}
+		SubmitJob job {
+		    .buffer = m_command.m_buffer,
+		    .submit = submit,
+		    .upload_sequence = AsyncUpload::SubmitSequence(),
+		    .debug_op = m_command.m_debug_op,
+		    .debug_submit = m_command.m_debug_submit_id,
+		    .debug_arg0 = m_command.m_debug_arg0,
+		    .debug_arg1 = m_command.m_debug_arg1,
+		    .debug_arg2 = m_command.m_debug_arg2,
+		    .debug_arg3 = m_command.m_debug_arg3,
+		    .debug_arg4 = m_command.m_debug_arg4,
+		};
+		EXIT_IF(m_graphics.queue == nullptr);
+		{
+			std::lock_guard lock(m_submit_mutex);
+			job.tick = m_master.NextTick();
+			job.submit.AddSignal(m_master.Handle(), job.tick);
+			m_submit_jobs.push_back(job);
+			++m_submits_queued;
+		}
+		m_command.m_buffer = nullptr;
+		m_recorded_dispatches = 0;
+		m_submit_available.notify_one();
+		return job.tick;
+	}
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
@@ -623,6 +670,72 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	m_command.m_buffer = nullptr;
 	m_recorded_dispatches = 0;
 	return tick;
+}
+
+void CommandScheduler::QueueSubmit(const SubmitJob& job) {
+	// The producer snapshots the sequence before it advances to later upload jobs.
+	AsyncUpload::Wait(job.upload_sequence);
+	const auto& submit = job.submit;
+	vk::TimelineSemaphoreSubmitInfo timeline {};
+	timeline.waitSemaphoreValueCount = submit.num_wait_semaphores;
+	timeline.pWaitSemaphoreValues = submit.wait_ticks.data();
+	timeline.signalSemaphoreValueCount = submit.num_signal_semaphores;
+	timeline.pSignalSemaphoreValues = submit.signal_ticks.data();
+	vk::SubmitInfo info {};
+	info.pNext = &timeline;
+	info.waitSemaphoreCount = submit.num_wait_semaphores;
+	info.pWaitSemaphores = submit.wait_semaphores.data();
+	info.pWaitDstStageMask = submit.wait_stages.data();
+	info.commandBufferCount = 1;
+	info.pCommandBuffers = &job.buffer;
+	info.signalSemaphoreCount = submit.num_signal_semaphores;
+	info.pSignalSemaphores = submit.signal_semaphores.data();
+	vk::Result result;
+	{
+		Common::LockGuard lock(m_graphics.queue_mutex);
+		result = m_graphics.queue.submit(1, &info, nullptr);
+	}
+	if (result != vk::Result::eSuccess) {
+		ReportVulkanFatal("async vkQueueSubmit", result, job.tick, job.debug_op, job.debug_submit,
+		                  job.debug_arg0, job.debug_arg1, job.debug_arg2, job.debug_arg3, job.debug_arg4);
+	}
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+}
+
+void CommandScheduler::SubmitThread(std::stop_token stop) {
+	LocalPlatform::SetThreadName("Kyty.Submit");
+	for (;;) {
+		SubmitJob job;
+		{
+			std::unique_lock lock(m_submit_mutex);
+			m_submit_available.wait(lock, [this, &stop] { return stop.stop_requested() || !m_submit_jobs.empty(); });
+			if (m_submit_jobs.empty()) return;
+			job = std::move(m_submit_jobs.front());
+			m_submit_jobs.pop_front();
+		}
+		QueueSubmit(job);
+		{
+			std::lock_guard lock(m_submit_mutex);
+			++m_submits_done;
+		}
+		m_submit_available.notify_all();
+	}
+}
+
+void CommandScheduler::WaitSubmitted() {
+	std::unique_lock lock(m_submit_mutex);
+	const auto queued = m_submits_queued;
+	m_submit_available.wait(lock, [this, queued] { return m_submits_done >= queued; });
+}
+
+void CommandScheduler::StopSubmitThread() {
+	if (m_submit_thread.joinable()) {
+		m_submit_thread.request_stop();
+		m_submit_available.notify_all();
+		m_submit_thread.join();
+	}
+	std::lock_guard lock(m_submit_mutex);
+	EXIT_IF(!m_submit_jobs.empty() || m_submits_done != m_submits_queued);
 }
 
 void CommandScheduler::BeginNext() {

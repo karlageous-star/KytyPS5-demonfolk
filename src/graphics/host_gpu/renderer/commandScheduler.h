@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 
 #include <queue>
@@ -37,6 +38,8 @@ public:
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
+	// Wait only until queued ordinary submissions reach the driver, without holding queue_mutex.
+	void                      WaitSubmitted();
 	void                      Wait(uint64_t tick);
 	void                      PopPendingOperations(bool at_draw_entry = false);
 	void                      DrainPriorityOperations();
@@ -83,9 +86,23 @@ private:
 		uint64_t                     tick = 0;
 	};
 
+	struct SubmitJob {
+		vk::CommandBuffer buffer = nullptr;
+		SubmitInfo submit;
+		uint64_t tick = 0;
+		uint64_t upload_sequence = 0;
+		uint32_t debug_op = 0;
+		uint64_t debug_submit = 0;
+		uint32_t debug_arg0 = 0, debug_arg1 = 0, debug_arg2 = 0, debug_arg3 = 0;
+		uint64_t debug_arg4 = 0;
+	};
+
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
+	void QueueSubmit(const SubmitJob& job);
+	void SubmitThread(std::stop_token stop);
+	void StopSubmitThread();
 
 	MasterSemaphore              m_master;
 	uint64_t                     m_last_pending_refresh = 0;
@@ -107,6 +124,13 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	// One producer, one FIFO consumer; command-pool reuse still waits for GPU completion.
+	std::mutex m_submit_mutex;
+	std::condition_variable m_submit_available;
+	std::deque<SubmitJob> m_submit_jobs;
+	uint64_t m_submits_queued = 0, m_submits_done = 0;
+	bool m_async_submit = false;
+	std::jthread m_submit_thread;
 };
 
 } // namespace Libs::Graphics

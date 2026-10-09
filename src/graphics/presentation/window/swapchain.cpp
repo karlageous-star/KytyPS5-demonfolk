@@ -972,6 +972,10 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	LocalVulkanRecording::WaitDeferredSubmits();
 #endif
 
+	// Ordinary asynchronous submissions have the same Windows present dependency:
+	// release them to the driver before taking any presentation/queue locks.
+	m_impl->renderer.GetCommandScheduler().WaitSubmitted();
+
 	const auto overlay_visual = GetSystemOverlayVisualState();
 	auto&      swapchain  = m_impl->swapchain;
 	auto*      hud        = m_impl->UpdateHud(reuse);

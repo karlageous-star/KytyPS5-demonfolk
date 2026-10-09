@@ -2447,6 +2447,9 @@ public:
       }
     }
     const auto last_blocked_tick = scheduler.CurrentTick() - 1;
+    // Ordinary async submit must publish every queued job without waiting for this
+    // unsignaled external GPU semaphore. This also protects Windows presentation.
+    scheduler.WaitSubmitted();
     Require("SchedulerTimeline", "external timeline overflow",
             distinct_handles &&
                 last_blocked_tick ==
