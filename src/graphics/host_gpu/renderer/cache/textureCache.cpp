@@ -360,6 +360,8 @@ void TextureCache::RegisterImage(ImageId id) {
 	}
 	MarkImageGranules(image.info.data.address, image.info.data.size);
 	if (m_image_starts[image.info.data.address]++ == 0) {
+		if (const auto bucket = StartBucket(image.info.data.address); m_start_buckets[bucket]++ == 0)
+			m_start_bucket_bits[bucket / 64u] |= uint64_t {1} << (bucket % 64u);
 		const auto epoch = m_start_epoch.load(std::memory_order_relaxed) + 1;
 		if (m_start_log.size() >= 8192) m_start_log.erase(m_start_log.begin(), m_start_log.begin() + 4096);
 		m_start_log.emplace_back(epoch, image.info.data.address);
@@ -394,6 +396,8 @@ void TextureCache::UnregisterImage(ImageId id) {
 		EXIT("TextureCache: image missing from start index\n");
 	} else if (--start->second == 0) {
 		m_image_starts.erase(start);
+		if (const auto bucket = StartBucket(image.info.data.address); --m_start_buckets[bucket] == 0)
+			m_start_bucket_bits[bucket / 64u] &= ~(uint64_t {1} << (bucket % 64u));
 	}
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
@@ -3088,7 +3092,7 @@ void TextureCache::UpdateImage(ImageId id) {
 
 bool TextureCache::HasImageStartingAt(uint64_t address) {
 	std::scoped_lock lock {m_lock};
-	return m_image_starts.contains(address);
+	return MayStartAt(address) && m_image_starts.contains(address);
 }
 
 bool TextureCache::NewImageStartsSince(uint64_t epoch, std::vector<std::pair<uint64_t, uint64_t>>& out) {
@@ -3109,7 +3113,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 		return {};
 	}
 	// Only registered images starting at `address` qualify.
-	if (!m_image_starts.contains(address)) {
+	if (!MayStartAt(address) || !m_image_starts.contains(address)) {
 		return {};
 	}
 	ImageIds matches;

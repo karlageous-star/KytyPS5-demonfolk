@@ -241,6 +241,20 @@ private:
 	// Start address -> number of registered images starting there, and the
 	// log of addresses that gained their first one.
 	std::unordered_map<uint64_t, uint32_t>            m_image_starts;
+	// Start addresses per bucket of 4 KiB pages (hashed), and a bit per bucket that has any (8 KiB: it stays in the
+	// cache): a lookup of an address in an empty bucket needs no walk of the map (HasImageStartingAt: every formatted
+	// buffer of a table draw or dispatch asks, mostly at per-frame ring addresses no image starts at; the map's node
+	// walk was ~1% of the GPU thread on the 1-1 walk).
+	static constexpr uint32_t StartBucketBits = 16;
+	[[nodiscard]] static size_t StartBucket(uint64_t address) {
+		return static_cast<size_t>(((address >> 12u) * 0x9e3779b97f4a7c15ull) >> (64u - StartBucketBits));
+	}
+	[[nodiscard]] bool MayStartAt(uint64_t address) const {
+		const auto bucket = StartBucket(address);
+		return ((m_start_bucket_bits[bucket / 64u] >> (bucket % 64u)) & 1u) != 0;
+	}
+	std::unique_ptr<uint32_t[]>                         m_start_buckets = std::make_unique<uint32_t[]>(size_t {1} << StartBucketBits);
+	std::array<uint64_t, (size_t {1} << StartBucketBits) / 64> m_start_bucket_bits {};
 	std::atomic<uint64_t>                             m_start_epoch {1};
 	std::vector<std::pair<uint64_t, uint64_t>>        m_start_log; // (epoch, address)
 	std::atomic<uint64_t>                             m_resolution_epoch {1};
