@@ -1504,16 +1504,16 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 				}
 			}
 		}
-		// A PC with under 24 GiB of RAM records the shaders but translates and builds none at start-up
-		// (as KYTY_SHADER_WARMUP=record): their SPIR-V, modules and pipelines took ~3 GiB of RAM, ~5 GiB of
-		// commit and ~1 GiB of video memory on top of the ~10 GB the game takes, and the static prefetch
-		// translates every shader in the background anyway (chenxiao 5cf2f6d1, 4a59e94c: 16 GB at 1-1, +76 MiB
-		// instead of +3181, the same frame rate). Pipelines then come from the driver cache or the static
-		// binaries when first drawn. KYTY_WARMUP_LOW_RAM=0: the full warmup on such a PC too.
+		// KYTY_WARMUP_LOW_RAM=1: a PC with under 24 GiB of RAM records the shaders but translates and builds
+		// none at start-up (as KYTY_SHADER_WARMUP=record), saving their SPIR-V, modules and pipelines (chenxiao
+		// 5cf2f6d1, 4a59e94c: ~3 GiB of RAM there, where the static prefetch's portable programs serve first
+		// use). Opt-in: with specialized (non-portable) programs the prefetch serves none, and Demon's Souls on
+		// a 16 GB PC then translated ~2.5 compute shaders a second on the render thread while standing (D2:
+		// 112 in 45 s, 50-400 ms each) for no lower peak commit (11.9 GB against C1's 10.7).
 		constexpr uint64_t WarmupMinRam = uint64_t {24} << 30u;
 		const uint64_t     ram          = LocalPlatform::PhysicalMemory();
 		const char*        low_ram_env  = std::getenv("KYTY_WARMUP_LOW_RAM");
-		const bool         low_ram      = (low_ram_env == nullptr || std::string_view(low_ram_env) != "0") && ram != 0 &&
+		const bool         low_ram      = low_ram_env != nullptr && std::string_view(low_ram_env) == "1" && ram != 0 &&
 		                       ram < WarmupMinRam;
 		const bool compile = std::string_view(warmup) == "1" && !low_ram;
 		if (low_ram && std::string_view(warmup) == "1")
