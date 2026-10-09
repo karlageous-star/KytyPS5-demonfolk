@@ -22394,6 +22394,84 @@ TestCase BufferLoadsPreserveByteBaseOffset() {
   return test;
 }
 
+TestCase NativeMisalignedBufferByteExact(u32 base_remainder) {
+  using O = ShaderOpcode;
+  static constexpr std::array<const char *, 4> names = {
+      "NativeMisalignedBufferByteExact_Invalid", "NativeMisalignedBufferByteExact_Base1",
+      "NativeMisalignedBufferByteExact_Base2", "NativeMisalignedBufferByteExact_Base3"};
+  std::vector<u32> code;
+  const auto emit_load = [&](u32 opcode, u32 dst, u32 offset) {
+    AppendVMovU32(&code, 20, offset);
+    AppendBufferLoadOpcode(&code, opcode, dst, 20);
+  };
+  const auto emit_store = [&](u32 opcode, u32 src, u32 offset) {
+    AppendVMovU32(&code, 20, offset);
+    AppendBufferStoreOpcode(&code, opcode, src, 20);
+  };
+
+  emit_load(0x0c, 0, 0);                         // raw dword at the base remainder
+  emit_load(0x0c, 1, 4u - base_remainder);       // effective byte address 4
+  emit_load(0x0a, 2, 19u - base_remainder);      // unsigned short at effective byte 19
+  emit_load(0x0b, 3, 19u - base_remainder);      // signed short at effective byte 19
+  emit_store(0x1c, 0, 64u - base_remainder);     // capture loads at aligned addresses
+  emit_store(0x1c, 1, 68u - base_remainder);
+  emit_store(0x1c, 2, 72u - base_remainder);
+  emit_store(0x1c, 3, 76u - base_remainder);
+  AppendVMovLiteral(&code, 4, 0xdecafbad);
+  emit_store(0x1c, 4, 0);                        // raw dword store at the base remainder
+  AppendVMovLiteral(&code, 5, 0x12345678);
+  emit_store(0x1c, 5, 12u - base_remainder);     // effective byte address 12
+  AppendVMovLiteral(&code, 6, 0x00001234);
+  emit_store(0x1a, 6, 19u - base_remainder);     // crossing short store at byte 19
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = names[base_remainder];
+  test.code = std::move(code);
+  test.initial.assign(24, 0xa5a5a5a5u);
+  test.initial[0] = 0x44332211u;
+  test.initial[1] = 0x88776655u;
+  test.expected = test.initial;
+  const auto get_byte = [](const std::vector<u32> &words, u32 address) {
+    return static_cast<u8>(words[address / 4u] >> ((address & 3u) * 8u));
+  };
+  const auto set_byte = [](std::vector<u32> *words, u32 address, u8 value) {
+    const auto shift = (address & 3u) * 8u;
+    (*words)[address / 4u] = ((*words)[address / 4u] & ~(0xffu << shift)) |
+                             (static_cast<u32>(value) << shift);
+  };
+  const auto read_u32 = [&](u32 address) {
+    return static_cast<u32>(get_byte(test.initial, address)) |
+           (static_cast<u32>(get_byte(test.initial, address + 1u)) << 8u) |
+           (static_cast<u32>(get_byte(test.initial, address + 2u)) << 16u) |
+           (static_cast<u32>(get_byte(test.initial, address + 3u)) << 24u);
+  };
+  set_byte(&test.initial, 19, 0x80);
+  set_byte(&test.initial, 20, 0xff);
+  test.expected = test.initial;
+  const auto write_u32 = [&](u32 address, u32 value) {
+    for (u32 byte = 0; byte < 4; byte++) {
+      set_byte(&test.expected, address + byte, static_cast<u8>(value >> (byte * 8u)));
+    }
+  };
+  write_u32(64, read_u32(base_remainder));
+  write_u32(68, read_u32(4));
+  write_u32(72, 0x0000ff80);
+  write_u32(76, 0xffffff80);
+  write_u32(base_remainder, 0xdecafbad);
+  write_u32(12, 0x12345678);
+  set_byte(&test.expected, 19, 0x34);
+  set_byte(&test.expected, 20, 0x12);
+  test.storage_buffer_offsets = {base_remainder};
+  test.user_data = MakeNativeUserData(nullptr);
+  test.user_data[0] = base_remainder;
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_LOAD_USHORT,
+                  O::BUFFER_LOAD_SSHORT, O::BUFFER_STORE_DWORD, O::BUFFER_STORE_SHORT,
+                  O::S_ENDPGM};
+  return test;
+}
+
 TestCase BufferByteStorePreservesNeighbours() {
   using O = ShaderOpcode;
   std::vector<u32> code;
@@ -32336,6 +32414,18 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferLoadsPreserveByteBaseOffset());
     RunCase(&vulkan, BufferByteStorePreservesNeighbours());
     RunCase(&vulkan, BufferUnorm8LoadPreservesByteBaseOffset());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--byte-exact-only") == 0) {
+    const auto *byte_exact = std::getenv("KYTY_BUFFER_BYTE_EXACT");
+    if (byte_exact == nullptr || std::strcmp(byte_exact, "1") != 0) {
+      std::fprintf(stderr, "--byte-exact-only requires KYTY_BUFFER_BYTE_EXACT=1\n");
+      return 2;
+    }
+    VulkanHarness vulkan;
+    RunCase(&vulkan, NativeMisalignedBufferByteExact(1));
+    RunCase(&vulkan, NativeMisalignedBufferByteExact(2));
+    RunCase(&vulkan, NativeMisalignedBufferByteExact(3));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cmpswap-only") == 0) {
