@@ -14027,6 +14027,10 @@ OpFunctionEnd
   void CheckRasterization(bool depth_feedback, bool lod_stats = false, uint32_t lod_extent = 8, bool packed_vertex_color = false, bool lod_subgroup = false, bool native_index_test = false) {
     const char *name = packed_vertex_color ? "PackedFloatVertexColor" : lod_stats ? "GpuLodStatsFeedback" :
         (depth_feedback ? "DepthAttachmentFeedback" : "PolygonModeRasterization");
+    if (depth_feedback && !lod_stats && !m_attachment_feedback_loop_enabled) {
+      std::printf("[gpu]     %-32s SKIP (attachment feedback loop layout/dynamic state unavailable)\n", name);
+      return;
+    }
     const uint32_t extent = lod_stats ? lod_extent : (depth_feedback ? 8 : 32);
     constexpr uintptr_t depth_address = 0x0000000204400000ull;
     constexpr uint64_t allocation_size = 0x40000;
@@ -14248,9 +14252,11 @@ OpFunctionEnd
       cmd.setDepthBiasEnable(false);
       const vk::Bool32 write = true;
       cmd.setColorWriteEnableEXT(1, &write);
-      cmd.setAttachmentFeedbackLoopEnableEXT(
-          feedback_enabled ? vk::ImageAspectFlags{vk::ImageAspectFlagBits::eDepth}
-                           : vk::ImageAspectFlags{});
+      if (m_attachment_feedback_loop_enabled) {
+        cmd.setAttachmentFeedbackLoopEnableEXT(
+            feedback_enabled ? vk::ImageAspectFlags{vk::ImageAspectFlagBits::eDepth}
+                             : vk::ImageAspectFlags{});
+      }
       const vk::DeviceSize offset = 0;
       cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
       cmd.draw(3, 1, 0, 0);
@@ -15783,8 +15789,8 @@ private:
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
-    m_runtime_context.attachment_feedback_loop_enabled = true;
-    m_runtime_context.provoking_vertex_last_enabled = true;
+    m_runtime_context.attachment_feedback_loop_enabled = m_attachment_feedback_loop_enabled;
+    m_runtime_context.provoking_vertex_last_enabled = m_provoking_vertex_last_enabled;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -15860,6 +15866,20 @@ private:
         if ((queues[i].queueFlags &
              (vk::QueueFlagBits::eCompute | vk::QueueFlagBits::eGraphics)) ==
             (vk::QueueFlagBits::eCompute | vk::QueueFlagBits::eGraphics)) {
+          u32 candidate_extension_count = 0;
+          if (physical.enumerateDeviceExtensionProperties(
+                  nullptr, &candidate_extension_count, nullptr) != vk::Result::eSuccess) {
+            continue;
+          }
+          std::vector<vk::ExtensionProperties> candidate_extensions(candidate_extension_count);
+          if (physical.enumerateDeviceExtensionProperties(
+                  nullptr, &candidate_extension_count, candidate_extensions.data()) != vk::Result::eSuccess ||
+              !std::ranges::any_of(candidate_extensions, [](const auto &extension) {
+                return std::strcmp(extension.extensionName.data(),
+                                   VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME) == 0;
+              })) {
+            continue;
+          }
           vk::PhysicalDeviceVulkan12Features features12{};
           features12.sType = vk::StructureType::ePhysicalDeviceVulkan12Features;
           vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
@@ -15887,6 +15907,42 @@ private:
             "no Vulkan graphics+compute device with fragment barycentrics");
     m_physical_device.getMemoryProperties(&m_memory_properties);
 
+    vk::PhysicalDeviceProperties device_properties{};
+    m_physical_device.getProperties(&device_properties);
+    std::printf("[gpu] Vulkan device: %s\n", device_properties.deviceName.data());
+    u32 extension_count = 0;
+    RequireVk("VulkanHarness", "dispatch",
+              m_physical_device.enumerateDeviceExtensionProperties(
+                  nullptr, &extension_count, nullptr),
+              "vkEnumerateDeviceExtensionProperties");
+    std::vector<vk::ExtensionProperties> extension_properties(extension_count);
+    RequireVk("VulkanHarness", "dispatch",
+              m_physical_device.enumerateDeviceExtensionProperties(
+                  nullptr, &extension_count, extension_properties.data()),
+              "vkEnumerateDeviceExtensionProperties");
+    const auto has_extension = [&](const char *name) {
+      return std::ranges::any_of(extension_properties, [&](const auto &extension) {
+        return std::strcmp(extension.extensionName.data(), name) == 0;
+      });
+    };
+    const char *required_extensions[] = {
+        VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+        VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
+        VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
+        VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
+        VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
+        VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME,
+        VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME};
+    std::vector<std::string> missing_features;
+    for (const auto *extension : required_extensions) {
+      if (!has_extension(extension)) {
+        missing_features.emplace_back(std::string("extension ") + extension);
+      }
+    }
+    const bool feedback_extensions =
+        has_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
+        has_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+
     vk::PhysicalDeviceFeatures available_features{};
     m_physical_device.getFeatures(&available_features);
     vk::PhysicalDeviceVulkan12Features available_features12{};
@@ -15896,6 +15952,8 @@ private:
     available_features13.sType =
         vk::StructureType::ePhysicalDeviceVulkan13Features;
     available_features13.pNext = &available_features12;
+    vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR available_barycentric{};
+    available_barycentric.pNext = &available_features13;
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR available_derivatives{};
     available_derivatives.pNext = &available_features13;
     vk::PhysicalDeviceDepthClipEnableFeaturesEXT available_depth_clip{};
@@ -15903,50 +15961,79 @@ private:
     vk::PhysicalDeviceDepthClipControlFeaturesEXT available_clip_control{};
     available_clip_control.pNext = &available_depth_clip;
     vk::PhysicalDeviceColorWriteEnableFeaturesEXT available_color_write{};
-    available_color_write.pNext = &available_clip_control;
     vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT available_feedback_layout{};
-    available_feedback_layout.pNext = &available_color_write;
     vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT available_feedback_dynamic{};
-    available_feedback_dynamic.pNext = &available_feedback_layout;
     vk::PhysicalDeviceProvokingVertexFeaturesEXT available_provoking_vertex{};
-    available_provoking_vertex.pNext = &available_feedback_dynamic;
+    void *available_extension_chain = &available_barycentric;
+    if (has_extension(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME)) {
+      available_color_write.pNext = available_extension_chain;
+      available_extension_chain = &available_color_write;
+    }
+    if (has_extension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME)) {
+      available_clip_control.pNext = available_extension_chain;
+      available_extension_chain = &available_clip_control;
+    }
+    if (has_extension(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME)) {
+      available_depth_clip.pNext = available_extension_chain;
+      available_extension_chain = &available_depth_clip;
+    }
+    if (has_extension(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME)) {
+      available_derivatives.pNext = available_extension_chain;
+      available_extension_chain = &available_derivatives;
+    }
+    if (feedback_extensions) {
+      available_feedback_dynamic.pNext = available_extension_chain;
+      available_feedback_layout.pNext = &available_feedback_dynamic;
+      available_extension_chain = &available_feedback_layout;
+    }
+    if (has_extension(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME)) {
+      available_provoking_vertex.pNext = available_extension_chain;
+      available_extension_chain = &available_provoking_vertex;
+    }
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
-    available_features2.pNext = &available_provoking_vertex;
+    available_features2.pNext = available_extension_chain;
     m_physical_device.getFeatures2(&available_features2);
-    Require("VulkanHarness", "dispatch",
-            available_features.shaderStorageImageWriteWithoutFormat == true,
-            "shaderStorageImageWriteWithoutFormat is not supported");
-    Require("VulkanHarness", "dispatch",
-            available_features.shaderImageGatherExtended == true &&
-                available_derivatives.computeDerivativeGroupQuads == true,
-            "image gather or compute derivative quads are not supported");
-    Require("VulkanHarness", "dispatch",
-            available_features12.timelineSemaphore == true,
-            "timeline semaphores are not supported");
-    Require("VulkanHarness", "dispatch",
-            available_features13.dynamicRendering == true,
-            "dynamic rendering is not supported");
-    Require("VulkanHarness", "dispatch",
-            available_features13.synchronization2 == true,
-            "synchronization2 is not supported");
-    Require("VulkanHarness", "dispatch",
-            available_features.sampleRateShading == true,
-            "sample-rate shading is not supported");
-    Require("VulkanHarness", "dispatch", available_features.shaderInt64 == true,
-            "shaderInt64 is not supported");
-    Require("VulkanHarness", "dispatch",
-            available_features12.bufferDeviceAddress == true,
-            "bufferDeviceAddress is not supported");
-    Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
-            "vertex layer output is not supported");
-    Require("VulkanHarness", "graphics", available_features.fillModeNonSolid &&
-                available_depth_clip.depthClipEnable && available_clip_control.depthClipControl &&
-                available_color_write.colorWriteEnable &&
-                available_feedback_layout.attachmentFeedbackLoopLayout &&
-                available_feedback_dynamic.attachmentFeedbackLoopDynamicState &&
-                available_provoking_vertex.provokingVertexLast,
-            "production rasterization features are not supported");
+    const auto require_feature = [&](bool supported, const char *name) {
+      if (!supported) missing_features.emplace_back(name);
+    };
+    require_feature(available_features.shaderStorageImageWriteWithoutFormat,
+                    "shaderStorageImageWriteWithoutFormat");
+    require_feature(available_features.shaderImageGatherExtended,
+                    "shaderImageGatherExtended");
+    require_feature(available_derivatives.computeDerivativeGroupQuads,
+                    "computeDerivativeGroupQuads");
+    require_feature(available_features12.timelineSemaphore, "timelineSemaphore");
+    require_feature(available_features13.dynamicRendering, "dynamicRendering");
+    require_feature(available_features13.synchronization2, "synchronization2");
+    require_feature(available_features.sampleRateShading, "sampleRateShading");
+    require_feature(available_features.shaderInt64, "shaderInt64");
+    require_feature(available_features12.bufferDeviceAddress, "bufferDeviceAddress");
+    require_feature(available_features12.shaderOutputLayer, "shaderOutputLayer");
+    require_feature(available_barycentric.fragmentShaderBarycentric,
+                    "fragmentShaderBarycentric");
+    require_feature(available_features.fillModeNonSolid, "fillModeNonSolid");
+    require_feature(available_depth_clip.depthClipEnable, "depthClipEnable");
+    require_feature(available_clip_control.depthClipControl, "depthClipControl");
+    require_feature(available_color_write.colorWriteEnable, "colorWriteEnable");
+    require_feature(available_provoking_vertex.provokingVertexLast,
+                    "provokingVertexLast");
+    require_feature(available_features.fragmentStoresAndAtomics,
+                    "fragmentStoresAndAtomics");
+    if (!missing_features.empty()) {
+      std::fprintf(stderr, "[gpu] Missing required Vulkan features on %s:\n",
+                   device_properties.deviceName.data());
+      for (const auto &feature : missing_features) {
+        std::fprintf(stderr, "[gpu]   - %s\n", feature.c_str());
+      }
+      Fail("VulkanHarness", "dispatch", "selected device lacks required Vulkan support");
+    }
+    m_attachment_feedback_loop_enabled =
+        feedback_extensions && available_feedback_layout.attachmentFeedbackLoopLayout &&
+        available_feedback_dynamic.attachmentFeedbackLoopDynamicState;
+    m_provoking_vertex_last_enabled = available_provoking_vertex.provokingVertexLast;
+    std::printf("[gpu] Attachment feedback loop support: %s\n",
+                m_attachment_feedback_loop_enabled ? "available" : "unavailable");
 
     float priority = 1.0f;
     vk::DeviceQueueCreateInfo queue_info{};
@@ -15988,14 +16075,18 @@ private:
     color_write.pNext = &clip_control;
     color_write.colorWriteEnable = true;
     vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT feedback_layout{};
-    feedback_layout.pNext = &color_write;
-    feedback_layout.attachmentFeedbackLoopLayout = true;
     vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT feedback_dynamic{};
-    feedback_dynamic.pNext = &feedback_layout;
-    feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
+    if (m_attachment_feedback_loop_enabled) {
+      feedback_layout.pNext = &color_write;
+      feedback_layout.attachmentFeedbackLoopLayout = true;
+      feedback_dynamic.pNext = &feedback_layout;
+      feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
+    }
     vk::PhysicalDeviceProvokingVertexFeaturesEXT provoking_vertex{};
-    provoking_vertex.pNext = &feedback_dynamic;
-    provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
+    provoking_vertex.pNext = m_attachment_feedback_loop_enabled
+                                 ? static_cast<void *>(&feedback_dynamic)
+                                 : static_cast<void *>(&color_write);
+    provoking_vertex.provokingVertexLast = m_provoking_vertex_last_enabled;
     device_info.pNext = &provoking_vertex;
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
@@ -16003,22 +16094,16 @@ private:
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
     device_features.fillModeNonSolid = true;
-    Require("VulkanHarness", "LOD feedback", available_features.fragmentStoresAndAtomics,
-            "fragment storage atomics are unavailable");
     device_features.fragmentStoresAndAtomics = true;
     device_info.pEnabledFeatures = &device_features;
-    constexpr const char *device_extensions[] = {
-        VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-        VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
-        VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
-        VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
-        VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-        VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME,
-        VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME,
-        VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME,
-        VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME};
-    device_info.enabledExtensionCount = std::size(device_extensions);
-    device_info.ppEnabledExtensionNames = device_extensions;
+    std::vector<const char *> device_extensions(std::begin(required_extensions),
+                                               std::end(required_extensions));
+    if (m_attachment_feedback_loop_enabled) {
+      device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
+      device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+    }
+    device_info.enabledExtensionCount = static_cast<uint32_t>(device_extensions.size());
+    device_info.ppEnabledExtensionNames = device_extensions.data();
     RequireVk("VulkanHarness", "dispatch",
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
@@ -16026,7 +16111,10 @@ private:
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
     LocalVulkanRecording::Install();
     m_recording = std::make_unique<LocalVulkanRecording::ProducerScope>();
-    kyty_local_vulkan_recording_mode.store(4);
+    const char *recording_setting = std::getenv("KYTY_TEST_VULKAN_RECORDING");
+    if (recording_setting == nullptr || std::strcmp(recording_setting, "0") != 0) {
+      kyty_local_vulkan_recording_mode.store(4);
+    }
 #endif
     m_device.getQueue(m_queue_family, 0, &m_queue);
 
@@ -16346,6 +16434,8 @@ private:
   std::unique_ptr<LocalVulkanRecording::ProducerScope> m_recording;
 #endif
   vk::PhysicalDevice m_physical_device = nullptr;
+  bool m_attachment_feedback_loop_enabled = false;
+  bool m_provoking_vertex_last_enabled = false;
   vk::Device m_device = nullptr;
   vk::Queue m_queue = nullptr;
   vk::CommandPool m_command_pool = nullptr;
