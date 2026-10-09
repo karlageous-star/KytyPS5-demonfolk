@@ -1361,14 +1361,20 @@ PipelineCache::CompileWorkers& PipelineCache::TableWorkers() {
 	return *m_table_workers;
 }
 
-// KYTY_PIPELINE_FAST_BUILD=0: a pipeline no cache holds is compiled optimized before its first use
-// (up to seconds on NVIDIA) instead of unoptimized now and optimized on a worker.
-static PipelineBuild FirstBuild() {
-	static const bool fast = [] {
+// A pipeline no cache holds: compiled unoptimized now (VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) and optimized on a
+// worker, or optimized before its first use (up to seconds on NVIDIA). Unoptimized first only on NVIDIA, where it was
+// measured (~100x faster to compile) and tested (chenxiao 894fda03): an AMD RX 6700 XT crashed in its driver at
+// start-up while the first unoptimized compute pipelines were made, and amdvlk aborted inside the background builds
+// here (X95); its unoptimized builds are not much faster either (140-250 ms).
+// KYTY_PIPELINE_FAST_BUILD=1 / 0 chooses either on any GPU.
+static PipelineBuild FirstBuild(const GraphicContext& graphics) {
+	static const int fast = [] {
 		const char* value = std::getenv("KYTY_PIPELINE_FAST_BUILD");
-		return value == nullptr || std::string_view(value) != "0";
+		return value == nullptr ? -1 : (std::string_view(value) != "0" ? 1 : 0);
 	}();
-	return fast ? PipelineBuild::Fast : PipelineBuild::Full;
+	constexpr uint32_t NvidiaVendor = 0x10DE;
+	const bool         nvidia       = graphics.GetPhysicalDeviceProperties().vendorID == NvidiaVendor;
+	return fast == 1 || (fast == -1 && nvidia) ? PipelineBuild::Fast : PipelineBuild::Full;
 }
 
 // An unoptimized pipeline (PipelineBuild::Fast): `build` compiles the optimized one on a worker, into
@@ -2455,7 +2461,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
 	                       vertex_program, ps_input_info, pixel_program, static_params,
-	                       m_driver_cache, native_bindings, FirstBuild());
+	                       m_driver_cache, native_bindings, FirstBuild(m_graphics));
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -2508,7 +2514,7 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
 	auto cached = std::make_unique<Pipeline>();
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache,
-	                       FirstBuild());
+	                       FirstBuild(m_graphics));
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
