@@ -514,6 +514,11 @@ add_executable(demons_souls_idle_tests EXCLUDE_FROM_ALL
 target_link_libraries(demons_souls_idle_tests xbyak::xbyak)
 target_include_directories(demons_souls_idle_tests PRIVATE ${inc_headers})
 
+add_executable(demons_souls_collision_guard_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DemonsSoulsCollisionGuardTests.cpp")
+target_link_libraries(demons_souls_collision_guard_tests xbyak::xbyak)
+target_include_directories(demons_souls_collision_guard_tests PRIVATE ${inc_headers})
+
 add_executable(page_protection_table_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PageProtectionTableTests.cpp")
 target_link_libraries(page_protection_table_tests fmt::fmt common)
@@ -699,6 +704,7 @@ if(BUILD_TESTING)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME demons_souls_copy COMMAND $<TARGET_FILE:demons_souls_copy_tests>)
 	add_test(NAME demons_souls_idle COMMAND $<TARGET_FILE:demons_souls_idle_tests>)
+	add_test(NAME demons_souls_collision_guard COMMAND $<TARGET_FILE:demons_souls_collision_guard_tests>)
 	add_test(NAME page_protection_table COMMAND $<TARGET_FILE:page_protection_table_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME native_region_epoch COMMAND $<TARGET_FILE:native_region_epoch_tests>)
@@ -776,6 +782,7 @@ if(BUILD_TESTING)
 		page_manager_tests
 		demons_souls_copy_tests
 		demons_souls_idle_tests
+		demons_souls_collision_guard_tests
 		page_protection_table_tests
 		atrac9_initialization_tests
 		bit_array_tests

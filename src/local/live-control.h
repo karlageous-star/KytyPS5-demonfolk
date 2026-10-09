@@ -18,6 +18,7 @@
 // Without KYTY_LIVE_FILE nothing runs; the flip hook is one relaxed increment.
 
 #include "common/assert.h"
+#include "loader/demonsSoulsCollisionGuard.h"
 #include "frame-capture.h"
 #include "live-census.h"
 #include "live-counters.h"
@@ -82,6 +83,7 @@ inline int64_t g_render_idle_ns = 0;
 // The line also has the frame's render-thread wait for guest work, what some counters did in it and its
 // wall-clock time.
 inline void Flip() {
+	Loader::DemonsSoulsCollisionGuard::Report();
 	const auto flip = g_flips.load(std::memory_order_relaxed);
 	g_flip_times[flip % FlipTimes].store(std::chrono::steady_clock::now().time_since_epoch().count(),
 	                                     std::memory_order_relaxed);

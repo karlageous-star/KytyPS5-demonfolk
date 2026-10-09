@@ -1,4 +1,5 @@
 #include "loader/demonsSoulsIdle.h"
+#include "loader/demonsSoulsCollisionGuard.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -37,6 +38,7 @@ bool Readable(uint64_t address, uint64_t size) {
 }
 
 #include "demonsSoulsEmptyPoll.inc"
+#include "demonsSoulsCollisionGuard.inc"
 
 // Another build of the game (another region or version) has the same code elsewhere: the call's
 // bytes after its displacement, landing on the poll's prologue up to its RIP-relative displacement.
@@ -74,6 +76,7 @@ bool FindSites(const Program& program, uint64_t* call, uint64_t* poll) {
 
 void Install(Program* program) {
 #if defined(__x86_64__) || defined(_M_X64)
+	InstallCollisionGuard(program);
 	if (cave != 0 || program == nullptr || !Libs::Graphics::DemonsSouls::IsSupportedGame() ||
 	    program->file_name.filename() != "eboot.bin" || program->mapped_size > CaveOffset ||
 	    program->base_vaddr > UINT64_MAX - CaveOffset - PageSize)
@@ -151,7 +154,7 @@ void Install(Program* program) {
 void Clear() {
 #if defined(__x86_64__) || defined(_M_X64)
 	// RuntimeLinker::Clear has no guest-thread quiescence protocol.
-	EXIT_IF(empty_poll_cave != 0);
+	EXIT_IF(empty_poll_cave != 0 || collision_guard_cave != 0);
 #endif
 	if (!cave) return;
 	std::array<uint8_t, 5> bytes {};
@@ -165,14 +168,15 @@ void Clear() {
 }
 bool HasProcessLifetimePatch() {
 #if defined(__x86_64__) || defined(_M_X64)
-	return empty_poll_cave != 0;
+	return empty_poll_cave != 0 || collision_guard_cave != 0;
 #else
 	return false;
 #endif
 }
 bool OwnsProcessLifetimePatch(const Program* program) {
 #if defined(__x86_64__) || defined(_M_X64)
-	return empty_poll_cave != 0 && program == empty_poll_owner;
+	return (empty_poll_cave != 0 && program == empty_poll_owner) ||
+	       (collision_guard_cave != 0 && program == collision_guard_owner);
 #else
 	return false;
 #endif

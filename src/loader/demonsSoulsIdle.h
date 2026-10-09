@@ -19,7 +19,7 @@ struct Program;
 namespace DemonsSoulsIdle {
 void Install(Program* program);
 void Clear();
-// The opt-in empty-poll thunk is a process-lifetime patch. Guest exits use
+// The opt-in empty-poll and collision-guard thunks are process-lifetime patches. Guest exits use
 // quick_exit with the requested status, as WindowRun already does, instead of
 // restoring/freeing code that another guest thread may still be executing.
 [[nodiscard]] bool HasProcessLifetimePatch();
