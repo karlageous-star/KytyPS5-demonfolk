@@ -574,7 +574,10 @@ add_executable(spirv_local_arrays_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/spirvLocalArrays.cpp"
 )
 target_link_libraries(spirv_local_arrays_tests spirv-tools)
-target_include_directories(spirv_local_arrays_tests PRIVATE ${inc_headers})
+target_include_directories(spirv_local_arrays_tests PRIVATE ${inc_headers}
+	"${KYTY_THIRD_PARTY_DIR}/SPIRV-Headers/include")
+set_source_files_properties("${KYTY_SOURCE_DIR}/graphics/host_gpu/spirvLocalArrays.cpp"
+	PROPERTIES INCLUDE_DIRECTORIES "${KYTY_THIRD_PARTY_DIR}/SPIRV-Headers/include")
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
