@@ -114,13 +114,17 @@ private:
 	Common::Mutex& m_mutex;
 };
 
+// The configuration's, once the GPU exists (the command processor asks at every packet).
+static bool g_graphics_run_debug_dump = false;
+
 static bool GraphicsRunDebugDumpEnabled() {
-	return Config::GraphicsDebugDumpEnabled() &&
-	       Config::GetPrintfDirection() != Config::OutputDirection::Silent;
+	return g_graphics_run_debug_dump;
 }
 
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	g_graphics_run_debug_dump =
+	    Config::GraphicsDebugDumpEnabled() && Config::GetPrintfDirection() != Config::OutputDirection::Silent;
 	GraphicsInitJmpTables();
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
 	m_thread = std::jthread(ThreadRun, this);
