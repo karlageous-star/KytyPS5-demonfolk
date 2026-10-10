@@ -307,6 +307,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 	// decals' G-buffer) wholly in General; storage in General; else read-only.
 	std::array<std::vector<TableImageSet::Image>, 2> deps;
 	bool                                             ok = true;
+	for (uint32_t st = 0; st < stages; ++st) deps[st].reserve(prepared[st].images.size()); // (no regrowth: new sets come in bursts)
 	for (uint32_t st = 0; st < stages && ok; ++st)
 		for (auto& binding: prepared[st].images) {
 			auto&       image   = textures.GetImage(binding.image_id);
@@ -394,6 +395,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			}
 			pending.push_back(item);
 		}
+		if (st == 0) set->images.reserve(deps[0].size() + deps[1].size());
 		for (const auto& dep: deps[st])
 			if (dep.layout != vk::ImageLayout::eUndefined) set->images.push_back(dep);
 	}

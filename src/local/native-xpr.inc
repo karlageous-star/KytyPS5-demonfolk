@@ -582,6 +582,10 @@ struct RenderExecutor::NativeXprCache {
 	// A camera turn rebinds ~1500 sets a frame (Latria): with 32 per layout most retired sets were freed and
 	// allocated again a frame later.
 	static constexpr size_t FreeSetsPerLayout = 2048, FreeSetsMax = 16384;
+	// Sets a driver allocation makes of a layout whose free sets ran out (NativeXprAllocateSet), and the pool that
+	// had no room for them.
+	static constexpr uint32_t AllocateBatch = 4;
+	vk::DescriptorPool        batch_refused = nullptr;
 	std::unordered_map<VkDescriptorSetLayout, std::vector<FreeSet>> free_sets;
 	std::unordered_map<VkDescriptorSet, VkDescriptorSetLayout>      set_layouts;
 	size_t                                                          free_count = 0;
@@ -862,6 +866,31 @@ vk::DescriptorSet RenderExecutor::NativeXprAllocateSet(vk::DescriptorSetLayout l
 	allocate.descriptorSetCount = 1;
 	allocate.pSetLayouts        = &layout;
 	vk::DescriptorSet set       = nullptr;
+	// A few of the layout's sets in one call from the newest pool, the rest kept free for its next allocations: a
+	// driver call a set was ~1.2 ms of a walk's slow frame storing ~250 records and resolving new image sets.
+	if (!cache.pools.empty() && cache.pools.back() != cache.batch_refused &&
+	    cache.free_count + NativeXprCache::AllocateBatch <= NativeXprCache::FreeSetsMax) {
+		std::array<vk::DescriptorSetLayout, NativeXprCache::AllocateBatch> layouts;
+		layouts.fill(layout);
+		std::array<vk::DescriptorSet, NativeXprCache::AllocateBatch> sets {};
+		vk::DescriptorSetAllocateInfo batch {};
+		batch.descriptorPool     = cache.pools.back();
+		batch.descriptorSetCount = NativeXprCache::AllocateBatch;
+		batch.pSetLayouts        = layouts.data();
+		if (device.allocateDescriptorSets(&batch, sets.data()) == vk::Result::eSuccess) {
+			auto& free = cache.free_sets[static_cast<VkDescriptorSetLayout>(layout)];
+			for (size_t i = 0; i < sets.size(); ++i) {
+				cache.set_layouts[static_cast<VkDescriptorSet>(sets[i])] = static_cast<VkDescriptorSetLayout>(layout);
+				if (i != 0) {
+					free.push_back({batch.descriptorPool, sets[i]});
+					++cache.free_count;
+				}
+			}
+			pool_out = batch.descriptorPool;
+			return sets[0];
+		}
+		cache.batch_refused = batch.descriptorPool; // (full for a batch: single sets until the next pool)
+	}
 	// Freed sets return to their pool; try the newest pools first.
 	for (size_t i = 0; i < cache.pools.size() && i < 4; ++i) {
 		const auto pool         = cache.pools[cache.pools.size() - 1 - i];
