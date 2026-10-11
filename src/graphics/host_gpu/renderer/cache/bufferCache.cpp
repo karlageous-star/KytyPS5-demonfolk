@@ -39,6 +39,7 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 }
 
 #include "common/assert.h"
+#include "common/guardedCopy.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -1742,6 +1743,59 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	}
 }
 
+namespace {
+struct IndirectCopies {
+	VkCommandBuffer command;
+	VkDeviceAddress list;
+	uint32_t        count;
+};
+void ReplayIndirectCopies(std::span<const LocalVulkanRecording::Segment> segments,
+                          const vk::detail::DispatchLoaderDynamic& dispatch) {
+	const auto& copies = *static_cast<const IndirectCopies*>(segments[0].data);
+	dispatch.vkCmdCopyMemoryIndirectNV(copies.command, copies.list, copies.count, sizeof(VkCopyMemoryIndirectCommandNV));
+}
+} // namespace
+
+// The closing upload prologue's copies (UploadDirtyRanges), from a list in the table ring, as one command recorded in
+// order with the prologue's other commands (the recording worker replays it).
+void BufferCache::FlushPrologueCopies(vk::CommandBuffer command) {
+	if (m_prologue_copies.empty()) return;
+	const auto bytes          = m_prologue_copies.size() * sizeof(VkCopyMemoryIndirectCommandNV);
+	auto [mapped, offset]     = m_table_upload.Map(bytes, 16);
+	EXIT_IF(mapped == nullptr);
+	std::memcpy(mapped, m_prologue_copies.data(), bytes);
+	m_table_upload.Commit();
+	const IndirectCopies copies {command, m_table_upload.BufferDeviceAddress() + offset,
+	                             static_cast<uint32_t>(m_prologue_copies.size())};
+	m_prologue_copies.clear();
+	const LocalVulkanRecording::Segment segments[] {{&copies, sizeof(copies)}};
+	if (!LocalVulkanRecording::EnqueueDeferred(ReplayIndirectCopies, segments, false)) {
+		LocalVulkanRecording::Drain();
+		ReplayIndirectCopies(segments, VULKAN_HPP_DEFAULT_DISPATCHER);
+	}
+}
+
+// An upload's source bytes (a CPU-dirty range) into host memory, from inside the memory tracker's upload callback: through
+// the backing view, whatever the guest range's protection, else through the guest view without faulting. A read of the
+// guest view that faulted re-entered the tracker from the callback (another tracker's page protection: the fault
+// handler read GPU data back) and ended the emulator (10-12, Tower of Latria, third visit). Bytes not readable at all (no
+// mapping) are uploaded as zeros, reported.
+static void ReadUploadSource(uint8_t* destination, uint64_t address, uint64_t size) {
+	if (Libs::LibKernel::Memory::TryReadBackingToHost(address, destination, size)) return;
+#if defined(_WIN32)
+	if (const auto missed = Common::GuardedCopy(destination, reinterpret_cast<const void*>(address), size); missed != 0) {
+		std::memset(destination + (size - missed), 0, missed);
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 8)
+			std::printf("BufferCache: an upload's source 0x%llx+0x%llx is unreadable from +0x%llx: zeros uploaded\n",
+			            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
+			            static_cast<unsigned long long>(size - missed));
+	}
+#else
+	std::memcpy(destination, reinterpret_cast<const void*>(address), size);
+#endif
+}
+
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                                      uint64_t total_size) {
 	if (copies.empty()) {
@@ -1786,7 +1840,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			if (source != nullptr) {
 				AsyncUpload::Get().Push(mapped + copy.srcOffset, source, copy.size, address);
 			} else {
-				std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+				ReadUploadSource(mapped + copy.srcOffset, address, copy.size);
 			}
 			copy.srcOffset += base_offset;
 		}
@@ -1798,9 +1852,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
 	for (const auto& copy: copies) {
-		const auto address = buffer.CpuAddress() + copy.dstOffset;
-		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
-		            reinterpret_cast<const void*>(address), copy.size);
+		ReadUploadSource(temporary->Mapped().data() + copy.srcOffset, buffer.CpuAddress() + copy.dstOffset, copy.size);
 	}
 	temporary->Flush(0, total_size);
 	const auto handle = temporary->Handle();
