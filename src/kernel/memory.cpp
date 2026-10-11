@@ -262,6 +262,12 @@ static bool IsPrivateCommittedRangeType(VirtualRangeType type) {
 // hundreds of pages at once, growing with play time (0.3-0.8 s stalls after world switches).
 class VirtualRanges {
 public:
+	VirtualRanges() = default;
+	~VirtualRanges() {
+		for (auto& chunk: m_committed) delete[] chunk.load(std::memory_order_relaxed);
+	}
+	KYTY_CLASS_NO_COPY(VirtualRanges);
+
 	struct Range {
 		uint64_t         start          = 0;
 		uint64_t         size           = 0;
@@ -300,6 +306,7 @@ public:
 		r.disallow_merge = disallow_merge;
 		CopyVirtualRangeName(r.name, name);
 		MergeAroundUnlocked(m_ranges.emplace_hint(position, start, r));
+		if (IsCommittedRangeType(type)) MarkCommittedUnlocked(start, size, true);
 		return true;
 	}
 
@@ -309,6 +316,7 @@ public:
 
 		const auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size) {
+			if (IsCommittedRangeType(position->second.type)) MarkCommittedUnlocked(start, size, false);
 			m_ranges.erase(position);
 			return true;
 		}
@@ -503,6 +511,32 @@ public:
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
+		}
+		if (FullyCommitted(virtual_addr, size)) {
+			// KYTY_VERIFY_COMMITTED=1: the locked walk's answer compared (COMMITTED-MISMATCH lines; none over two
+			// rounds of the user's 1-1 route).
+			static const bool verify = std::getenv("KYTY_VERIFY_COMMITTED") != nullptr;
+			if (verify) {
+				Common::LockGuard lock(m_mutex);
+				uint64_t          covered = 0;
+				auto              it      = m_ranges.upper_bound(virtual_addr);
+				if (it != m_ranges.begin()) {
+					--it;
+					uint64_t expected = virtual_addr;
+					for (; it != m_ranges.end() && it->second.start <= expected && covered < size; ++it) {
+						const auto range_end = End(it->second.start, it->second.size);
+						if (range_end <= expected || !IsCommittedRangeType(it->second.type)) break;
+						covered += std::min(size - covered, range_end - expected);
+						expected = range_end;
+					}
+				}
+				static std::atomic<uint32_t> mismatches {0};
+				if (covered != size && mismatches.fetch_add(1, std::memory_order_relaxed) < 32)
+					std::printf("COMMITTED-MISMATCH addr=0x%llx size=0x%llx covered=0x%llx\n",
+					            static_cast<unsigned long long>(virtual_addr), static_cast<unsigned long long>(size),
+					            static_cast<unsigned long long>(covered));
+			}
+			return size;
 		}
 		struct CachedRange {
 			uint64_t identity = 0, epoch = 0, begin = 0, end = 0;
@@ -703,6 +737,12 @@ private:
 	// made mergeable: the pieces and their two neighbours. Every other adjacent pair was already unmergeable (each
 	// mutation merges around what it changed), so this equals merging the whole list.
 	void SpliceUnlocked(Iterator first, Iterator last, const std::vector<Range>& pieces) {
+		for (auto it = first; it != last; ++it) {
+			if (IsCommittedRangeType(it->second.type)) MarkCommittedUnlocked(it->second.start, it->second.size, false);
+		}
+		for (const auto& piece: pieces) {
+			if (IsCommittedRangeType(piece.type)) MarkCommittedUnlocked(piece.start, piece.size, true);
+		}
 		auto hint = m_ranges.erase(first, last);
 		if (pieces.empty()) {
 			return; // (a gap now separates the neighbours)
@@ -808,6 +848,68 @@ private:
 			}
 		}
 		return nullptr;
+	}
+
+	// Committed pages (a bit per 4 KiB page, set for pages a committed range covers whole, by 1 GiB chunk), read without
+	// the lock: a request on set pages only is fully committed. Written under m_mutex: cleared for each committed range
+	// that goes before set for each one that comes, so a reader racing a change sees the pages before or after it (or
+	// clear: the locked path answers). Guest addresses past the chunks take the locked path.
+	static constexpr uint64_t CommittedPageBits = 12, CommittedChunkBits = 30, CommittedChunks = 1024;
+	static constexpr uint64_t CommittedChunkWords = uint64_t {1} << (CommittedChunkBits - CommittedPageBits - 6);
+	std::array<std::atomic<std::atomic<uint64_t>*>, CommittedChunks> m_committed {};
+
+	void MarkCommittedUnlocked(uint64_t start, uint64_t size, bool on) {
+		const auto end = End(start, size);
+		// Set: the pages the range covers whole; cleared: every page it touches.
+		auto first = on ? (start + (uint64_t {1} << CommittedPageBits) - 1) >> CommittedPageBits : start >> CommittedPageBits;
+		auto last  = on ? end >> CommittedPageBits : (end + (uint64_t {1} << CommittedPageBits) - 1) >> CommittedPageBits;
+		last       = std::min<uint64_t>(last, CommittedChunks << (CommittedChunkBits - CommittedPageBits));
+		for (auto page = first; page < last;) {
+			const auto chunk_index = page >> (CommittedChunkBits - CommittedPageBits);
+			auto*      chunk       = m_committed[chunk_index].load(std::memory_order_acquire);
+			const auto chunk_end   = (chunk_index + 1) << (CommittedChunkBits - CommittedPageBits);
+			const auto stop        = std::min(last, chunk_end);
+			if (chunk == nullptr) {
+				if (!on) {
+					page = stop;
+					continue;
+				}
+				chunk = new std::atomic<uint64_t>[CommittedChunkWords] {};
+				m_committed[chunk_index].store(chunk, std::memory_order_release);
+			}
+			for (; page < stop;) {
+				const auto local = page - (chunk_index << (CommittedChunkBits - CommittedPageBits));
+				const auto bit   = local & 63u;
+				const auto count = std::min<uint64_t>(64 - bit, stop - page);
+				const auto mask  = (count == 64 ? ~uint64_t {0} : ((uint64_t {1} << count) - 1)) << bit;
+				if (on)
+					chunk[local >> 6].fetch_or(mask, std::memory_order_release);
+				else
+					chunk[local >> 6].fetch_and(~mask, std::memory_order_release);
+				page += count;
+			}
+		}
+	}
+
+	[[nodiscard]] bool FullyCommitted(uint64_t start, uint64_t size) const {
+		const auto first = start >> CommittedPageBits;
+		const auto last  = (start + size - 1) >> CommittedPageBits; // (inclusive; size != 0, no overflow: checked)
+		if (last >= (CommittedChunks << (CommittedChunkBits - CommittedPageBits))) return false;
+		for (auto page = first; page <= last;) {
+			const auto chunk_index = page >> (CommittedChunkBits - CommittedPageBits);
+			const auto* chunk      = m_committed[chunk_index].load(std::memory_order_acquire);
+			if (chunk == nullptr) return false;
+			const auto stop = std::min(last + 1, (chunk_index + 1) << (CommittedChunkBits - CommittedPageBits));
+			for (; page < stop;) {
+				const auto local = page - (chunk_index << (CommittedChunkBits - CommittedPageBits));
+				const auto bit   = local & 63u;
+				const auto count = std::min<uint64_t>(64 - bit, stop - page);
+				const auto mask  = (count == 64 ? ~uint64_t {0} : ((uint64_t {1} << count) - 1)) << bit;
+				if ((chunk[local >> 6].load(std::memory_order_acquire) & mask) != mask) return false;
+				page += count;
+			}
+		}
+		return true;
 	}
 
 	Ranges        m_ranges;
