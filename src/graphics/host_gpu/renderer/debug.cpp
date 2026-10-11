@@ -38,7 +38,8 @@ static bool RenderTargetMaskHasBoundMrt(const CommandBuffer& buffer) {
 
 	uint32_t bound_targets = 0;
 	for (uint32_t i = 0; i < 8; i++) {
-		if (render_target_mask_slot(mask, i) != 0 && hw.GetRenderTarget(i).base.addr != 0) {
+		if (render_target_mask_slot(mask, i) != 0 && hw.GetRenderTarget(i).base.addr != 0 &&
+		    hw.GetRenderTarget(i).info.format != Prospero::ChannelLayout::kInvalid) {
 			bound_targets++;
 		}
 	}
@@ -50,7 +51,8 @@ uint32_t render_target_first_bound_slot(const CommandBuffer& buffer) {
 	const auto& hw   = buffer.GetRegisters();
 	const auto  mask = hw.GetRenderTargetMask();
 	for (uint32_t i = 0; i < 8; i++) {
-		if (render_target_mask_slot(mask, i) != 0 && hw.GetRenderTarget(i).base.addr != 0) {
+		if (render_target_mask_slot(mask, i) != 0 && hw.GetRenderTarget(i).base.addr != 0 &&
+		    hw.GetRenderTarget(i).info.format != Prospero::ChannelLayout::kInvalid) {
 			return i;
 		}
 	}
