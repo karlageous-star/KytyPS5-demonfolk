@@ -256,6 +256,10 @@ static bool IsPrivateCommittedRangeType(VirtualRangeType type) {
 	       type == VirtualRangeType::Runtime;
 }
 
+// The guest's virtual ranges, sorted and disjoint, keyed by their start. A tree: a streamed texture pool leaves tens of
+// thousands of ranges (one per direct mapping, never merged), and as a sorted vector each insertion or removal moved
+// the ranges after it (~80 bytes each): up to ~10 ms per munmap, 70 ms of a frame when the game unmapped and mapped
+// hundreds of pages at once, growing with play time (0.3-0.8 s stalls after world switches).
 class VirtualRanges {
 public:
 	struct Range {
@@ -277,12 +281,12 @@ public:
 		if (start == 0 || size == 0) {
 			return false;
 		}
-		auto position = LowerBound(start);
+		auto position = m_ranges.lower_bound(start);
 		if ((position != m_ranges.end() &&
-		     VirtualRangesOverlap(start, size, position->start, position->size)) ||
+		     VirtualRangesOverlap(start, size, position->second.start, position->second.size)) ||
 		    (position != m_ranges.begin() &&
-		     VirtualRangesOverlap(start, size, std::prev(position)->start,
-		                          std::prev(position)->size))) {
+		     VirtualRangesOverlap(start, size, std::prev(position)->second.start,
+		                          std::prev(position)->second.size))) {
 			return false;
 		}
 
@@ -295,9 +299,7 @@ public:
 		r.type           = type;
 		r.disallow_merge = disallow_merge;
 		CopyVirtualRangeName(r.name, name);
-		const auto index = static_cast<size_t>(position - m_ranges.begin());
-		m_ranges.insert(position, r);
-		MergeAroundUnlocked(index);
+		MergeAroundUnlocked(m_ranges.emplace_hint(position, start, r));
 		return true;
 	}
 
@@ -305,8 +307,8 @@ public:
 		Common::LockGuard lock(m_mutex);
 		Mutation          mutation(*this);
 
-		auto position = LowerBound(start);
-		if (position != m_ranges.end() && position->start == start && position->size == size) {
+		const auto position = m_ranges.find(start);
+		if (position != m_ranges.end() && position->second.size == size) {
 			m_ranges.erase(position);
 			return true;
 		}
@@ -336,9 +338,9 @@ public:
 		Mutation          mutation(*this);
 
 		// Ranges start at distinct addresses: only the one starting at `start` can match.
-		auto position = LowerBound(start);
-		if (position != m_ranges.end() && position->start == start && position->size == size &&
-		    IsReservedRangeType(position->type)) {
+		const auto position = m_ranges.find(start);
+		if (position != m_ranges.end() && position->second.size == size &&
+		    IsReservedRangeType(position->second.type)) {
 			m_ranges.erase(position);
 		}
 		return true;
@@ -390,10 +392,10 @@ public:
 		Common::LockGuard lock(m_mutex);
 		Mutation          mutation(*this);
 
-		auto position = LowerBound(start);
-		if (position != m_ranges.end() && position->start == start && position->size == size) {
-			CopyVirtualRangeName(position->name, name);
-			MergeAroundUnlocked(static_cast<size_t>(position - m_ranges.begin()));
+		const auto position = m_ranges.find(start);
+		if (position != m_ranges.end() && position->second.size == size) {
+			CopyVirtualRangeName(position->second.name, name);
+			MergeAroundUnlocked(position);
 			return;
 		}
 		EditUnlocked(start, size, [name](Range* r) { CopyVirtualRangeName(r->name, name); });
@@ -418,13 +420,11 @@ public:
 
 		Common::LockGuard lock(m_mutex);
 
-		auto next = std::upper_bound(
-		    m_ranges.begin(), m_ranges.end(), addr,
-		    [](uint64_t value, const Range& range) { return value < range.start; });
+		auto next = m_ranges.upper_bound(addr);
 		if (next != m_ranges.begin()) {
-			auto current = std::prev(next);
-			if (addr < End(current->start, current->size)) {
-				*out = *current;
+			const auto& current = std::prev(next)->second;
+			if (addr < End(current.start, current.size)) {
+				*out = current;
 				return true;
 			}
 		}
@@ -432,7 +432,7 @@ public:
 			return false;
 		}
 
-		*out = *next;
+		*out = next->second;
 		return true;
 	}
 
@@ -447,16 +447,13 @@ public:
 
 		const auto end     = start + size;
 		auto       current = start;
-		// Ranges are sorted and disjoint: start at the last one beginning at or before `start`
-		// (a streamed texture pool leaves tens of thousands of ranges; a scan from the first
-		// one cost milliseconds per sparse read).
-		auto first = std::upper_bound(m_ranges.begin(), m_ranges.end(), start,
-		                              [](uint64_t value, const Range& range) { return value < range.start; });
+		// Ranges are sorted and disjoint: start at the last one beginning at or before `start`.
+		auto first = m_ranges.upper_bound(start);
 		if (first != m_ranges.begin()) {
 			--first;
 		}
 		for (auto it = first; it != m_ranges.end(); ++it) {
-			const auto& range     = *it;
+			const auto& range     = it->second;
 			const auto  range_end = End(range.start, range.size);
 			if (range_end <= current) {
 				continue;
@@ -482,6 +479,27 @@ public:
 		return false;
 	}
 
+	// The end of the committed virtual range `virtual_addr` lies in (0: none), itself, not the ranges after it.
+	uint64_t MappingEnd(uint64_t virtual_addr) {
+		thread_local std::array<std::pair<uint64_t, uint64_t>, 16> cache {};       // (begin, end) by address
+		thread_local std::array<std::pair<uint64_t, uint64_t>, 16> cache_stamp {}; // (identity, epoch)
+		const auto slot  = ((virtual_addr >> 20) ^ (virtual_addr >> 32)) & 15u;
+		const auto epoch = m_epoch.load(std::memory_order_acquire);
+		if (!(epoch & 1) && cache_stamp[slot] == std::pair {m_identity, epoch} && virtual_addr >= cache[slot].first &&
+		    virtual_addr < cache[slot].second)
+			return cache[slot].second;
+		Common::LockGuard lock(m_mutex);
+		auto vma = m_ranges.upper_bound(virtual_addr);
+		if (vma == m_ranges.begin()) return 0;
+		--vma;
+		const auto& range   = vma->second;
+		const auto  vma_end = End(range.start, range.size);
+		if (virtual_addr < range.start || virtual_addr >= vma_end || !IsCommittedRangeType(range.type)) return 0;
+		cache[slot]       = {range.start, vma_end};
+		cache_stamp[slot] = {m_identity, m_epoch.load(std::memory_order_relaxed)};
+		return vma_end;
+	}
+
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
@@ -502,30 +520,28 @@ public:
 		}
 		Common::LockGuard lock(m_mutex);
 
-		auto vma = std::upper_bound(
-		    m_ranges.begin(), m_ranges.end(), virtual_addr,
-		    [](uint64_t value, const Range& range) { return value < range.start; });
+		auto vma = m_ranges.upper_bound(virtual_addr);
 		if (vma == m_ranges.begin()) {
 			return 0;
 		}
 		--vma;
 
-		const auto vma_end = End(vma->start, vma->size);
-		if (virtual_addr < vma->start || virtual_addr >= vma_end ||
-		    !IsCommittedRangeType(vma->type)) {
+		const auto vma_end = End(vma->second.start, vma->second.size);
+		if (virtual_addr < vma->second.start || virtual_addr >= vma_end ||
+		    !IsCommittedRangeType(vma->second.type)) {
 			return 0;
 		}
 
-		const auto cache_begin  = vma->start;
+		const auto cache_begin  = vma->second.start;
 		auto       cache_end    = vma_end;
-		uint64_t clamped_size = std::min(size, vma_end - virtual_addr);
-		uint64_t expected     = virtual_addr + clamped_size;
+		uint64_t   clamped_size = std::min(size, vma_end - virtual_addr);
+		uint64_t   expected     = virtual_addr + clamped_size;
 		++vma;
 
-		while (vma != m_ranges.end() && vma->start == expected && IsCommittedRangeType(vma->type) &&
+		while (vma != m_ranges.end() && vma->second.start == expected && IsCommittedRangeType(vma->second.type) &&
 		       clamped_size < size) {
-			cache_end        = End(vma->start, vma->size);
-			const auto chunk = std::min(size - clamped_size, vma->size);
+			cache_end        = End(vma->second.start, vma->second.size);
+			const auto chunk = std::min(size - clamped_size, vma->second.size);
 			clamped_size += chunk;
 			expected += chunk;
 			++vma;
@@ -548,19 +564,19 @@ public:
 		}
 		const auto        end = virtual_addr + size;
 		Common::LockGuard lock(m_mutex);
-		auto              range = std::upper_bound(m_ranges.begin(), m_ranges.end(), virtual_addr,
-		                                           [](uint64_t value, const Range& r) { return value < r.start; });
-		if (range != m_ranges.begin()) {
-			--range;
+		auto              it  = m_ranges.upper_bound(virtual_addr);
+		if (it != m_ranges.begin()) {
+			--it;
 		}
-		for (; range != m_ranges.end() && range->start < end; ++range) {
-			const auto range_end = End(range->start, range->size);
-			if (range_end <= virtual_addr || !IsCommittedRangeType(range->type)) {
+		for (; it != m_ranges.end() && it->second.start < end; ++it) {
+			const auto& range     = it->second;
+			const auto  range_end = End(range.start, range.size);
+			if (range_end <= virtual_addr || !IsCommittedRangeType(range.type)) {
 				continue;
 			}
-			const auto begin          = std::max(range->start, virtual_addr);
+			const auto begin          = std::max(range.start, virtual_addr);
 			const auto finish         = std::min(range_end, end);
-			const bool private_memory = IsPrivateCommittedRangeType(range->type);
+			const bool private_memory = IsPrivateCommittedRangeType(range.type);
 			if (!out->empty() && out->back().address + out->back().size == begin &&
 			    out->back().private_memory == private_memory) {
 				out->back().size += finish - begin;
@@ -574,7 +590,7 @@ public:
 		Common::LockGuard lock(m_mutex);
 
 		uint64_t used = 0;
-		for (const auto& r: m_ranges) {
+		for (const auto& [key, r]: m_ranges) {
 			if (!IsCommittedRangeType(r.type) || r.size == 0) {
 				continue;
 			}
@@ -596,6 +612,9 @@ public:
 	}
 
 private:
+	using Ranges   = std::map<uint64_t, Range>;
+	using Iterator = Ranges::iterator;
+
 	// Writers already hold m_mutex. Odd epochs make concurrent cache readers
 	// take that lock; the final release invalidates every previous interval.
 	struct Mutation {
@@ -641,81 +660,73 @@ private:
 		ranges->push_back(piece);
 	}
 
-	std::vector<Range>::iterator LowerBound(uint64_t start) {
-		return std::lower_bound(
-		    m_ranges.begin(), m_ranges.end(), start,
-		    [](const Range& range, uint64_t value) { return range.start < value; });
-	}
-
-	void MergeAroundUnlocked(size_t index) {
-		if (index >= m_ranges.size()) {
+	// `it` with the adjacent ranges it can merge with (its predecessor first, then its successors).
+	void MergeAroundUnlocked(Iterator it) {
+		if (it == m_ranges.end()) {
 			return;
 		}
-		if (index != 0) {
-			auto& previous = m_ranges[index - 1];
-			auto& current  = m_ranges[index];
-			if (End(previous.start, previous.size) == current.start &&
-			    SameMergeKey(previous, current)) {
-				previous.size += current.size;
-				m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(index));
-				index--;
+		if (it != m_ranges.begin()) {
+			const auto previous = std::prev(it);
+			if (End(previous->second.start, previous->second.size) == it->second.start &&
+			    SameMergeKey(previous->second, it->second)) {
+				previous->second.size += it->second.size;
+				m_ranges.erase(it);
+				it = previous;
 			}
 		}
-		while (index + 1 < m_ranges.size()) {
-			auto& current = m_ranges[index];
-			auto& next    = m_ranges[index + 1];
-			if (End(current.start, current.size) != next.start || !SameMergeKey(current, next)) {
+		for (auto next = std::next(it); next != m_ranges.end(); next = std::next(it)) {
+			if (End(it->second.start, it->second.size) != next->second.start ||
+			    !SameMergeKey(it->second, next->second)) {
 				break;
 			}
-			current.size += next.size;
-			m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(index + 1));
+			it->second.size += next->second.size;
+			m_ranges.erase(next);
 		}
 	}
 
-	// The ranges overlapping [start, start + size): [first, last) of m_ranges (sorted, disjoint,
-	// never empty). Only the range containing `start` can begin before it.
-	std::pair<size_t, size_t> OverlapSpan(uint64_t start, uint64_t size) const {
+	// The ranges overlapping [start, start + size): [first, last) (sorted, disjoint, never empty).
+	// Only the range containing `start` can begin before it.
+	std::pair<Iterator, Iterator> OverlapSpan(uint64_t start, uint64_t size) {
 		const auto end   = End(start, size);
-		auto       first = std::upper_bound(m_ranges.begin(), m_ranges.end(), start,
-		                                    [](uint64_t value, const Range& range) { return value < range.start; });
-		if (first != m_ranges.begin() && End(std::prev(first)->start, std::prev(first)->size) > start) {
+		auto       first = m_ranges.upper_bound(start);
+		if (first != m_ranges.begin() && End(std::prev(first)->second.start, std::prev(first)->second.size) > start) {
 			--first;
 		}
 		auto last = first;
-		while (last != m_ranges.end() && last->start < end) {
+		while (last != m_ranges.end() && last->second.start < end) {
 			++last;
 		}
-		return {static_cast<size_t>(first - m_ranges.begin()), static_cast<size_t>(last - m_ranges.begin())};
+		return {first, last};
 	}
 
-	// Replaces m_ranges[first, last) with `pieces` (in order), then merges what the change can
-	// have made mergeable: the pieces and their two neighbours. Every other adjacent pair was
-	// already unmergeable (each mutation merges around what it changed), so this equals merging
-	// the whole list, without copying and re-sorting tens of thousands of streamed-texture ranges
-	// under the lock the render thread's range lookups take.
-	void SpliceUnlocked(size_t first, size_t last, const std::vector<Range>& pieces) {
-		const auto replaced = last - first;
-		const auto common   = std::min(replaced, pieces.size());
-		std::copy_n(pieces.begin(), common, m_ranges.begin() + static_cast<std::ptrdiff_t>(first));
-		if (pieces.size() < replaced) {
-			m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(first + common),
-			               m_ranges.begin() + static_cast<std::ptrdiff_t>(last));
-		} else if (pieces.size() > replaced) {
-			m_ranges.insert(m_ranges.begin() + static_cast<std::ptrdiff_t>(first + common),
-			                pieces.begin() + static_cast<std::ptrdiff_t>(common), pieces.end());
+	// Replaces [first, last) with `pieces` (in order, inside the replaced span), then merges what the change can have
+	// made mergeable: the pieces and their two neighbours. Every other adjacent pair was already unmergeable (each
+	// mutation merges around what it changed), so this equals merging the whole list.
+	void SpliceUnlocked(Iterator first, Iterator last, const std::vector<Range>& pieces) {
+		auto hint = m_ranges.erase(first, last);
+		if (pieces.empty()) {
+			return; // (a gap now separates the neighbours)
 		}
-		// Merge within [first - 1, first + pieces.size() + 1).
-		size_t index = first == 0 ? 0 : first - 1;
-		size_t limit = std::min(m_ranges.size(), first + pieces.size() + 1);
-		while (index + 1 < limit) {
-			auto& current = m_ranges[index];
-			auto& next    = m_ranges[index + 1];
-			if (End(current.start, current.size) == next.start && SameMergeKey(current, next)) {
-				current.size += next.size;
-				m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(index + 1));
-				--limit;
+		Iterator inserted_first = m_ranges.end();
+		for (const auto& piece: pieces) {
+			const auto it = m_ranges.emplace_hint(hint, piece.start, piece);
+			if (inserted_first == m_ranges.end()) inserted_first = it;
+			hint = std::next(it);
+		}
+		// Merge within [the range before the first piece, the range after the last piece].
+		const auto stop_key = pieces.back().start;
+		auto       it       = inserted_first != m_ranges.begin() ? std::prev(inserted_first) : inserted_first;
+		while (it != m_ranges.end() && it->first <= stop_key) {
+			const auto next = std::next(it);
+			if (next == m_ranges.end()) {
+				break;
+			}
+			if (End(it->second.start, it->second.size) == next->second.start &&
+			    SameMergeKey(it->second, next->second)) {
+				it->second.size += next->second.size;
+				m_ranges.erase(next);
 			} else {
-				++index;
+				it = next;
 			}
 		}
 	}
@@ -732,8 +743,8 @@ private:
 		}
 		std::vector<Range> pieces;
 		auto               edit_end = End(start, size);
-		for (size_t i = first; i < last; ++i) {
-			const auto r     = m_ranges[i];
+		for (auto i = first; i != last; ++i) {
+			const auto r     = i->second;
 			auto       r_end = End(r.start, r.size);
 
 			auto mid_start = std::max(start, r.start);
@@ -767,8 +778,8 @@ private:
 		// Only the first overlapping range can keep a head and only the last one a tail.
 		std::vector<Range> pieces;
 		const auto         rem_end = End(start, size);
-		const auto         head    = m_ranges[first];
-		const auto         tail    = m_ranges[last - 1];
+		const auto         head    = first->second;
+		const auto         tail    = std::prev(last)->second;
 		AddPiece(&pieces, head, head.start, std::max(start, head.start));
 		AddPiece(&pieces, tail, std::min(rem_end, End(tail.start, tail.size)), End(tail.start, tail.size));
 		SpliceUnlocked(first, last, pieces);
@@ -776,31 +787,31 @@ private:
 	}
 
 	// The range of `type` that contains `address`, or null.
-	const Range* FindContainingUnlocked(uint64_t address, VirtualRangeType type) const {
+	const Range* FindContainingUnlocked(uint64_t address, VirtualRangeType type) {
 		const auto [first, last] = OverlapSpan(address, 1);
-		if (first == last || m_ranges[first].type != type || m_ranges[first].start > address) {
+		if (first == last || first->second.type != type || first->second.start > address) {
 			return nullptr;
 		}
-		return &m_ranges[first];
+		return &first->second;
 	}
 
 	Range* FindOverlap(uint64_t start, uint64_t size) {
-		auto position = LowerBound(start);
+		auto position = m_ranges.lower_bound(start);
 		if (position != m_ranges.end() &&
-		    VirtualRangesOverlap(start, size, position->start, position->size)) {
-			return &*position;
+		    VirtualRangesOverlap(start, size, position->second.start, position->second.size)) {
+			return &position->second;
 		}
 		if (position != m_ranges.begin()) {
 			auto previous = std::prev(position);
-			if (VirtualRangesOverlap(start, size, previous->start, previous->size)) {
-				return &*previous;
+			if (VirtualRangesOverlap(start, size, previous->second.start, previous->second.size)) {
+				return &previous->second;
 			}
 		}
 		return nullptr;
 	}
 
-	std::vector<Range> m_ranges;
-	Common::Mutex      m_mutex;
+	Ranges        m_ranges;
+	Common::Mutex m_mutex;
 };
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -865,7 +876,7 @@ public:
 	[[nodiscard]] const std::map<uint64_t, AllocatedBlock>& GetPhysicalBlocks() const {
 		return m_physical;
 	}
-	[[nodiscard]] const std::vector<AllocatedBlock>& GetMappings() const { return m_mappings; }
+	[[nodiscard]] const std::map<uint64_t, AllocatedBlock>& GetMappings() const { return m_mappings; }
 
 private:
 	void ConsumeFreeRange(std::map<uint64_t, uint64_t>::iterator range, uint64_t start,
@@ -874,7 +885,20 @@ private:
 
 	std::map<uint64_t, AllocatedBlock> m_physical;
 	std::map<uint64_t, uint64_t>       m_free;
-	std::vector<AllocatedBlock>        m_mappings;
+	// The mappings overlapping [vaddr, vaddr + len), in order (m_mutex held).
+	template <typename Func>
+	void ForEachMappingOverlapping(uint64_t vaddr, uint64_t len, Func&& func) {
+		auto it = m_mappings.upper_bound(vaddr);
+		if (it != m_mappings.begin() && std::prev(it)->second.map_vaddr + std::prev(it)->second.map_size > vaddr) {
+			--it;
+		}
+		for (; it != m_mappings.end() && it->second.map_vaddr < vaddr + len; ++it) {
+			if (VirtualRangesOverlap(vaddr, len, it->second.map_vaddr, it->second.map_size)) func(it->second);
+		}
+	}
+	// The mappings by their virtual address (disjoint): a vector scanned at every map, unmap and protection change
+	// held tens of thousands of streamed-texture mappings (~130 bytes each).
+	std::map<uint64_t, AllocatedBlock> m_mappings;
 	Common::Mutex                      m_mutex;
 };
 
@@ -1444,7 +1468,7 @@ void RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func) {
 	g_free_callback  = free_func;
 
 	g_physical_memory->GetMutex().Lock();
-	for (const auto& b: g_physical_memory->GetMappings()) {
+	for (const auto& [mapped_vaddr, b]: g_physical_memory->GetMappings()) {
 		if (b.map_vaddr != 0 && b.map_size != 0) {
 			g_alloc_callback(b.map_vaddr, b.map_size);
 		}
@@ -1720,7 +1744,7 @@ bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len, int pro
 	mapping.prot           = prot;
 	mapping.mode           = mode;
 	mapping.gpu_mode       = gpu_mode;
-	m_mappings.push_back(mapping);
+	m_mappings.insert_or_assign(vaddr, mapping); // (a stale record at that address is replaced)
 
 	return true;
 }
@@ -1833,58 +1857,63 @@ bool PhysicalMemory::Unmap(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mod
 		if (host_vaddr_to_release == nullptr || host_vaddr == 0 || host_size == 0) {
 			return;
 		}
-		const bool still_mapped = std::any_of(
-		    m_mappings.begin(), m_mappings.end(), [host_vaddr, host_size](const auto& block) {
-			    return block.host_vaddr == host_vaddr && block.host_size == host_size;
-		    });
+		const bool still_mapped = std::any_of(m_mappings.begin(), m_mappings.end(), [host_vaddr, host_size](const auto& entry) {
+			return entry.second.host_vaddr == host_vaddr && entry.second.host_size == host_size;
+		});
 		if (!still_mapped) {
 			*host_vaddr_to_release = host_vaddr;
 		}
 	};
 
-	size_t index = 0;
-	for (auto& b: m_mappings) {
-		if (b.map_vaddr == vaddr && b.map_size == size) {
-			*gpu_mode             = b.gpu_mode;
-			const auto host_vaddr = b.host_vaddr;
-			const auto host_size  = b.host_size;
+	// The one mapping containing `vaddr` (they are disjoint).
+	auto it = m_mappings.upper_bound(vaddr);
+	if (it == m_mappings.begin()) {
+		return false;
+	}
+	--it;
+	auto& b = it->second;
+	if (b.map_vaddr == vaddr && b.map_size == size) {
+		*gpu_mode             = b.gpu_mode;
+		const auto host_vaddr = b.host_vaddr;
+		const auto host_size  = b.host_size;
 
-			m_mappings.erase(m_mappings.begin() + static_cast<std::ptrdiff_t>(index));
-			set_host_release_if_last(host_vaddr, host_size);
+		m_mappings.erase(it);
+		set_host_release_if_last(host_vaddr, host_size);
 
-			return true;
-		}
-		if (vaddr > b.map_vaddr && vaddr + size < b.map_vaddr + b.map_size) {
-			*gpu_mode = b.gpu_mode;
+		return true;
+	}
+	if (vaddr > b.map_vaddr && vaddr + size < b.map_vaddr + b.map_size) {
+		*gpu_mode = b.gpu_mode;
 
-			AllocatedBlock right = b;
-			right.start_addr += (vaddr + size) - b.map_vaddr;
-			right.size      = b.map_vaddr + b.map_size - (vaddr + size);
-			right.map_size  = right.size;
-			right.map_vaddr = vaddr + size;
+		AllocatedBlock right = b;
+		right.start_addr += (vaddr + size) - b.map_vaddr;
+		right.size      = b.map_vaddr + b.map_size - (vaddr + size);
+		right.map_size  = right.size;
+		right.map_vaddr = vaddr + size;
 
-			b.size     = vaddr - b.map_vaddr;
-			b.map_size = b.size;
-			m_mappings.push_back(right);
-			return true;
-		}
-		if (vaddr == b.map_vaddr && size < b.map_size) {
-			*gpu_mode = b.gpu_mode;
+		b.size     = vaddr - b.map_vaddr;
+		b.map_size = b.size;
+		m_mappings.insert_or_assign(right.map_vaddr, right);
+		return true;
+	}
+	if (vaddr == b.map_vaddr && size < b.map_size) {
+		*gpu_mode = b.gpu_mode;
 
-			b.start_addr += size;
-			b.size -= size;
-			b.map_vaddr += size;
-			b.map_size -= size;
-			return true;
-		}
-		if (vaddr > b.map_vaddr && vaddr + size == b.map_vaddr + b.map_size) {
-			*gpu_mode = b.gpu_mode;
+		AllocatedBlock rest = b;
+		rest.start_addr += size;
+		rest.size -= size;
+		rest.map_vaddr += size;
+		rest.map_size -= size;
+		m_mappings.erase(it);
+		m_mappings.insert_or_assign(rest.map_vaddr, rest);
+		return true;
+	}
+	if (vaddr > b.map_vaddr && vaddr + size == b.map_vaddr + b.map_size) {
+		*gpu_mode = b.gpu_mode;
 
-			b.size     = vaddr - b.map_vaddr;
-			b.map_size = b.size;
-			return true;
-		}
-		index++;
+		b.size     = vaddr - b.map_vaddr;
+		b.map_size = b.size;
+		return true;
 	}
 
 	return false;
@@ -1899,13 +1928,19 @@ void PhysicalMemory::ProtectMapping(uint64_t vaddr, uint64_t size, int prot,
 
 	const auto                  end = vaddr + size;
 	std::vector<AllocatedBlock> updated;
-	updated.reserve(m_mappings.size() + 2);
-	for (const auto& block: m_mappings) {
+	// The mappings the range overlaps (disjoint: from the one containing `vaddr`), replaced by their pieces.
+	auto it = m_mappings.upper_bound(vaddr);
+	if (it != m_mappings.begin() && std::prev(it)->second.map_vaddr + std::prev(it)->second.map_size > vaddr) {
+		--it;
+	}
+	while (it != m_mappings.end() && it->second.map_vaddr < end) {
+		const auto block     = it->second;
 		const auto block_end = block.map_vaddr + block.map_size;
 		if (!VirtualRangesOverlap(vaddr, size, block.map_vaddr, block.map_size)) {
-			updated.push_back(block);
+			++it;
 			continue;
 		}
+		it                       = m_mappings.erase(it);
 		const auto overlap_start = std::max(vaddr, block.map_vaddr);
 		const auto overlap_end   = std::min(end, block_end);
 		if (block.map_vaddr < overlap_start) {
@@ -1932,7 +1967,9 @@ void PhysicalMemory::ProtectMapping(uint64_t vaddr, uint64_t size, int prot,
 			updated.push_back(right);
 		}
 	}
-	m_mappings = std::move(updated);
+	for (const auto& piece: updated) {
+		m_mappings.insert_or_assign(piece.map_vaddr, piece);
+	}
 }
 
 bool PhysicalMemory::Find(uint64_t phys_addr, bool next, AllocatedBlock* out) {
@@ -1962,7 +1999,7 @@ std::vector<PhysicalMemory::AllocatedBlock> PhysicalMemory::FindMappings(uint64_
 	Common::LockGuard lock(m_mutex);
 
 	std::vector<AllocatedBlock> mappings;
-	for (const auto& m: m_mappings) {
+	for (const auto& [mapped_vaddr, m]: m_mappings) {
 		if (!VirtualRangesOverlap(phys_addr, len, m.start_addr, m.size)) {
 			continue;
 		}
@@ -1986,39 +2023,36 @@ bool PhysicalMemory::Find(uint64_t vaddr, uint64_t* base_addr, size_t* len, int*
                           VirtualMemory::Mode* mode, GpuAccessMode* gpu_mode) {
 	Common::LockGuard lock(m_mutex);
 
-	return std::any_of(m_mappings.begin(), m_mappings.end(),
-	                   [vaddr, base_addr, len, prot, mode, gpu_mode](auto& b) {
-		                   if (vaddr >= b.map_vaddr && vaddr < b.map_vaddr + b.map_size) {
-			                   if (base_addr != nullptr) {
-				                   *base_addr = b.map_vaddr;
-			                   }
-			                   if (len != nullptr) {
-				                   *len = b.map_size;
-			                   }
-			                   if (prot != nullptr) {
-				                   *prot = b.prot;
-			                   }
-			                   if (mode != nullptr) {
-				                   *mode = b.mode;
-			                   }
-			                   if (gpu_mode != nullptr) {
-				                   *gpu_mode = b.gpu_mode;
-			                   }
-
-			                   return true;
-		                   }
-		                   return false;
-	                   });
+	auto it = m_mappings.upper_bound(vaddr);
+	if (it == m_mappings.begin()) {
+		return false;
+	}
+	const auto& b = std::prev(it)->second;
+	if (vaddr < b.map_vaddr || vaddr >= b.map_vaddr + b.map_size) {
+		return false;
+	}
+	if (base_addr != nullptr) {
+		*base_addr = b.map_vaddr;
+	}
+	if (len != nullptr) {
+		*len = b.map_size;
+	}
+	if (prot != nullptr) {
+		*prot = b.prot;
+	}
+	if (mode != nullptr) {
+		*mode = b.mode;
+	}
+	if (gpu_mode != nullptr) {
+		*gpu_mode = b.gpu_mode;
+	}
+	return true;
 }
 
 void PhysicalMemory::SetVirtualRangeName(uint64_t vaddr, uint64_t len, const char* name) {
 	Common::LockGuard lock(m_mutex);
 
-	for (auto& b: m_mappings) {
-		if (VirtualRangesOverlap(vaddr, len, b.map_vaddr, b.map_size)) {
-			CopyVirtualRangeName(b.name, name);
-		}
-	}
+	ForEachMappingOverlapping(vaddr, len, [name](AllocatedBlock& b) { CopyVirtualRangeName(b.name, name); });
 }
 
 bool FlexibleMemory::Map(uint64_t vaddr, size_t len, int prot, VirtualMemory::Mode mode,
@@ -2356,11 +2390,7 @@ void FlexibleMemory::SetVirtualRangeName(uint64_t vaddr, uint64_t len, const cha
 void PhysicalMemory::SetVirtualRangeMemoryType(uint64_t vaddr, uint64_t len, int memory_type) {
 	Common::LockGuard lock(m_mutex);
 
-	for (auto& b: m_mappings) {
-		if (VirtualRangesOverlap(vaddr, len, b.map_vaddr, b.map_size)) {
-			b.memory_type = memory_type;
-		}
-	}
+	ForEachMappingOverlapping(vaddr, len, [memory_type](AllocatedBlock& b) { b.memory_type = memory_type; });
 }
 
 uint64_t FlexibleMemory::Available() {
@@ -2924,8 +2954,7 @@ static int UnmapRange(uint64_t vaddr, size_t len, const VirtualRanges::Range& ra
 		if (DecodeMemoryProtection(range.protection, &direct_mode, &direct_gpu) &&
 		    g_guest_address_space->BackingContains(vaddr, len) &&
 		    g_guest_address_space->UnmapBacking(vaddr, len)) {
-			uint64_t ignored_host = 0;
-			if (g_physical_memory->Unmap(vaddr, len, &gpu_mode, &ignored_host)) {
+			if (g_physical_memory->Unmap(vaddr, len, &gpu_mode)) {
 				owner_unmapped = true;
 			} else {
 				EXIT_IF(!g_guest_address_space->MapBacking(vaddr, len, direct_offset, direct_mode));
