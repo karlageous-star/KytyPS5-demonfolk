@@ -174,11 +174,18 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
 
 	uint8_t config[ATRAC9_CONFIG_DATA_SIZE] {};
 	std::memcpy(config, config_data, sizeof(config));
+	// (A multichannel config: a channel's mono stream, then the channels' superframe.)
+	At9MultiConfig  multi {};
+	const bool      is_multi = At9ParseMultiConfig(config, &multi);
 	Atrac9CodecInfo codec_info {};
-	const int       init_result = Atrac9InitDecoder(handle, config);
+	const int       init_result = Atrac9InitDecoder(handle, is_multi ? multi.mono : config);
 	const int       info_result =
 	    init_result == 0 ? Atrac9GetCodecInfo(handle, &codec_info) : init_result;
 	Atrac9ReleaseHandle(handle);
+	if (is_multi && info_result == 0) {
+		codec_info.channels       = static_cast<int>(multi.channels);
+		codec_info.superframeSize = codec_info.superframeSize * static_cast<int>(multi.channels);
+	}
 
 	if (info_result != 0 || codec_info.channels <= 0 || codec_info.samplingRate <= 0 ||
 	    codec_info.frameSamples <= 0 || codec_info.framesInSuperframe <= 0 ||
