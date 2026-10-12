@@ -1389,24 +1389,16 @@ void InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
 void PrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
 	if (size == 0 || UINT64_MAX - vaddr < size || g_gpu_resources == nullptr) return;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	// From the first page a store would fault on to the end of the last one.
-	uint64_t first = 0, last = 0;
-	bool     any   = false;
-	for (uint64_t at = vaddr; at < vaddr + size;) {
-		MEMORY_BASIC_INFORMATION info {};
-		if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) == 0) return;
-		const auto end = std::min(reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize, vaddr + size);
-		if (end <= at) return;
-		const bool writable = info.State == MEM_COMMIT && (info.Protect & PAGE_GUARD) == 0 &&
-		                      (info.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0;
-		if (!writable) {
-			if (!any) first = at;
-			any  = true;
-			last = end;
-		}
-		at = end;
+	// From the first page a store would fault on to the end of the last one, of those the trackers protect: by the
+	// pages' state. (A VirtualQuery walk cost more than the reads at start-up - the kernel scans a region's page table to
+	// its end - 88% of the AMPR thread's time while the game loaded on a laptop.) A page the guest itself protects faults
+	// as before.
+	uint64_t first = 0, end = 0;
+	if (g_gpu_resources->WatchedSpan(vaddr, size, &first, &end)) {
+		first = std::max(first, vaddr);
+		end   = std::min(end, vaddr + size);
+		(void)g_gpu_resources->InvalidateMemoryForWrite(first, end - first);
 	}
-	if (any) (void)g_gpu_resources->InvalidateMemoryForWrite(first, last - first);
 #endif
 }
 

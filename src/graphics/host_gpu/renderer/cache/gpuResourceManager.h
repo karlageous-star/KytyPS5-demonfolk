@@ -33,6 +33,10 @@ public:
 	void                        SetGpu(GuestGpu* gpu) noexcept { m_gpu = gpu; }
 	// After a guest protection change: tracked pages get the tracker's protection back.
 	void ReapplyProtection(uint64_t vaddr, uint64_t size) { m_page_manager.ReapplyProtection(vaddr, size); }
+	// The pages of a range the trackers protect (PageManager::WatchedSpan).
+	[[nodiscard]] bool WatchedSpan(uint64_t vaddr, uint64_t size, uint64_t* first, uint64_t* end) const noexcept {
+		return m_page_manager.WatchedSpan(vaddr, size, first, end);
+	}
 	void SyncProtection(uint64_t vaddr, uint64_t size) { m_page_manager.SyncProtection(vaddr, size); }
 	// (PageManager::WatchedRuns: for a holder of the guest address-space lock.)
 	void WatchedRuns(uint64_t vaddr, uint64_t size, std::vector<PageManager::WatchedRun>* runs) const {

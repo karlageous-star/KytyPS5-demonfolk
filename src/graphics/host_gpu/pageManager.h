@@ -66,6 +66,9 @@ public:
 	// false when the page is watched. Checked and changed under the page's lock, so a watcher
 	// protecting the page meanwhile is not undone.
 	[[nodiscard]] bool RestoreIfUnwatched(uint64_t vaddr) noexcept;
+	// From the first to the end of the last page of [vaddr, vaddr + size) a watcher holds (its host protection is the
+	// trackers'), by the pages' state: no system call. False when no page of the range has one.
+	[[nodiscard]] bool WatchedSpan(uint64_t vaddr, uint64_t size, uint64_t* first, uint64_t* end) const noexcept;
 
 	template <bool track>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
