@@ -286,6 +286,7 @@ enum : uint32_t {
 	OpGroupNonUniformBallot        = 339,
 	OpGroupNonUniformBallotFindLSB = 343,
 	OpGroupNonUniformShuffle       = 345,
+	OpGroupNonUniformBitwiseOr     = 359,
 };
 
 enum : uint32_t {
