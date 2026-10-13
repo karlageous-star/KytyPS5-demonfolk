@@ -546,6 +546,53 @@ static bool ExtraMipsKeepLayout(const TileSurfaceDescription& physical, uint32_t
 	                  });
 }
 
+// KYTY_TEXTURE_LAYER_RANGE=1|0 (default: on with less than 12 GiB of video memory): a sampled array texture of one
+// level whose view starts past its first layer is held as the array of the layers the view reads, not whole. The
+// game's streamed texture pool is one T# of ~1700 1024x1024 BC layers (1.7 GB at 0x1009000000, over the shadow-map
+// pool's lent layers) of which a view samples one (base layer 737 at 2-3, 1617 at 4-1): the whole array was made, its
+// buffer joined from 8 others (3 s), and that buffer over the shadow-map layers refused their partial uploads, which
+// became whole 320 MiB uploads: frames of 5 and 17 s on an 8 GB laptop. Not a view of more than half the layers (an
+// array view from layer 17 of 1585 at 4-2): an image of nearly all of it beside the whole one other views take.
+static bool TextureLayerRangeEnabled(bool small_video_memory) {
+	static const char* const value = std::getenv("KYTY_TEXTURE_LAYER_RANGE");
+	return value != nullptr && value[0] != '\0' ? value[0] != '0' : small_video_memory;
+}
+
+static void HoldLayerRange(TextureCache& cache, TextureCache::ImageDesc& desc, bool small_video_memory) {
+	const auto& full  = desc.info;
+	const auto  first = desc.view_info.base_layer;
+	const auto  count = desc.view_info.layer_count;
+	if (first == 0 || count == 0 || full.resources.layers < 2 || first + count > full.resources.layers ||
+	    count > full.resources.layers / 2 ||
+	    !TextureLayerRangeEnabled(small_video_memory) || full.resources.levels != 1 || full.samples != 1 ||
+	    full.IsVolume() || full.IsDepth() || full.HasMetadata() || full.HasStencil() || full.mip_layout.empty() ||
+	    full.mip_layout[0].offset != 0 || full.mip_layout[0].size != full.data.size ||
+	    full.data.size % full.resources.layers != 0 || cache.HoldsImage(full)) {
+		return;
+	}
+	// One level with nothing before or after it: the layers are whole slices, one after another.
+	const uint64_t slice = full.data.size / full.resources.layers;
+	ImageInfo      from  = full;
+	from.data             = {full.data.address + slice * first, slice * count};
+	from.resources.layers = count;
+	from.mip_layout       = {};
+	PopulateTextureMipLayout(from);
+	if (from.data.address % (uint64_t {64} << 10u) != 0 || from.mip_layout[0].offset != 0 ||
+	    from.mip_layout[0].size != from.data.size) {
+		return;
+	}
+	if (full.data.size >= (uint64_t {256} << 20u)) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
+			std::printf("TextureCache: array view held as layers %u..%u of %u (0x%llx, %llu of %llu MiB)\n", first,
+			            first + count - 1, full.resources.layers, static_cast<unsigned long long>(from.data.address),
+			            static_cast<unsigned long long>(from.data.size >> 20u),
+			            static_cast<unsigned long long>(full.data.size >> 20u));
+	}
+	desc.info                 = from;
+	desc.view_info.base_layer = 0;
+}
+
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
                                      const SurfaceFormatInfo& surface_format, bool storage,
@@ -899,6 +946,10 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	desc.allow_reduced = !storage && !resource.exact_texels && !resource.depth_compare &&
 	                     resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
 
+	if (!storage && type == Prospero::ImageType::kColor2D) {
+		HoldFromBaseLevel(texture_cache, desc, m_context.GetGraphics().small_video_memory);
+	}
+	if (!storage) HoldLayerRange(texture_cache, desc, m_context.GetGraphics().small_video_memory);
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
