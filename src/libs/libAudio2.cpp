@@ -359,12 +359,20 @@ static bool audioout2_context_has_queueable_device(AudioOut2ContextHandle ctx) {
 
 // The object ports (mono float) are for the system's 3D audio to render. Demon's Souls puts its whole
 // game mix there as ambisonics: two fifth-order scenes, one channel per port (attribute 8 = 0x40 | ACN,
-// SN3D, its beds silent). Decoded here for stereo with two virtual cardioids facing left and right
-// (W and Y, left positive), which only the first order feeds; an object that is no ambisonics channel
-// plays in the centre. Each port's gain applies, and the result goes to the front left and right of
-// the context's first float main port. Adding the 36 channels up instead cancelled most directions.
+// SN3D, its beds silent). Decoded here for stereo from the first order (W, Y left positive, X front
+// positive) by two virtual microphones facing about 74 degrees left and right: a sound straight ahead
+// plays at full level on both sides, as a binaural render plays it, one behind at -3 dB (the level of
+// a surround downmix), and one at the side with the power it has ahead. Cardioids facing 90 degrees
+// (W and Y alone) played what is ahead, where people talk, 3 dB below what is at the sides. An object
+// that is no ambisonics channel plays in the centre. Each port's gain applies, and the result goes to
+// the front left and right of the context's first float main port. Adding the 36 channels up instead
+// cancelled most directions.
 static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, const AudioOut2PortStateEntry& target) {
-	constexpr float                 HALF_POWER = 0.70710677f;
+	constexpr float HALF_POWER = 0.70710677f;
+	// Ahead W + X = 1, behind W - X = 1/sqrt(2), at the side (W + Y)^2 + (W - Y)^2 = 2.
+	constexpr float W_GAIN = 0.85355339f;
+	constexpr float X_GAIN = 0.14644661f;
+	constexpr float Y_GAIN = 0.52100538f;
 	thread_local std::vector<float> mix;
 	const auto channels = audioout2_data_format_channels(target.data_format);
 	const auto frames   = target.samples_num;
@@ -378,9 +386,14 @@ static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, cons
 		float left = HALF_POWER, right = HALF_POWER;
 		if ((object.ambisonics & AUDIO_OUT2_AMBISONICS_CHANNEL) != 0) {
 			const auto acn = object.ambisonics & ~AUDIO_OUT2_AMBISONICS_CHANNEL;
-			if (acn == 1) {
-				right = -HALF_POWER;
-			} else if (acn != 0) {
+			if (acn == 0) {
+				left = right = W_GAIN;
+			} else if (acn == 1) {
+				left  = Y_GAIN;
+				right = -Y_GAIN;
+			} else if (acn == 3) {
+				left = right = X_GAIN;
+			} else {
 				continue;
 			}
 		}
