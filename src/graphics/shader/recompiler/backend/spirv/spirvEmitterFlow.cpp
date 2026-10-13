@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <atomic>
 #include <cstdlib>
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
@@ -27,6 +29,8 @@ static bool IsWaveOrScanRead(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (value == nullptr || value->GetOpcode() != IR::ValueOpcode::BitwiseOr32) return false;
 	for (size_t i = 0; i < 2; i++) {
 		const auto* arg = value->Arg(i).Resolve().TryInstruction();
+		if (arg != nullptr && arg->GetOpcode() == IR::ValueOpcode::SelectU32) // a VGPR write under exec
+			arg = arg->Arg(1).Resolve().TryInstruction();
 		if (arg != nullptr && arg->GetOpcode() == IR::ValueOpcode::Permlane16U32 && arg->Flags<IR::PermlaneFlags>().x16)
 			return true;
 	}
@@ -649,6 +653,10 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		case IR::ValueOpcode::ReadLane:
 			if (IsWaveOrScanRead(ctx, inst)) {
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1) < 64)
+					std::printf("PS_WAVE_OR %016llx lane %u\n", static_cast<unsigned long long>(state.program.shader_hash),
+					            inst.Arg(1).Resolve().U32());
 				// A wave64 OR reduction (DPP row_shr 1/2/4/8, v_permlanex16, v_readlane 31/63) in a graphics shader that
 				// runs on 32-wide host subgroups: lane 63 does not exist and fragment subgroups can have lanes without a
 				// fragment, which break the scan's chain (dark columns on Demon's Souls' water, PS 7a59c1a20cbe5d4a).
