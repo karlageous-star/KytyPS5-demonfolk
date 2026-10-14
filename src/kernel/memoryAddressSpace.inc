@@ -522,6 +522,15 @@ public:
 		return true;
 	}
 
+	// The span of the views over [vaddr, vaddr + size), widening [*begin, *end) (a partial unmap maps the other parts
+	// of the first and the last view again: GuestAddressSpace::UnmapBacking marks it busy).
+	void ViewSpan(uint64_t vaddr, uint64_t size, uint64_t* begin, uint64_t* end) {
+		auto     lock = MapReadLock();
+		MapEntry entry {};
+		if (FindContainingUnlocked(vaddr, 1, &entry)) *begin = std::min(*begin, entry.vaddr);
+		if (FindContainingUnlocked(vaddr + size - 1, 1, &entry)) *end = std::max(*end, entry.vaddr + entry.size);
+	}
+
 	bool UnmapOne(uint64_t vaddr, uint64_t size, bool* placeholder_preserved = nullptr) {
 		GuestBackingMutation mutation;
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -1058,9 +1067,9 @@ private:
 	}
 
 	// A view mapped again (MapExistingPlaceholderFixed, `protective`) gets the GPU trackers' protection of the pages a
-	// watcher holds at once. The caller holds the address-space lock (UnmapBacking), which every protection change of
-	// the trackers waits for: their state is read without their regions' locks, and a change made meanwhile is applied
-	// after this. Given only after the lock (ReapplyRemappedViews), a CPU write to a watched page in between went
+	// watcher holds at once. The views are busy (UnmapBacking), and every protection change of the trackers over them
+	// waits for that: their state is read without their regions' locks, and a change made meanwhile is applied after
+	// this. Given only after the lock (ReapplyRemappedViews), a CPU write to a watched page in between went
 	// unseen. (The view keeps its own mode until here, a few system calls: one mapped read-only cannot be made writable
 	// later, and made read-only at once, the game's own writes to its unwatched pages faulted by the thousands.)
 	static void ProtectRemapped(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
@@ -1174,6 +1183,23 @@ private:
 };
 
 class GuestAddressSpace {
+	// m_mutex held exclusively, counted with its time (address_space_holds, address_space_hold_kt): every protection
+	// change of the GPU trackers waits for such a hold (ProtectTransient: address_space_waits).
+	class ExclusiveLock {
+	public:
+		explicit ExclusiveLock(std::shared_mutex& mutex): m_lock(mutex), m_start(__rdtsc()) {}
+		~ExclusiveLock() {
+			LiveCounters::Add(LiveCounters::AddressSpaceHolds);
+			LiveCounters::Add(LiveCounters::AddressSpaceHoldKt, (__rdtsc() - m_start) >> 10u);
+		}
+		KYTY_CLASS_NO_COPY(ExclusiveLock);
+		std::unique_lock<std::shared_mutex>& Lock() { return m_lock; }
+
+	private:
+		std::unique_lock<std::shared_mutex> m_lock;
+		uint64_t                            m_start;
+	};
+
 public:
 	explicit GuestAddressSpace(uint64_t backing_size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -1251,6 +1277,7 @@ public:
 	// exclusive lock, and an access to those parts meanwhile faults on unmapped memory.
 	[[nodiscard]] bool IsMappedAfterChanges(uint64_t vaddr) {
 		std::shared_lock lock(m_mutex);
+		WaitNotBusy(lock, vaddr, 1);
 		const auto       it = FindMappedContainingUnlocked(vaddr);
 		return it != m_mapped.end();
 	}
@@ -1294,14 +1321,15 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		ExclusiveLock lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
 	// Returns once no change of the address space is under way (Memory::WriteBacking: a partial unmap's views mapped
 	// again).
-	void WaitForChanges() {
+	void WaitForChanges(uint64_t vaddr, uint64_t size) {
 		std::shared_lock lock(m_mutex);
+		WaitNotBusy(lock, vaddr, size);
 	}
 
 	// Protect, keeping the GPU trackers' protection of the pages a watcher holds (what ReapplyProtection gives back):
@@ -1314,7 +1342,7 @@ public:
 		}
 		thread_local std::vector<Graphics::PageManager::WatchedRun> runs;
 		runs.clear();
-		std::lock_guard lock(m_mutex);
+		ExclusiveLock lock(m_mutex);
 		if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) g_gpu_resources->WatchedRuns(vaddr, size, &runs);
 		uint64_t at = vaddr;
 		for (const auto& run: runs) {
@@ -1340,45 +1368,96 @@ public:
 
 		// The page manager serializes changes of one region under its lock; different regions
 		// never share pages, so these calls may run concurrently.
-		std::shared_lock lock(m_mutex);
+		std::shared_lock lock(m_mutex, std::try_to_lock);
+		if (!lock.owns_lock()) {
+			const auto start = __rdtsc();
+			lock.lock();
+			const auto waited = (__rdtsc() - start) >> 10u;
+			LiveCounters::Add(LiveCounters::AddressSpaceWaits);
+			LiveCounters::Add(LiveCounters::AddressSpaceWaitKt, waited);
+			if (LiveCensus::g_render) LiveCounters::Add(LiveCounters::AddressSpaceWaitKtRender, waited);
+		}
+		WaitNotBusy(lock, vaddr, size);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                VirtualMemory::Mode               mode,
 	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
-		std::lock_guard lock(m_mutex);
 		LiveTrace::SlowOsCallScope slow(LiveTrace::OsMapBacking, vaddr, size);
-		if (!ConsumeUnlocked(vaddr, size)) {
-			if (failure_reason != nullptr) {
-				*failure_reason = GuestBackingStore::FailureReason::AddressRangeUnavailable;
+		{
+			ExclusiveLock lock(m_mutex);
+			// (Guest maps and unmaps run one at a time: another one over the range is only waited for here.)
+			m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(vaddr, size); });
+			if (!ConsumeUnlocked(vaddr, size)) {
+				if (failure_reason != nullptr) {
+					*failure_reason = GuestBackingStore::FailureReason::AddressRangeUnavailable;
+				}
+				return false;
 			}
-			return false;
+			m_busy.emplace_back(vaddr, vaddr + size);
 		}
+		// The system calls without the lock (BusyUnlocked): the trackers' protections of other ranges go on.
 		const auto host_mode = VirtualMemory::IsExecute(mode)
 		                           ? VirtualMemory::Mode::ExecuteReadWrite
 		                           : VirtualMemory::Mode::ReadWrite;
-		if (m_backing->MapExistingPlaceholderFixed(vaddr, size, backing_offset, host_mode,
-		                                           failure_reason)) {
-			EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Backing));
-			return true;
+		const bool mapped = m_backing->MapExistingPlaceholderFixed(vaddr, size, backing_offset, host_mode, failure_reason);
+		{
+			ExclusiveLock lock(m_mutex);
+			if (mapped) {
+				EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Backing));
+			} else {
+				AddFreeUnlocked(vaddr, size);
+			}
+			EraseBusyUnlocked(vaddr, vaddr + size);
 		}
-		AddFreeUnlocked(vaddr, size);
-		return false;
+		m_busy_done.notify_all();
+		return mapped;
 	}
 
 	bool UnmapBacking(uint64_t vaddr, uint64_t size) {
 		bool unmapped = false;
 		{
-			std::lock_guard lock(m_mutex);
 			LiveTrace::SlowOsCallScope slow(LiveTrace::OsUnmapBacking, vaddr, size);
+			struct UnmapHold {
+				uint64_t start = __rdtsc();
+				~UnmapHold() { LiveCounters::Add(LiveCounters::AddressSpaceUnmapHoldKt, (__rdtsc() - start) >> 10u); }
+			} unmap_hold;
 			g_protective_remap = kyty_local_protective_remap.load(std::memory_order_relaxed) != 0;
-			bool            placeholder_preserved = false;
-			if (ContainsMappedUnlocked(vaddr, size, MappingType::Backing) &&
-			    m_backing->Unmap(vaddr, size, &placeholder_preserved) && placeholder_preserved) {
-				EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Backing));
-				AddFreeUnlocked(vaddr, size);
-				unmapped = true;
+			// The views over the range busy, the system calls without the lock (BusyUnlocked): a partial unmap of a big
+			// view held it for milliseconds (4.5 ms for a 52 MiB one, 1.5-5 ms a call late in a laptop session), every
+			// protection of the GPU trackers anywhere waiting behind it.
+			uint64_t busy_begin = vaddr, busy_end = vaddr + size;
+			bool     contained  = false;
+			{
+				ExclusiveLock lock(m_mutex);
+				// (Guest maps and unmaps run one at a time: another one over the views is only waited for here.)
+				for (;;) {
+					contained = ContainsMappedUnlocked(vaddr, size, MappingType::Backing);
+					if (!contained) break;
+					busy_begin = vaddr;
+					busy_end   = vaddr + size;
+					m_backing->ViewSpan(vaddr, size, &busy_begin, &busy_end);
+					if (!BusyUnlocked(busy_begin, busy_end - busy_begin)) {
+						m_busy.emplace_back(busy_begin, busy_end);
+						break;
+					}
+					m_busy_done.wait(lock.Lock());
+				}
+			}
+			if (contained) {
+				bool       placeholder_preserved = false;
+				const bool done = m_backing->Unmap(vaddr, size, &placeholder_preserved) && placeholder_preserved;
+				{
+					ExclusiveLock lock(m_mutex);
+					if (done) {
+						EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Backing));
+						AddFreeUnlocked(vaddr, size);
+						unmapped = true;
+					}
+					EraseBusyUnlocked(busy_begin, busy_end);
+				}
+				m_busy_done.notify_all();
 			}
 		}
 		if (g_remapped_count != 0) {
@@ -1431,7 +1510,7 @@ public:
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	bool TestContainsFree(uint64_t vaddr, uint64_t size) {
-		std::lock_guard lock(m_mutex);
+		ExclusiveLock lock(m_mutex);
 		return FindContaining(vaddr, size) != m_free.end();
 	}
 #endif
@@ -1442,7 +1521,7 @@ public:
 	}
 
 	bool Commit(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-		std::lock_guard lock(m_mutex);
+		ExclusiveLock lock(m_mutex);
 		if (!ConsumeUnlocked(vaddr, size)) {
 			return false;
 		}
@@ -1478,7 +1557,7 @@ public:
 		if (vaddr == 0 || size == 0 || !IsPageAligned(vaddr) || !IsPageAligned(size)) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		ExclusiveLock lock(m_mutex);
 		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Private)) {
 			return false;
 		}
@@ -1564,6 +1643,26 @@ private:
 
 	[[nodiscard]] bool IsGranularityAligned(uint64_t value) const {
 		return (value & (m_granularity - 1u)) == 0;
+	}
+
+	// Whether a backing map or unmap is changing a range that overlaps [vaddr, vaddr + size) outside the lock.
+	[[nodiscard]] bool BusyUnlocked(uint64_t vaddr, uint64_t size) const {
+		for (const auto& [begin, end]: m_busy)
+			if (vaddr < end && begin < vaddr + size) return true;
+		return false;
+	}
+
+	// (With m_mutex held shared.) Returns once no map or unmap is changing [vaddr, vaddr + size).
+	void WaitNotBusy(std::shared_lock<std::shared_mutex>& lock, uint64_t vaddr, uint64_t size) {
+		if (!BusyUnlocked(vaddr, size)) return;
+		LiveCounters::Add(LiveCounters::AddressSpaceBusyWaits);
+		m_busy_done.wait(lock, [&] { return !BusyUnlocked(vaddr, size); });
+	}
+
+	void EraseBusyUnlocked(uint64_t begin, uint64_t end) {
+		const auto it = std::find(m_busy.begin(), m_busy.end(), std::pair<uint64_t, uint64_t> {begin, end});
+		EXIT_IF(it == m_busy.end());
+		m_busy.erase(it);
 	}
 
 	bool ProtectMappedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
@@ -1970,6 +2069,11 @@ private:
 	// only read the maps: guest write faults and GPU readbacks on many threads otherwise queue on
 	// it for every VirtualProtect. Mapping changes take it exclusively.
 	std::shared_mutex                          m_mutex;
+	// Ranges a backing map or unmap is changing outside m_mutex (MapBacking, UnmapBacking: their system calls), under
+	// it; what overlaps one waits for it (WaitNotBusy). Guest maps and unmaps run one at a time (the kernel's memory
+	// operation mutex).
+	std::vector<std::pair<uint64_t, uint64_t>> m_busy;
+	std::condition_variable_any                m_busy_done;
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
