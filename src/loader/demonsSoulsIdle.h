@@ -52,6 +52,15 @@ inline bool MatchesUsa(std::span<const uint8_t> call, std::span<const uint8_t> p
 	return std::ranges::equal(call, CallBytesUsa) && std::ranges::equal(poll, PollBytesUsa);
 }
 
+// KYTY_DS_MAIN_WAIT_YIELD=1 (USA 01.004.000): the main thread's wait for its jobs (eboot+0x86eb00..0x86ecba) spins
+// on the job counters, a pause, a TSC read, the job-queue spinlock and a try-run-job: a whole core of a 6-core PC (100%
+// of the main thread's samples in gameplay, its 13 job workers at 16-22% each). Each round's "pause; mov r13, r15"
+// (eboot+0x86eb39, before the lock is taken) becomes a call of a thunk that gives the CPU to a ready thread
+// (SwitchToThread: nothing when none is ready), then does them. Checked by its bytes.
+inline constexpr uint64_t                MainWaitOffsetUsa = 0x86eb39;
+inline constexpr std::array<uint8_t, 17> MainWaitBytesUsa {0xf3, 0x90, 0x4d, 0x89, 0xfd, 0x45, 0x89, 0xe7, 0x4e,
+                                                           0x8b, 0xa4, 0xf3, 0x00, 0x0f, 0x00, 0x00, 0xe8};
+
 #if defined(__x86_64__) || defined(_M_X64)
 // The poll's observable register state is retained even on the idle path.
 // In particular this is not an ordinary C++ function replacement: its caller
@@ -79,6 +88,28 @@ inline void EmitThunk(Xbyak::CodeGenerator& c, const void* poll, const void* sle
 		c.pop(reg);
 	c.popfq();
 	c.L(done);
+	c.ret();
+}
+
+// The main-wait thunk: every register and the flags kept, `yield` called (SysV), then the replaced instructions.
+inline void EmitYieldThunk(Xbyak::CodeGenerator& c, const void* yield) {
+	using namespace Xbyak::util;
+	c.pushfq();
+	for (const auto& reg: {rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11})
+		c.push(reg);
+	// Entry RSP is 8 mod 16 (the function body keeps RSP 16-aligned); the 80-byte save above retains that alignment.
+	c.sub(rsp, 520);
+	constexpr uint8_t save_fp[] {0x48, 0x0f, 0xae, 0x04, 0x24}; // FXSAVE64 [rsp]
+	c.db(save_fp, sizeof(save_fp));
+	c.mov(rax, reinterpret_cast<uint64_t>(yield));
+	c.call(rax);
+	c.fxrstor64(ptr[rsp]);
+	c.add(rsp, 520);
+	for (const auto& reg: {r11, r10, r9, r8, rdi, rsi, rdx, rcx, rax})
+		c.pop(reg);
+	c.popfq();
+	c.pause();
+	c.mov(r13, r15);
 	c.ret();
 }
 #endif

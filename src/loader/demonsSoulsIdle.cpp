@@ -18,6 +18,7 @@
 #include <span>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <xbyak/xbyak_util.h>
 #endif
@@ -25,11 +26,15 @@
 namespace Loader::DemonsSoulsIdle {
 namespace {
 constexpr uint64_t     PageSize = 0x4000, CaveOffset = 0x8000000;
-uint64_t               cave = 0, site = 0;
-std::array<uint8_t, 5> installed_call {}, original_call {};
+uint64_t               cave = 0, site = 0, wait_site = 0;
+std::array<uint8_t, 5> installed_call {}, original_call {}, installed_wait {};
 
 void KYTY_SYSV_ABI WaitForWork() {
 	Common::Thread::SleepMicroWithoutSpinning(50);
+}
+
+void KYTY_SYSV_ABI YieldMainWait() {
+	std::this_thread::yield();
 }
 
 bool Readable(uint64_t address, uint64_t size) {
@@ -121,6 +126,20 @@ void Install(Program* program) {
 	Xbyak::CodeGenerator code(PageSize, reinterpret_cast<void*>(allocated));
 	EmitThunk(code, reinterpret_cast<const void*>(poll),
 	          reinterpret_cast<const void*>(&WaitForWork));
+	// KYTY_DS_MAIN_WAIT_YIELD=1: the main thread's job wait yields its CPU each round (demonsSoulsIdle.h).
+	uint64_t wait_call = 0, wait_thunk = 0;
+	if (const char* yield = std::getenv("KYTY_DS_MAIN_WAIT_YIELD"); usa && yield != nullptr && *yield == '1') {
+		const auto at = program->base_vaddr + MainWaitOffsetUsa;
+		if (program->mapped_size >= MainWaitOffsetUsa + MainWaitBytesUsa.size() && Readable(at, MainWaitBytesUsa.size()) &&
+		    std::memcmp(reinterpret_cast<const void*>(at), MainWaitBytesUsa.data(), MainWaitBytesUsa.size()) == 0) {
+			wait_call = at;
+			code.align(16);
+			wait_thunk = reinterpret_cast<uint64_t>(code.getCurr());
+			EmitYieldThunk(code, reinterpret_cast<const void*>(&YieldMainWait));
+		} else {
+			std::printf("Demon's Souls main wait yield: the wait loop of 01.004.000 not found; retaining guest code\n");
+		}
+	}
 	code.ready();
 	if (Xbyak::GetError() ||
 	    !Common::VirtualMemory::FlushInstructionCache(allocated, code.getSize()) ||
@@ -147,6 +166,20 @@ void Install(Program* program) {
 	site = call;
 	std::printf("Demon's Souls idle wait: installed portable 50 us backoff (call at eboot+0x%llx)\n",
 	     static_cast<unsigned long long>(call - program->base_vaddr));
+	if (wait_call != 0) {
+		installed_wait[0]    = 0xe8;
+		const auto wait_disp = static_cast<int32_t>(wait_thunk - (wait_call + 5));
+		std::memcpy(installed_wait.data() + 1, &wait_disp, sizeof(wait_disp));
+		std::memcpy(reinterpret_cast<void*>(wait_call), installed_wait.data(), installed_wait.size());
+		if (Common::VirtualMemory::FlushInstructionCache(wait_call, installed_wait.size())) {
+			wait_site = wait_call;
+			std::printf("Demon's Souls main wait yield: installed (eboot+0x%llx)\n",
+			            static_cast<unsigned long long>(wait_call - program->base_vaddr));
+		} else {
+			std::memcpy(reinterpret_cast<void*>(wait_call), MainWaitBytesUsa.data(), installed_wait.size());
+			Common::VirtualMemory::FlushInstructionCache(wait_call, installed_wait.size());
+		}
+	}
 	InstallEmptyPoll(program);
 #endif
 }
@@ -157,6 +190,15 @@ void Clear() {
 	EXIT_IF(empty_poll_cave != 0 || collision_guard_cave != 0);
 #endif
 	if (!cave) return;
+	if (wait_site != 0) {
+		std::array<uint8_t, 5> wait_bytes {};
+		std::memcpy(wait_bytes.data(), reinterpret_cast<const void*>(wait_site), wait_bytes.size());
+		if (wait_bytes == installed_wait) {
+			std::memcpy(reinterpret_cast<void*>(wait_site), MainWaitBytesUsa.data(), installed_wait.size());
+			Common::VirtualMemory::FlushInstructionCache(wait_site, installed_wait.size());
+		}
+		wait_site = 0;
+	}
 	std::array<uint8_t, 5> bytes {};
 	std::memcpy(bytes.data(), reinterpret_cast<const void*>(site), bytes.size());
 	if (bytes == installed_call) {
