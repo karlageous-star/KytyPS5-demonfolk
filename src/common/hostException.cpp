@@ -1,4 +1,5 @@
 #include "common/hostException.h"
+#include "common/guardedCopy.h"
 
 #include <atomic>
 #include <cstdio>
@@ -84,6 +85,12 @@ bool InitializeThreadSignalStack() {
 
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	auto* exception_record = exception->ExceptionRecord;
+
+	// A guarded copy reached a page without access: it stops there (never the guest's fault).
+	if (exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+	    Common::ResumeGuardedCopy(exception->ContextRecord)) {
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
 
 	if (exception_record->ExceptionCode == DBG_PRINTEXCEPTION_C ||
 	    exception_record->ExceptionCode == DBG_PRINTEXCEPTION_WIDE_C) {
