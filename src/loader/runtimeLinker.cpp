@@ -17,6 +17,7 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/demonsSoulsIdle.h"
+#include "loader/demonsSoulsRenderSize.h"
 #include "loader/demonsSoulsCopy.h"
 #include "loader/demonsSoulsGpuPages.h"
 #include "loader/elf.h"
@@ -1650,6 +1651,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	}
 	DemonsSoulsIdle::Install(m_programs.empty() ? nullptr : m_programs.front());
 	for (auto* program : m_programs) DemonsSoulsCopy::Install(program);
+	DemonsSoulsRenderSize::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsGpuPages::Install(m_programs.empty() ? nullptr : m_programs.front());
 	StartAllModules();
 
