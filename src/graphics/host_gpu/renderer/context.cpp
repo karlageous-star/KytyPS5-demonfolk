@@ -152,10 +152,22 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg4      = arg4;
 }
 
+// The same rendering: the size, the layers, the depth/stencil attachment and the color attachments up to the count
+// (those past it are no part of a rendering). (All eight compared, at every table draw: ~1% of the render thread at
+// Latria standing.)
+static bool SameRendering(const RenderState& a, const RenderState& b) {
+	if (a.num_color_attachments != b.num_color_attachments || a.width != b.width || a.height != b.height ||
+	    a.num_layers != b.num_layers || !(a.depth_stencil_attachment == b.depth_stencil_attachment))
+		return false;
+	for (uint32_t i = 0; i < a.num_color_attachments; i++)
+		if (!(a.color_attachments[i] == b.color_attachments[i])) return false;
+	return true;
+}
+
 void CommandBuffer::BeginRendering(const RenderState& state) const {
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
-	if (m_rendering && m_render_state == state) {
+	if (m_rendering && SameRendering(m_render_state, state)) {
 		return;
 	}
 	EndRendering();
