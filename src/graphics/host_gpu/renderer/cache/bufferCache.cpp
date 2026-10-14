@@ -1683,6 +1683,19 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
 	if (source) {
+		// The pieces of one run (split at mapping boundaries for the upload worker's reads, which UploadCopies pushed)
+		// are adjacent in the staging ring and in the buffer: one copy region each run from here on. (The game's
+		// mappings get finer at every level load: 434 -> 586 copies a frame at Stonefang over four rounds.)
+		size_t merged = 0;
+		for (const auto& copy: copies) {
+			if (merged != 0 && copies[merged - 1].srcOffset + copies[merged - 1].size == copy.srcOffset &&
+			    copies[merged - 1].dstOffset + copies[merged - 1].size == copy.dstOffset) {
+				copies[merged - 1].size += copy.size;
+			} else {
+				copies[merged++] = copy;
+			}
+		}
+		copies.resize(merged);
 		for (const auto& copy: copies) {
 			InvalidateCopyFeedback(buffer.CpuAddress() + copy.dstOffset, copy.size);
 			NoteGpuWrite(buffer.CpuAddress() + copy.dstOffset, copy.size, GpuWriteOrigin::CpuUpload);
