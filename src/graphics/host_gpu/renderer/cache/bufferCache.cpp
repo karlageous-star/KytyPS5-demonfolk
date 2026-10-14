@@ -1743,38 +1743,6 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	}
 }
 
-namespace {
-struct IndirectCopies {
-	VkCommandBuffer command;
-	VkDeviceAddress list;
-	uint32_t        count;
-};
-void ReplayIndirectCopies(std::span<const LocalVulkanRecording::Segment> segments,
-                          const vk::detail::DispatchLoaderDynamic& dispatch) {
-	const auto& copies = *static_cast<const IndirectCopies*>(segments[0].data);
-	dispatch.vkCmdCopyMemoryIndirectNV(copies.command, copies.list, copies.count, sizeof(VkCopyMemoryIndirectCommandNV));
-}
-} // namespace
-
-// The closing upload prologue's copies (UploadDirtyRanges), from a list in the table ring, as one command recorded in
-// order with the prologue's other commands (the recording worker replays it).
-void BufferCache::FlushPrologueCopies(vk::CommandBuffer command) {
-	if (m_prologue_copies.empty()) return;
-	const auto bytes          = m_prologue_copies.size() * sizeof(VkCopyMemoryIndirectCommandNV);
-	auto [mapped, offset]     = m_table_upload.Map(bytes, 16);
-	EXIT_IF(mapped == nullptr);
-	std::memcpy(mapped, m_prologue_copies.data(), bytes);
-	m_table_upload.Commit();
-	const IndirectCopies copies {command, m_table_upload.BufferDeviceAddress() + offset,
-	                             static_cast<uint32_t>(m_prologue_copies.size())};
-	m_prologue_copies.clear();
-	const LocalVulkanRecording::Segment segments[] {{&copies, sizeof(copies)}};
-	if (!LocalVulkanRecording::EnqueueDeferred(ReplayIndirectCopies, segments, false)) {
-		LocalVulkanRecording::Drain();
-		ReplayIndirectCopies(segments, VULKAN_HPP_DEFAULT_DISPATCHER);
-	}
-}
-
 // An upload's source bytes (a CPU-dirty range) into host memory, from inside the memory tracker's upload callback: through
 // the backing view, whatever the guest range's protection, else through the guest view without faulting. A read of the
 // guest view that faulted re-entered the tracker from the callback (another tracker's page protection: the fault
