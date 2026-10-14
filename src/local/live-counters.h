@@ -126,13 +126,53 @@ enum Id : uint32_t {
 	CopyForwards,          // GPU copies whose bytes also landed in guest memory when recorded (KYTY_COPY_FORWARD)
 	CopyForwardBytes,      // ... their bytes
 	LinearCopies,          // copy-kernel dispatches recorded as buffer copies (DemonsSouls::TryLinearCopy)
+	BackingWriteWaits,     // render-thread waits for the backing store's data mutex to write (backing_lock_waits: the others)
+	BackingWriteWaitUs,    // ... their time in microseconds
+	GcImageDeletes,        // images the texture cache's garbage collection deleted (video memory pressure)
+	GcBufferDeletes,       // buffers the buffer cache's garbage collection deleted or retired
+	ImageRefills,          // whole-image refreshes that refilled the staging copy of an upload still unsubmitted
+	ImageRefillBytes,      // ... their guest bytes (InitializeImage)
+	InOrderUploads,        // buffer uploads recorded in order (not in the upload prologue): a barrier pair each
+	InOrderUploadBytes,    // ... their bytes
+	LevelRefreshes,        // sampled-view refreshes that left the levels below the view dirty (RefreshTextureLevels)
+	LevelSkippedBytes,     // ... the guest bytes of those levels when they were left
+	TableNoSet,            // table draws left to the normal path without an image set (programs compiling, validation)
+	TableDrawNative,       // ... after another refusal inside TableDraw (evaluation, blocks, targets, transit)
+	TableStoreDeferred,    // table store requests left for a later frame (programs compiling, one a pair a frame, budget)
+	UploadWaitUs,          // microseconds threads waited for the upload worker's copies (the recording worker's submissions)
+	UploadBusyUs,          // ... the upload worker spent running its jobs
+	RecordWaitUs,          // ... producers waited for the recording worker (a full stream, a drain)
+	UploadCallUs,          // ... the upload worker spent in calls (deferred write protections, partly mapped reads)
+	UploadSharedRuns,      // runs of upload copies of 1 MiB or more, shared with the helper threads
+	UploadGuardStops,      // guarded upload copies stopped at a page the guest mapping cannot read
+	TableProofMismatches,  // table set image uses a proof held for that a full check failed (KYTY_TABLE_SET_PROOFS=2)
+	TableRingCopies,       // guest-written V# ranges table mode copied into the table upload ring (TableXpr::RingCopy)
+	TableRingBytes,        // ... their bytes
+	TableRingShared,       // uses that read a copy an earlier use made (no copy)
+	TableRingSharedBytes,  // ... their bytes
+	RbNarrowed,            // guest readback windows left pieces an unfinished GPU write overlaps to a later request
+	RbWindowNarrowed,      // guest readback windows over memory not one mapping any more, cut to the mapped pages around the request
+	UnmapBufferDeletes,    // buffers deleted because the guest unmapped all of their memory
+	BdaFaultPages,         // 16 KiB pages BDA shaders read with no buffer registered (read as zeros; registered after)
+	BackingSpanWrites,     // backing data writes over several guest mappings (written a mapping at a time)
+	DiscardedGpuBytes,     // GPU-written bytes a host write replaced whole, dropped instead of read back
+	GuestMoveBytes,        // bytes the game's large memmoves (>= 256 KiB, DemonsSoulsCopy) moved
+	GuestMoveSameBytes,    // ... into pages that already held them (left clean: kyty_local_move_compare)
+	GuestMoveGpuBytes,     // ... into pages the GPU wrote
+	UnmapBufferSplits,     // buffers cut to their mapped parts after a guest unmap (BufferCache::SplitUnmappedBuffers)
+	UnmapSplitFreedBytes,  // ... the unmapped bytes they no longer hold
+	ShortcutMismatches,    // verified shortcuts that disagreed (kyty_local_state_key_cache / targets_shortcut 2)
+	RemappedViews,         // views a partial unmap mapped again (Windows: the view's other parts, GuestBackingStore::UnmapOne)
+	WriteBackRetries,      // GPU write-backs written after waiting for a partial unmap of their view (Memory::WriteBacking)
+	RemapWindowWrites,     // write faults on watched pages of a view being mapped again (unseen when it came back writable)
+	DownloadPagesReleased, // pages of a pending image download a CPU write took first (not written back: TryDownloadImage)
 	Count
 };
 
 inline constexpr const char* Names[Count] = {
     "window_faults", "window_pages",     "write_faults",     "read_faults",   "reprotects",
     "reprotect_pages", "unprotects",     "unprotect_pages",  "protect_calls", "protect_calls_render",
-    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "readback_evictions", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices", "buffer_registrations", "bda_rebuilds", "region_syncs", "region_skips", "bda_full_syncs", "bda_range_calls", "bda_ranges", "bda_range_mib", "protect_calls_gfx", "sync_reads_guest", "sync_reads_render", "rb_reject_size", "rb_reject_backing", "rb_reject_image", "rb_reject_capacity", "rb_queue_done", "rb_queue_inflight", "rb_queue_verified", "rb_queue_mismatch", "indirect_tables", "direct_draws", "mesh_draws", "backing_read_bytes", "backing_read_us", "xpr_tries", "xpr_hits", "xpr_miss_key", "xpr_miss_state", "xpr_miss_target", "xpr_miss_validate", "xpr_stores", "vblanks", "async_image_bytes", "backing_lock_waits", "backing_lock_wait_us", "backing_hold_zero_us", "backing_hold_write_us", "backing_hold_map_us", "alias_rebuilds", "alias_rebuild_us", "alias_maps", "unmap_finishes", "unmap_finish_us", "partial_dirty_faults", "partial_uploads", "partial_upload_bytes", "partial_fallbacks", "partial_unmaps", "stale_protect_repairs", "readback_parts", "gpu_range_entries", "texture_unmaps", "texture_unmap_us", "texture_unmap_deletes", "full_uploads", "full_upload_bytes", "async_pipelines", "xpr_store_pending", "dispatch_key_new", "dispatch_key_same", "dispatch_key_changed", "draw_key_new", "draw_key_same", "xpr_direct_tries", "xpr_direct_hits", "xpr_stored", "xpr_refuse_program", "xpr_refuse_reads", "xpr_refuse_bind", "xpr_refuse_draw", "xpr_relocated", "xpr_relocated_stored", "depth_overlaps", "depth_overlap_bytes", "xpr_miss_blocked", "xpr_miss_refused", "xpr_miss_unseen", "xpr_miss_budget", "readback_regions", "table_draws", "table_evals", "table_stores", "table_continued", "table_store_variant", "table_store_targets", "table_refused_sets", "table_dispatches", "table_registered", "render_passes", "writeback_skips", "copy_forwards", "copy_forward_bytes", "linear_copies"};
+    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "readback_evictions", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices", "buffer_registrations", "bda_rebuilds", "region_syncs", "region_skips", "bda_full_syncs", "bda_range_calls", "bda_ranges", "bda_range_mib", "protect_calls_gfx", "sync_reads_guest", "sync_reads_render", "rb_reject_size", "rb_reject_backing", "rb_reject_image", "rb_reject_capacity", "rb_queue_done", "rb_queue_inflight", "rb_queue_verified", "rb_queue_mismatch", "indirect_tables", "direct_draws", "mesh_draws", "backing_read_bytes", "backing_read_us", "xpr_tries", "xpr_hits", "xpr_miss_key", "xpr_miss_state", "xpr_miss_target", "xpr_miss_validate", "xpr_stores", "vblanks", "async_image_bytes", "backing_lock_waits", "backing_lock_wait_us", "backing_hold_zero_us", "backing_hold_write_us", "backing_hold_map_us", "alias_rebuilds", "alias_rebuild_us", "alias_maps", "unmap_finishes", "unmap_finish_us", "partial_dirty_faults", "partial_uploads", "partial_upload_bytes", "partial_fallbacks", "partial_unmaps", "stale_protect_repairs", "readback_parts", "gpu_range_entries", "texture_unmaps", "texture_unmap_us", "texture_unmap_deletes", "full_uploads", "full_upload_bytes", "async_pipelines", "xpr_store_pending", "dispatch_key_new", "dispatch_key_same", "dispatch_key_changed", "draw_key_new", "draw_key_same", "xpr_direct_tries", "xpr_direct_hits", "xpr_stored", "xpr_refuse_program", "xpr_refuse_reads", "xpr_refuse_bind", "xpr_refuse_draw", "xpr_relocated", "xpr_relocated_stored", "depth_overlaps", "depth_overlap_bytes", "xpr_miss_blocked", "xpr_miss_refused", "xpr_miss_unseen", "xpr_miss_budget", "readback_regions", "table_draws", "table_evals", "table_stores", "table_continued", "table_store_variant", "table_store_targets", "table_refused_sets", "table_dispatches", "table_registered", "render_passes", "writeback_skips", "copy_forwards", "copy_forward_bytes", "linear_copies", "backing_write_waits", "backing_write_wait_us", "gc_image_deletes", "gc_buffer_deletes", "image_refills", "image_refill_bytes", "inorder_uploads", "inorder_upload_bytes", "level_refreshes", "level_skipped_bytes", "table_no_set", "table_draw_native", "table_store_deferred", "upload_wait_us", "upload_busy_us", "record_wait_us", "upload_call_us", "upload_shared_runs", "upload_guard_stops", "table_proof_mismatches", "table_ring_copies", "table_ring_bytes", "table_ring_shared", "table_ring_shared_bytes", "rb_narrowed", "rb_window_narrowed", "unmap_buffer_deletes", "bda_fault_pages", "backing_span_writes", "discarded_gpu_bytes", "guest_move_bytes", "guest_move_same_bytes", "guest_move_gpu_bytes", "unmap_buffer_splits", "unmap_split_freed_bytes", "shortcut_mismatches", "remapped_views", "write_back_retries", "remap_window_writes", "download_pages_released"};
 
 inline std::atomic<uint64_t> g_values[Count];
 // The render thread's counts: it is their only writer, so an increment needs no locked

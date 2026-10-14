@@ -37,6 +37,23 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 // model). It goes back once the address-space lock is released (GuestAddressSpace::UnmapBacking;
 // the page manager protects through that lock).
 thread_local std::vector<std::pair<uint64_t, uint64_t>> g_remapped_views;
+// The view a partial unmap maps again, from its unmap to the end of UnmapBacking (InRemapWindow).
+static std::atomic<uint64_t> g_remap_window_begin {0};
+static std::atomic<uint64_t> g_remap_window_end {0};
+
+// kyty_local_protective_remap as UnmapBacking read it: its views are protected by ProtectRemapped or left to
+// ReapplyRemappedViews, not both.
+thread_local bool     g_protective_remap = true;
+thread_local uint32_t g_remapped_count   = 0;
+static bool ProtectiveRemap() {
+	return g_protective_remap;
+}
+
+// A view mapped again: counted, and left to ReapplyRemappedViews unless ProtectRemapped protected it.
+static void NoteRemapped(uint64_t vaddr, uint64_t size) {
+	++g_remapped_count;
+	if (!g_protective_remap) g_remapped_views.emplace_back(vaddr, size);
+}
 
 static void ReapplyRemappedViews() {
 	for (const auto& [vaddr, size]: std::exchange(g_remapped_views, {})) {
@@ -389,9 +406,11 @@ public:
 		return true;
 	}
 
+	// `protective`: a view mapped again (UnmapOne, Unmap) gets its watched pages' protection before it is published
+	// (ProtectRemapped; the caller holds the address-space lock).
 	bool MapExistingPlaceholderFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                                 VirtualMemory::Mode mode,
-	                                 FailureReason*      failure_reason = nullptr) {
+	                                 FailureReason*      failure_reason = nullptr, bool protective = false) {
 		GuestBackingMutation mutation;
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			SetFailure(failure_reason, !IsAvailable() ? FailureReason::BackingUnavailable
@@ -408,6 +427,7 @@ public:
 			}
 			return false;
 		}
+		if (protective) ProtectRemapped(vaddr, size, mode);
 
 		{
 			std::lock_guard lock(m_mutex);
@@ -419,6 +439,7 @@ public:
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #else
+		(void)protective;
 		void* mapped = MapView(vaddr, size, backing_offset, mode, failure_reason);
 		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
 			return false;
@@ -469,8 +490,8 @@ public:
 			if (!UnmapOne(entry.vaddr, entry.size, &part_placeholder_preserved)) {
 				for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
 					EXIT_IF(!MapExistingPlaceholderFixed(it->vaddr, it->size, it->backing_offset,
-					                                     it->mode));
-					g_remapped_views.emplace_back(it->vaddr, it->size);
+					                                     it->mode, nullptr, ProtectiveRemap()));
+					NoteRemapped(it->vaddr, it->size);
 				}
 				if (placeholder_preserved != nullptr) {
 					*placeholder_preserved = false;
@@ -488,8 +509,8 @@ public:
 		if (removed.size() > 1 && !CoalescePlaceholders(vaddr, size)) {
 			for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
 				EXIT_IF(!MapExistingPlaceholderFixed(it->vaddr, it->size, it->backing_offset,
-				                                     it->mode));
-				g_remapped_views.emplace_back(it->vaddr, it->size);
+				                                     it->mode, nullptr, ProtectiveRemap()));
+				NoteRemapped(it->vaddr, it->size);
 			}
 			return false;
 		}
@@ -588,6 +609,8 @@ public:
 		const uint64_t right_addr = vaddr + size;
 		const uint64_t old_end    = old.vaddr + old.size;
 		const uint64_t right_size = old_end - right_addr;
+		g_remap_window_end.store(old_end, std::memory_order_relaxed);
+		g_remap_window_begin.store(old.vaddr, std::memory_order_release);
 
 		if (UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
 			bool ok = true;
@@ -598,15 +621,16 @@ public:
 				ok = SplitPlaceholder(vaddr, size) && ok;
 			}
 			if (left_size != 0) {
-				const bool mapped =
-				    MapExistingPlaceholderFixed(old.vaddr, left_size, old.backing_offset, old.mode);
-				if (mapped) g_remapped_views.emplace_back(old.vaddr, left_size);
+				const bool mapped = MapExistingPlaceholderFixed(old.vaddr, left_size, old.backing_offset, old.mode,
+				                                                nullptr, ProtectiveRemap());
+				if (mapped) NoteRemapped(old.vaddr, left_size);
 				ok = mapped && ok;
 			}
 			if (right_size != 0) {
-				const bool mapped = MapExistingPlaceholderFixed(
-				    right_addr, right_size, old.backing_offset + (right_addr - old.vaddr), old.mode);
-				if (mapped) g_remapped_views.emplace_back(right_addr, right_size);
+				const bool mapped = MapExistingPlaceholderFixed(right_addr, right_size,
+				                                                old.backing_offset + (right_addr - old.vaddr), old.mode,
+				                                                nullptr, ProtectiveRemap());
+				if (mapped) NoteRemapped(right_addr, right_size);
 				ok = mapped && ok;
 			}
 			if (ok) {
@@ -624,9 +648,9 @@ public:
 			}
 			EXIT_IF(VirtualFree(reinterpret_cast<void*>(old.vaddr), old.size,
 			                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) == 0);
-			EXIT_IF(
-			    !MapExistingPlaceholderFixed(old.vaddr, old.size, old.backing_offset, old.mode));
-			g_remapped_views.emplace_back(old.vaddr, old.size);
+			EXIT_IF(!MapExistingPlaceholderFixed(old.vaddr, old.size, old.backing_offset, old.mode, nullptr,
+			                                     ProtectiveRemap()));
+			NoteRemapped(old.vaddr, old.size);
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
@@ -1037,6 +1061,25 @@ private:
 		                   MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0;
 	}
 
+	// A view mapped again (MapExistingPlaceholderFixed, `protective`) gets the GPU trackers' protection of the pages a
+	// watcher holds at once. The caller holds the address-space lock (UnmapBacking), which every protection change of
+	// the trackers waits for: their state is read without their regions' locks, and a change made meanwhile is applied
+	// after this. Given only after the lock (ReapplyRemappedViews), a CPU write to a watched page in between went
+	// unseen. (The view keeps its own mode until here, a few system calls: one mapped read-only cannot be made writable
+	// later, and made read-only at once, the game's own writes to its unwatched pages faulted by the thousands.)
+	static void ProtectRemapped(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+		if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) return;
+		thread_local std::vector<Graphics::PageManager::WatchedRun> runs;
+		runs.clear();
+		g_gpu_resources->WatchedRuns(vaddr, size, &runs);
+		for (const auto& run: runs) {
+			const auto begin = std::max(run.address, vaddr);
+			const auto end   = std::min(run.address + run.size, vaddr + size);
+			if (begin < end && run.mode != mode)
+				EXIT_IF(!ApplyProtection(reinterpret_cast<void*>(begin), end - begin, run.mode));
+		}
+	}
+
 	void* ReplacePlaceholderView(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                             VirtualMemory::Mode mode, FailureReason* failure_reason) {
 		const DWORD map_protect =
@@ -1262,6 +1305,36 @@ public:
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
+	// Returns once no change of the address space is under way (Memory::WriteBacking: a partial unmap's views mapped
+	// again).
+	void WaitForChanges() {
+		std::shared_lock lock(m_mutex);
+	}
+
+	// Protect, keeping the GPU trackers' protection of the pages a watcher holds (what ReapplyProtection gives back):
+	// under the lock, which every protection change of the trackers waits for, no CPU write reaches a watched page
+	// between the guest's protection and theirs (a guest mprotect to writable made such writes unseen).
+	bool ProtectKeepingWatched(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+		GuestBackingMutation mutation;
+		if (size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		thread_local std::vector<Graphics::PageManager::WatchedRun> runs;
+		runs.clear();
+		std::lock_guard lock(m_mutex);
+		if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) g_gpu_resources->WatchedRuns(vaddr, size, &runs);
+		uint64_t at = vaddr;
+		for (const auto& run: runs) {
+			const auto begin = std::max(run.address, vaddr);
+			const auto end   = std::min(run.address + run.size, vaddr + size);
+			if (begin >= end) continue;
+			if (at < begin && !ProtectMappedUnlocked(at, begin - at, mode)) return false;
+			if (!ProtectMappedUnlocked(begin, end - begin, run.mode)) return false;
+			at = end;
+		}
+		return at >= vaddr + size || ProtectMappedUnlocked(at, vaddr + size - at, mode);
+	}
+
 	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -1306,6 +1379,7 @@ public:
 		{
 			std::lock_guard lock(m_mutex);
 			LiveTrace::SlowOsCallScope slow(LiveTrace::OsUnmapBacking, vaddr, size);
+			g_protective_remap = kyty_local_protective_remap.load(std::memory_order_relaxed) != 0;
 			bool            placeholder_preserved = false;
 			if (ContainsMappedUnlocked(vaddr, size, MappingType::Backing) &&
 			    m_backing->Unmap(vaddr, size, &placeholder_preserved) && placeholder_preserved) {
@@ -1314,7 +1388,13 @@ public:
 				unmapped = true;
 			}
 		}
+		if (g_remapped_count != 0) {
+			LiveCounters::Add(LiveCounters::RemappedViews, std::exchange(g_remapped_count, 0u));
+			if (const auto us = kyty_local_remap_window_us.load(std::memory_order_relaxed); us != 0)
+				std::this_thread::sleep_for(std::chrono::microseconds(us));
+		}
 		ReapplyRemappedViews();
+		g_remap_window_begin.store(0, std::memory_order_release);
 		return unmapped;
 	}
 

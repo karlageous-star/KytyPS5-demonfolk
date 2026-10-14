@@ -160,6 +160,8 @@ bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;
 // Whether a guest mapping holds vaddr once a mapping change under way is done (it waits for one).
 [[nodiscard]] bool     IsGuestMappedAfterChanges(uint64_t vaddr);
+// Whether the address is in a view a partial unmap is mapping again (Windows; statistics: remap_window_writes).
+[[nodiscard]] bool     InRemapWindow(uint64_t vaddr) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,

@@ -120,6 +120,8 @@ public:
 	// The latest tick of a GPU-written image's download that will write guest memory overlapping
 	// the range once the GPU completes it (on the priority thread); 0 when none is pending.
 	[[nodiscard]] uint64_t PendingDownloadTick(uint64_t address, uint64_t size);
+	// Whether a pending image download holds a page of the range (TryDownloadImage).
+	[[nodiscard]] bool HasPendingDownload(uint64_t address, uint64_t size);
 	// Once per guest flip (the unit of NumFramesBeforeRemoval).
 	void AdvanceFrame() noexcept { m_frame.fetch_add(1, std::memory_order_relaxed); }
 	[[nodiscard]] uint64_t CurrentFrame() const noexcept { return m_frame.load(std::memory_order_relaxed); }
@@ -305,7 +307,13 @@ private:
 	Common::TickHistory   m_tick_history;
 	struct PendingDownload {
 		uint64_t address = 0, size = 0, tick = 0;
+		// The tracker pages from `first_page` it holds a write watcher on until its write-back (false: a CPU write took
+		// the page first, ReleaseDownloadPages: it keeps the CPU's bytes).
+		uint64_t          first_page = 0;
+		std::vector<bool> held;
 	};
+	// A CPU or host write over pages pending downloads hold: they are let go, and not written back.
+	void ReleaseDownloadPages(uint64_t address, uint64_t size);
 	std::mutex                   m_download_mutex; // the priority thread removes finished ones
 	std::vector<PendingDownload> m_pending_downloads;
 	mutable uint32_t m_image_query_epoch      = 0;

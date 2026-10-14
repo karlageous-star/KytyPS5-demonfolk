@@ -379,6 +379,35 @@ struct PageManager::Impl {
 		}
 	}
 
+	void WatchedRuns(uint64_t vaddr, uint64_t size, std::vector<PageManager::WatchedRun>* runs) const {
+		const auto begin = PageStart(vaddr);
+		const auto end   = PageEnd(vaddr, size);
+		for (auto chunk_begin = begin; chunk_begin < end;) {
+			const auto chunk_end   = std::min(end, (chunk_begin / REGION_SIZE + 1) * REGION_SIZE);
+			const auto region_base = chunk_begin / REGION_SIZE * REGION_SIZE;
+			// (No region lock: a page's state is one byte, and a change made meanwhile protects after the caller.)
+			if (const auto* region = FindRegion(chunk_begin); region != nullptr) {
+				const auto last = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+				for (auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE); first < last;) {
+					const auto perms = region->pages[first].Perms();
+					auto       next  = first + 1;
+					while (next < last && region->pages[next].Perms() == perms) next++;
+					if (perms != READ_WRITE_PROTECTION) {
+						const auto address = region_base + first * PAGE_SIZE;
+						const auto mode    = ToMemoryMode(perms);
+						if (!runs->empty() && runs->back().address + runs->back().size == address && runs->back().mode == mode) {
+							runs->back().size += (next - first) * PAGE_SIZE;
+						} else {
+							runs->push_back({address, (next - first) * PAGE_SIZE, mode});
+						}
+					}
+					first = next;
+				}
+			}
+			chunk_begin = chunk_end;
+		}
+	}
+
 	void ReapplyProtection(uint64_t vaddr, uint64_t size) {
 		const auto begin = PageStart(vaddr);
 		const auto end   = PageEnd(vaddr, size);
@@ -482,6 +511,10 @@ bool PageManager::RestoreIfUnwatched(uint64_t vaddr) noexcept {
 
 void PageManager::ReapplyProtection(uint64_t vaddr, uint64_t size) {
 	m_impl->ReapplyProtection(vaddr, size);
+}
+
+void PageManager::WatchedRuns(uint64_t vaddr, uint64_t size, std::vector<WatchedRun>* runs) const {
+	m_impl->WatchedRuns(vaddr, size, runs);
 }
 
 template <bool track>

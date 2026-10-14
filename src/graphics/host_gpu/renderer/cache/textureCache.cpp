@@ -3448,6 +3448,7 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
 	std::scoped_lock lock {m_lock};
+	ReleaseDownloadPages(address, size);
 	InvalidateCpuAliases(address, size);
 }
 
@@ -3647,20 +3648,67 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
 	const auto tick = m_scheduler.CurrentTick();
+	// The pages stay write-watched until the write-back: a CPU write before it (the collector deletes the image at
+	// once, a CPU write untracks it) is newer than the image's bytes, and takes its page from the write-back
+	// (ReleaseDownloadPages). Written back whole, it overwrote such writes (game data in reused memory).
+	const auto first_page = range.address & ~(TRACKER_PAGE_SIZE - 1);
+	const auto end_page   = (range.address + range.size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	m_page_manager.UpdatePageWatchers<true>(first_page, end_page - first_page);
 	{
 		std::lock_guard lock(m_download_mutex);
-		m_pending_downloads.push_back({range.address, range.size, tick});
+		m_pending_downloads.push_back(
+		    {range.address, range.size, tick, first_page, std::vector<bool>((end_page - first_page) / TRACKER_PAGE_SIZE, true)});
 	}
 	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset, tick] {
 		download.Invalidate(offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 		std::lock_guard lock(m_download_mutex);
 		const auto done = std::ranges::find_if(m_pending_downloads, [&](const PendingDownload& pending) {
 			return pending.address == range.address && pending.size == range.size && pending.tick == tick;
 		});
-		if (done != m_pending_downloads.end()) m_pending_downloads.erase(done);
+		if (done == m_pending_downloads.end()) return;
+		// The pages it still holds, by runs: written back, then let go.
+		const auto& held = done->held;
+		for (size_t first = 0; first < held.size();) {
+			if (!held[first]) {
+				++first;
+				continue;
+			}
+			auto last = first + 1;
+			while (last < held.size() && held[last]) ++last;
+			const auto run_begin = done->first_page + first * TRACKER_PAGE_SIZE;
+			const auto run_end   = done->first_page + last * TRACKER_PAGE_SIZE;
+			const auto begin     = std::max(run_begin, range.address);
+			const auto end       = std::min(run_end, range.address + range.size);
+			LibKernel::Memory::WriteBacking(begin, mapped + (begin - range.address), end - begin, "image");
+			m_page_manager.UpdatePageWatchers<false>(run_begin, run_end - run_begin);
+			first = last;
+		}
+		m_pending_downloads.erase(done);
 	});
 	return true;
+}
+
+bool TextureCache::HasPendingDownload(uint64_t address, uint64_t size) {
+	std::lock_guard lock(m_download_mutex);
+	return std::ranges::any_of(m_pending_downloads, [&](const PendingDownload& pending) {
+		return address < pending.address + pending.size && pending.address < address + size;
+	});
+}
+
+void TextureCache::ReleaseDownloadPages(uint64_t address, uint64_t size) {
+	std::lock_guard lock(m_download_mutex);
+	for (auto& pending: m_pending_downloads) {
+		if (address >= pending.address + pending.size || pending.address >= address + size) continue;
+		const auto begin = std::max(address, pending.address) & ~(TRACKER_PAGE_SIZE - 1);
+		const auto end   = std::min(address + size, pending.address + pending.size);
+		for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE) {
+			const auto index = (page - pending.first_page) / TRACKER_PAGE_SIZE;
+			if (index >= pending.held.size() || !pending.held[index]) continue;
+			pending.held[index] = false;
+			m_page_manager.UpdatePageWatchers<false>(page, TRACKER_PAGE_SIZE);
+			LiveCounters::Add(LiveCounters::DownloadPagesReleased);
+		}
+	}
 }
 
 uint64_t TextureCache::PendingDownloadTick(uint64_t address, uint64_t size) {
@@ -3758,6 +3806,8 @@ bool BufferCache::TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, ui
 	// through invalidation so registration cannot introduce an alias in between.
 	std::unique_lock lock(m_texture_cache.m_lock);
 	if (!m_texture_cache.FindImagesInRegion(begin, size, true).empty()) return false;
+	// (Nor a page a pending image download holds: its write fault goes to the texture cache, which lets it go.)
+	if (m_texture_cache.HasPendingDownload(begin, size)) return false;
 	// Registration takes the image lock and then this region lock, so handing the image
 	// lock over once the region lock is held keeps the check and the state change atomic
 	// for it, while the page protection change no longer blocks image lookups.

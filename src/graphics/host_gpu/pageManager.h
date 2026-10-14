@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_PAGEMANAGER_H_
 
 #include "common/common.h"
+#include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <atomic>
@@ -43,6 +44,15 @@ public:
 
 	// Sets every page of the range to its watchers' current protection (writable when none).
 	void SyncProtection(uint64_t vaddr, uint64_t size);
+
+	// The runs of pages of [vaddr, vaddr + size) a watcher holds, with their watchers' protection (the other pages left
+	// out), by the pages' state read without their regions' locks: for a caller holding the guest address-space lock,
+	// which every protection change of the trackers waits for, so that one made meanwhile is applied after the caller's.
+	struct WatchedRun {
+		uint64_t                    address = 0, size = 0;
+		Common::VirtualMemory::Mode mode    = Common::VirtualMemory::Mode::NoAccess;
+	};
+	void WatchedRuns(uint64_t vaddr, uint64_t size, std::vector<WatchedRun>* runs) const;
 
 	// While set on this thread, watchers released inside [begin, end) update the page state
 	// without making the pages writable on the host: the range is about to be unmapped, which

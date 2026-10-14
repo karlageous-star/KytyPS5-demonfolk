@@ -89,8 +89,12 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
+		// (A write to a watched page of a view a partial unmap is mapping again: unseen while such a view came back
+		// writable.)
+		const bool in_remap = LibKernel::Memory::InRemapWindow(fault_vaddr);
 		if (TryInvalidateCpuWriteWindow(fault_vaddr)) {
 			LiveCounters::Add(LiveCounters::WindowFault);
+			if (in_remap) LiveCounters::Add(LiveCounters::RemapWindowWrites);
 			return true;
 		}
 		LiveCounters::Add(LiveCounters::WriteFault);
@@ -100,6 +104,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 			LiveCounters::Add(LiveCounters::StaleProtectRepairs);
 			return true;
 		}
+		if (in_remap) LiveCounters::Add(LiveCounters::RemapWindowWrites);
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
