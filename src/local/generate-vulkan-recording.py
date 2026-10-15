@@ -119,15 +119,26 @@ def generate(registry, header):
         mark_id = MARK_IDS.get(name[:-3] if name.endswith('KHR') else name)
         mark = (f'LiveTrace::VulkanMark(commandBuffer, {mark_id}, {"true" if mark_id < 10 else "false"}); '
                 if mark_id is not None and ret == 'void' else '')
-        declarations.append(f'static VKAPI_ATTR {ret} VKAPI_CALL Wrapped_{name}({", ".join(decl(p) for p in params)}) {{')
+        signature = ', '.join(decl(p) for p in params)
+        # KYTY_BARRIER_MERGE: vkCmdPipelineBarrier's body is Record_vkCmdPipelineBarrier; its wrapper (after it) may hold
+        # a buffer-only barrier to merge with the next one (vulkan-recording.cpp HoldBarrier). Every other wrapper
+        # records a held barrier first, so it keeps its place before whatever this thread records next.
+        merged = name == 'vkCmdPipelineBarrier'
+        counters = []
         # Commands that do GPU work or synchronize: unchanged between two barriers = none in between.
         if re.match(r'vkCmd(Draw|Dispatch|Copy|Fill|Clear|Blit|Resolve|UpdateBuffer|BeginRendering|PipelineBarrier|WriteTimestamp|ExecuteCommands)', name):
-            declarations.append('    ++g_work_calls;')
+            counters.append('    ++g_work_calls;')
         # Local diagnostic (live census): barriers by the code that records them.
         if name.startswith('vkCmdPipelineBarrier'):
-            declarations.append('    if (LiveCensus::g_on.load(std::memory_order_relaxed) && LiveCensus::g_render) '
-                                'LiveCensus::Add(LiveCensus::Barrier, reinterpret_cast<uint64_t>(__builtin_return_address(0)), '
-                                f'{1 if "2" in name else 0} | LiveCensus::g_queue, 0);')
+            counters.append('    if (LiveCensus::g_on.load(std::memory_order_relaxed) && LiveCensus::g_render) '
+                            'LiveCensus::Add(LiveCensus::Barrier, reinterpret_cast<uint64_t>(__builtin_return_address(0)), '
+                            f'{1 if "2" in name else 0} | LiveCensus::g_queue, 0);')
+        if merged:
+            declarations.append(f'static {ret} Record_{name}({signature}) {{')
+        else:
+            declarations.append(f'static VKAPI_ATTR {ret} VKAPI_CALL Wrapped_{name}({signature}) {{')
+            declarations.append('    FlushHeldBarrier();')
+            declarations.extend(counters)
         if ok:
             deferred.append(name)
             declarations.append('    if (auto* stream = pAllocator == nullptr ? RecordingStream() : nullptr) {'
@@ -152,6 +163,13 @@ def generate(registry, header):
         else:
             declarations.append(f'    return original.{name}({", ".join(pnames)});')
         declarations.append('}')
+        if merged:
+            declarations.append(f'static VKAPI_ATTR {ret} VKAPI_CALL Wrapped_{name}({signature}) {{')
+            declarations.extend(counters)
+            declarations.append(f'    if (HoldBarrier({", ".join(pnames)})) return;')
+            declarations.append('    FlushHeldBarrier();')
+            declarations.append(f'    Record_{name}({", ".join(pnames)});')
+            declarations.append('}')
         installs.append(f'if (original.{name}) dispatcher.{name} = Wrapped_{name};')
     return ('// Generated; edit generate-vulkan-recording.py, not this file.\n' +
             '\n'.join(declarations) + '\nvoid InstallDispatch() {\n' +

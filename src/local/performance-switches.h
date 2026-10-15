@@ -34,6 +34,7 @@ extern volatile std::atomic<uint32_t> kyty_local_sync_readback_narrow_mode;
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 extern volatile std::atomic_uint32_t kyty_local_vulkan_recording_mode;
 extern volatile std::atomic_uint32_t kyty_local_deferred_submit_mode;
+extern volatile std::atomic_uint32_t kyty_local_barrier_merge_mode;
 extern volatile std::atomic_uint32_t kyty_local_native_xpr_mode;
 extern volatile std::atomic_uint32_t kyty_local_draw_packets_mode;
 extern volatile std::atomic_uint32_t kyty_local_native_xpr_predict_mode;
@@ -107,6 +108,8 @@ inline void InitializePerformanceSwitches() {
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 	    Switch {"KYTY_VULKAN_RECORDING", &kyty_local_vulkan_recording_mode},
 	    Switch {"KYTY_DEFERRED_SUBMIT", &kyty_local_deferred_submit_mode},
+	    // 1: back-to-back buffer-only pipeline barriers of the recording thread become one call.
+	    Switch {"KYTY_BARRIER_MERGE", &kyty_local_barrier_merge_mode},
 	    // 1: native XPR draws; 2: verification (the normal path draws and is compared).
 	    Switch {"KYTY_NATIVE_XPR", &kyty_local_native_xpr_mode, 0, 2},
 	    Switch {"KYTY_DRAW_PACKETS", &kyty_local_draw_packets_mode},

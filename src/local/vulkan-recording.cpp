@@ -17,6 +17,7 @@
 #include <new>
 #include <thread>
 #include <type_traits>
+#include <vector>
 
 extern "C" {
 // 1: record Vulkan commands for the worker thread, draws and descriptor
@@ -24,6 +25,8 @@ extern "C" {
 volatile std::atomic<uint32_t> kyty_local_vulkan_recording_mode {0};
 // 1: queue command-buffer begin/end/submit instead of draining (DeferredSubmitEnabled).
 volatile std::atomic<uint32_t> kyty_local_deferred_submit_mode {0};
+// 1: back-to-back buffer-only pipeline barriers of the recording thread become one call (HoldBarrier).
+volatile std::atomic<uint32_t> kyty_local_barrier_merge_mode {0};
 // Pauses the idle worker spins before it blocks (a blocked worker costs the render thread a
 // wake-up system call per publish on Windows).
 #if defined(_WIN32)
@@ -298,14 +301,78 @@ void InvalidateRawState() {
 // only its own command stream): a plain increment, not a locked add on every command.
 thread_local uint64_t g_work_calls = 0;
 thread_local uint64_t g_packets    = 0;
+
+// KYTY_BARRIER_MERGE: consecutive vkCmdPipelineBarrier calls of the recording thread on one command buffer, with
+// nothing recorded between them and only memory and buffer barriers, become one call: the stage masks ORed, the
+// dependency flags ANDed, the barriers together. It orders and makes visible all that each of them did (never
+// less), and the GPU waits and flushes its caches once instead of once a call (Demon's Souls at the Gates: ~2,000
+// back-to-back pairs a frame, a dispatch's access barrier then the next one's hazard barrier, and the barrier pairs
+// of uploads and copies). Image barriers (layout transitions), queue-family transfers and extension chains are
+// recorded as they come. A held call is recorded before any other call this thread makes through the dispatcher
+// (every generated wrapper flushes it first) or the packet paths below.
+struct HeldBarrier {
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    VkPipelineStageFlags source = 0, destination = 0;
+    VkDependencyFlags flags = 0;
+    std::vector<VkMemoryBarrier> memory;
+    std::vector<VkBufferMemoryBarrier> buffers;
+    bool held = false;
+};
+thread_local HeldBarrier g_held;
+// A merged call stays well inside a recording chunk.
+constexpr size_t HeldBarrierLimit = 256;
+void FlushHeldBarrier();
+bool HoldBarrier(VkCommandBuffer command, VkPipelineStageFlags source, VkPipelineStageFlags destination,
+                 VkDependencyFlags flags, uint32_t memory_count, const VkMemoryBarrier* memory,
+                 uint32_t buffer_count, const VkBufferMemoryBarrier* buffers, uint32_t image_count,
+                 const VkImageMemoryBarrier* /*images*/) {
+    if (kyty_local_barrier_merge_mode.load(std::memory_order_relaxed) == 0 || image_count != 0 ||
+        (flags & ~static_cast<VkDependencyFlags>(VK_DEPENDENCY_BY_REGION_BIT)) != 0 || (memory_count != 0 && !memory) ||
+        (buffer_count != 0 && !buffers) || RecordingStream() == nullptr)
+        return false;
+    for (uint32_t i = 0; i < memory_count; ++i)
+        if (memory[i].pNext) return false;
+    for (uint32_t i = 0; i < buffer_count; ++i)
+        if (buffers[i].pNext || buffers[i].srcQueueFamilyIndex != buffers[i].dstQueueFamilyIndex) return false;
+    auto& held = g_held;
+    if (held.held && (held.command != command || held.memory.size() + memory_count > HeldBarrierLimit ||
+                      held.buffers.size() + buffer_count > HeldBarrierLimit))
+        FlushHeldBarrier();
+    if (!held.held) {
+        held.held        = true;
+        held.command     = command;
+        held.source      = 0;
+        held.destination = 0;
+        held.flags       = flags;
+        held.memory.clear();
+        held.buffers.clear();
+    }
+    held.source |= source;
+    held.destination |= destination;
+    held.flags &= flags;
+    held.memory.insert(held.memory.end(), memory, memory + memory_count);
+    held.buffers.insert(held.buffers.end(), buffers, buffers + buffer_count);
+    return true;
+}
 #include "local-vulkan-recording.inc"
+void FlushHeldBarrier() {
+    auto& held = g_held;
+    if (!held.held) return;
+    held.held = false;
+    Record_vkCmdPipelineBarrier(held.command, held.source, held.destination, held.flags,
+                                static_cast<uint32_t>(held.memory.size()), held.memory.data(),
+                                static_cast<uint32_t>(held.buffers.size()), held.buffers.data(), 0, nullptr);
+}
 } // namespace
 
 void Install() { InstallDispatch(); }
 const vk::detail::DispatchLoaderDynamic& DirectDispatch() { return original; }
 uint64_t WorkCalls() { return g_work_calls; }
 uint64_t RecordedWork() { return g_work_calls + g_packets; }
-void Drain() { if (producer) producer->Drain(); }
+void Drain() {
+    FlushHeldBarrier();
+    if (producer) producer->Drain();
+}
 bool PacketsEnabled() {
     return producer && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0;
 }
@@ -314,6 +381,7 @@ uint64_t StateEpoch() {
 }
 bool EnqueuePacket(ReplayPacket replay, std::span<const Segment> segments,
                    std::shared_ptr<const void> owner) {
+    FlushHeldBarrier();
     if (!PacketsEnabled() || !replay || segments.size() > 8) return false;
     for (const auto& segment : segments)
         if (segment.size && !segment.data) return false;
@@ -332,6 +400,7 @@ bool DeferredSubmitEnabled() {
         kyty_local_deferred_submit_mode.load(std::memory_order_relaxed) != 0;
 }
 bool EnqueueDeferred(ReplayPacket replay, std::span<const Segment> segments, bool publish) {
+    FlushHeldBarrier();
     if (!DeferredSubmitEnabled() || !replay || segments.size() > 8) return false;
     auto* stream = RecordingStream();
     if (!stream) return false;
@@ -361,6 +430,7 @@ void WaitDeferredSubmits() {
          done = g_deferred_done.load(std::memory_order_acquire)) g_deferred_done.wait(done, std::memory_order_acquire);
 }
 void ReplayInline(ReplayPacket replay, std::span<const Segment> segments) {
+    FlushHeldBarrier();
     if (producer) producer->BeforeDirect();
     replay(segments, original);
 }
@@ -368,5 +438,8 @@ ProducerScope::ProducerScope() {
     if (producer) std::abort();
     producer = std::make_unique<Stream>();
 }
-ProducerScope::~ProducerScope() { producer.reset(); }
+ProducerScope::~ProducerScope() {
+    FlushHeldBarrier();
+    producer.reset();
+}
 } // namespace LocalVulkanRecording
