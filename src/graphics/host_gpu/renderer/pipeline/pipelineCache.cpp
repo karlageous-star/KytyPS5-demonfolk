@@ -2149,6 +2149,16 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	// Reused per thread: every dispatch prepares one (its user data was a new vector each time).
 	thread_local ShaderParams params;
 	PrepareProgramInto(regs, sh, input_info, params);
+	// Live counters compute_programs / compute_program_same: how often a program meets the same user data as on its
+	// previous dispatch (what a validated memo of its SRT evaluation could serve).
+	{
+		thread_local std::array<std::pair<uint64_t, uint64_t>, 1024> last {};
+		const uint64_t user = XXH3_64bits(params.user_data.data(), params.user_data.size() * sizeof(uint32_t));
+		auto&          slot = last[params.hash % last.size()];
+		LiveCounters::Add(LiveCounters::ComputePrograms);
+		if (slot.first == params.hash && slot.second == user) LiveCounters::Add(LiveCounters::ComputeProgramSame);
+		slot = {params.hash, user};
+	}
 	Common::LockGuard lock(m_mutex);
 	m_program_cache->table_pending = false;
 	m_program_cache->table_waiting.reset();
