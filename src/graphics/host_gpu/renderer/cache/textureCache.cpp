@@ -3936,6 +3936,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	}
 	found->second.clear_mask = UINT32_MAX;
 	found->second.fill_known = false;
+	m_meta_epoch.fetch_add(1, std::memory_order_release); // (a clear pending: cached answers ask again)
 	return true;
 }
 
@@ -3950,6 +3951,7 @@ bool TextureCache::ClearMeta(uint64_t address, uint32_t fill_value) {
 	found->second.clear_mask = UINT32_MAX;
 	found->second.fill_value = fill_value;
 	found->second.fill_known = true;
+	m_meta_epoch.fetch_add(1, std::memory_order_release);
 	return true;
 }
 
@@ -3998,6 +4000,7 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	}
 	if (is_clear) {
 		found->second.clear_mask |= 1u << slice;
+		m_meta_epoch.fetch_add(1, std::memory_order_release);
 	} else {
 		found->second.clear_mask &= ~(1u << slice);
 	}
