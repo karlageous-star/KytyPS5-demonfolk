@@ -695,6 +695,24 @@ public:
 		return true;
 	}
 
+	// The same over consecutive mappings (chenxiao 9b50c39a; the game maps its heaps a few hundred KiB at a time: a 4 MiB
+	// copy of its constants spans ten): unique when each mapping's part of the range is (no byte of it mapped twice), and
+	// no address of it is unmapped. (Its callers read and write the range through its guest addresses only.)
+	bool IsUniqueRangeAcrossMappings(uint64_t vaddr, uint64_t size) {
+		if (size == 0 || UINT64_MAX - vaddr < size) return false;
+		auto           lock = MapReadLock();
+		const uint64_t end  = vaddr + size;
+		for (uint64_t at = vaddr; at < end;) {
+			MapEntry entry {};
+			if (!FindContainingUnlocked(at, 1, &entry)) return false;
+			const uint64_t piece    = std::min(end, entry.vaddr + entry.size) - at;
+			const uint64_t physical = entry.backing_offset + at - entry.vaddr;
+			if (!CoverageUnique(physical, physical + piece)) return false;
+			at += piece;
+		}
+		return true;
+	}
+
 	bool IsUniqueRange(uint64_t vaddr, uint64_t size) {
 		// KYTY_ALIAS_VERIFY: every answer is compared with the full rebuild it replaces.
 		static const bool verify = std::getenv("KYTY_ALIAS_VERIFY") != nullptr;
@@ -1313,6 +1331,9 @@ public:
 	}
 
 	bool IsUniqueBackingRange(uint64_t vaddr, uint64_t size) { return m_backing->IsUniqueRange(vaddr, size); }
+	bool IsUniqueBackingRangeAcrossMappings(uint64_t vaddr, uint64_t size) {
+		return m_backing->IsUniqueRangeAcrossMappings(vaddr, size);
+	}
 
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
 

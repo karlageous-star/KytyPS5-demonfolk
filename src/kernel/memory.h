@@ -134,6 +134,9 @@ extern thread_local uint64_t g_srt_shader_hash;
 // GPU thread: whether the buffer cache holds GPU-written bytes in the range (a CPU read of it drains the GPU).
 bool                   IsGpuDirtyOnGpuThread(uint64_t vaddr, uint64_t size);
 bool                   IsUniqueGuestBackingRange(uint64_t vaddr, uint64_t size);
+// The same over consecutive mappings (each mapping's part unique, none of it unmapped): for a caller that reads and
+// writes the range through its guest addresses only (not through one backing pointer).
+bool                   IsUniqueGuestBackingRangeAcrossMappings(uint64_t vaddr, uint64_t size);
 // On failure, optionally return a static diagnostic string (no allocation).
 // The mapped parts of a guest range as they are, unmapped parts as zeros (a texture pool span
 // whose memory the game released). False when the backing store is unavailable.

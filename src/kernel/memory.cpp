@@ -1206,6 +1206,10 @@ bool IsUniqueGuestBackingRange(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space != nullptr && g_guest_address_space->IsUniqueBackingRange(vaddr, size);
 }
 
+bool IsUniqueGuestBackingRangeAcrossMappings(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space != nullptr && g_guest_address_space->IsUniqueBackingRangeAcrossMappings(vaddr, size);
+}
+
 // `data` is host memory (every caller reads into a local or a scratch vector): the lock-free
 // host read applies; the guest-destination variant took both backing locks for each word.
 bool TryReadGpuCleanBackingOnWatchedPage(uint64_t vaddr, void* data, uint64_t size) {

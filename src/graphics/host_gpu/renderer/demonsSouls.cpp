@@ -101,9 +101,13 @@ bool TryLinearCopy(const LinearCopyDispatch& dispatch, BufferCache& cache, uint3
 	if ((src < dst + bytes && dst < src + bytes) ||
 	    (parameters.Base48() < dst + bytes && dst < parameters.Base48() + 16))
 		return false;
-	if (!LibKernel::Memory::IsUniqueGuestBackingRange(src, bytes) ||
-	    !LibKernel::Memory::IsUniqueGuestBackingRange(dst, bytes) ||
-	    !LibKernel::Memory::IsUniqueGuestBackingRange(parameters.Base48(), 16))
+	// Over consecutive mappings (chenxiao 9b50c39a): the game's heaps are mapped a few hundred KiB at a time, and a 4 MiB
+	// copy of its constants spanned ten, which took the shader path every frame: its destination GPU-written, every
+	// table evaluation reading descriptors there waited for the GPU (~2 drains a frame after the first area). The copy
+	// reads and writes through guest addresses (BufferCache::CopyBuffer), so each mapping's part being unique is enough.
+	if (!LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings(src, bytes) ||
+	    !LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings(dst, bytes) ||
+	    !LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings(parameters.Base48(), 16))
 		return false;
 	cache.CopyBuffer(dst, src, bytes, false, false);
 	cache.ScheduleCopyFeedback(dst, bytes);
