@@ -36,8 +36,10 @@ volatile std::atomic<uint32_t> kyty_local_recording_spin {0};
 namespace LocalVulkanRecording {
 namespace {
 constexpr size_t ChunkBytes = 64 * 1024;
-// Deep enough that a burst of recorded calls never blocks the producer in WaitForRoom.
-constexpr size_t ChunkCount = 64;
+// Deep enough that a burst of recorded calls never blocks the producer in WaitForRoom. 64 (4 MiB) was not:
+// Demon's Souls at the Gates spent 5% of the render thread's samples there (Kyty.Record at 41-50%: bursts, not
+// a slower consumer). 16 MiB for the one stream.
+constexpr size_t ChunkCount = 256;
 constexpr uint32_t End = std::numeric_limits<uint32_t>::max();
 vk::detail::DispatchLoaderDynamic original;
 
