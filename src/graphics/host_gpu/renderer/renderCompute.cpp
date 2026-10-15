@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ir/BdaReadPlan.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
@@ -40,6 +41,11 @@
 #include <cstdlib>
 #include <array>
 #include <atomic>
+
+extern "C" {
+// KYTY_CHAIN_BDA_READS=1: a dispatch that reaches memory through pointers only to read it chains on its read ranges.
+volatile std::atomic_uint32_t kyty_local_chain_bda_reads_mode {0};
+}
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -706,7 +712,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 9);
 	thread_local std::vector<CommandBuffer::ChainAccess> chain_accesses;
 	chain_accesses.clear();
-	const bool chain_unknown = program.info.uses_dma;
+	bool chain_unknown = program.info.uses_dma;
 	if (chain && chain_mode == 1) {
 		for (uint32_t i = 0; i < bindings.buffer_sources.size(); ++i) {
 			const auto& source = bindings.buffer_sources[i];
@@ -720,6 +726,21 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			chain_accesses.push_back({data.address, data.address + data.size, program.info.images[i].written});
 		}
 		if (indirect_args != 0) chain_accesses.push_back({indirect_args, indirect_args + 12u, false});
+		// KYTY_CHAIN_BDA_READS=1: a program that reaches memory through pointers only to read it (a complete BDA read
+		// plan: BuildBdaReadPlan refuses any address write, atomic or unbounded load; planning-only loads emit no
+		// code) chains on the ranges its plan evaluates to, the ranges PrepareBdaBindings made current, instead of
+		// waiting for every earlier dispatch: a barrier stays when an earlier dispatch of the chain wrote them or
+		// this one writes what an earlier one read through them.
+		if (chain_unknown && kyty_local_chain_bda_reads_mode.load(std::memory_order_relaxed) != 0) {
+			thread_local std::vector<GuestRange> dma_reads;
+			dma_reads.clear();
+			if (ShaderRecompiler::IR::EvaluateBdaReadPlan(program.bda_read_plan, input_info.stage.resources, dma_reads) &&
+			    !dma_reads.empty()) {
+				for (const auto& range: dma_reads)
+					chain_accesses.push_back({range.address, range.address + range.size, false});
+				chain_unknown = false;
+			}
+		}
 	}
 	bool continues_chain = chain && buffer.ComputeChainPending();
 	static const bool chain_stats = std::getenv("KYTY_CHAIN_STATS") != nullptr;

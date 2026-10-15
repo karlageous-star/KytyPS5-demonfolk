@@ -27,6 +27,7 @@ extern volatile std::atomic_uint32_t kyty_local_image_barrier_dedupe;
 extern volatile std::atomic_uint32_t kyty_local_pending_drain_mode;
 extern volatile std::atomic_uint32_t kyty_local_dispatch_batch;
 extern volatile std::atomic_uint32_t kyty_local_batch_while_busy_mode;
+extern volatile std::atomic_uint32_t kyty_local_chain_bda_reads_mode;
 extern volatile std::atomic_uint32_t kyty_local_async_lod_stats_mode;
 extern volatile std::atomic<uint32_t> kyty_local_buffer_reclaim_mode;
 extern volatile std::atomic<uint32_t> kyty_local_unmap_protect_skip_mode;
@@ -108,6 +109,8 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_DISPATCH_BATCH", &kyty_local_dispatch_batch, 1, 65536},
 	    // 1: a dispatch batch goes on while the GPU still runs work handed to it (up to 8 batches).
 	    Switch {"KYTY_BATCH_WHILE_BUSY", &kyty_local_batch_while_busy_mode},
+	    // 1: a compute dispatch that reads memory only through pointers chains on its BDA read ranges.
+	    Switch {"KYTY_CHAIN_BDA_READS", &kyty_local_chain_bda_reads_mode},
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 	    Switch {"KYTY_VULKAN_RECORDING", &kyty_local_vulkan_recording_mode},
 	    Switch {"KYTY_DEFERRED_SUBMIT", &kyty_local_deferred_submit_mode},
