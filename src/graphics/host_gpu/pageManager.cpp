@@ -509,27 +509,6 @@ bool PageManager::RestoreIfUnwatched(uint64_t vaddr) noexcept {
 	return Libs::LibKernel::Memory::RestoreGuestWritable(PageStart(vaddr), PAGE_SIZE);
 }
 
-bool PageManager::WatchedSpan(uint64_t vaddr, uint64_t size, uint64_t* first, uint64_t* end) const noexcept {
-	bool           any  = false;
-	const uint64_t stop = UINT64_MAX - vaddr < size ? UINT64_MAX : vaddr + size;
-	for (uint64_t at = PageStart(vaddr); at < stop && at < ADDRESS_SIZE;) {
-		const uint64_t until = std::min(stop, (at / REGION_SIZE + 1) * REGION_SIZE);
-		// (A region that does not exist yet never held a watcher.)
-		if (auto* region = m_impl->FindRegion(at); region != nullptr) {
-			SpinGuard lock(region->lock);
-			for (uint64_t page = at; page < until; page += PAGE_SIZE) {
-				const auto& state = region->pages[(page % REGION_SIZE) / PAGE_SIZE];
-				if (state.write_watchers == 0 && state.access_watchers == 0) continue;
-				if (!any) *first = page;
-				any  = true;
-				*end = page + PAGE_SIZE;
-			}
-		}
-		at = until;
-	}
-	return any;
-}
-
 void PageManager::ReapplyProtection(uint64_t vaddr, uint64_t size) {
 	m_impl->ReapplyProtection(vaddr, size);
 }
