@@ -72,12 +72,13 @@ public:
 	// Levels of the host image (fewer than the guest's with reduced texture quality).
 	[[nodiscard]] uint32_t HostLevels() const noexcept { return info.resources.levels - info.host_mip_skip; }
 	// Transit(layout, eShaderRead, range) would record nothing: the whole image is already in `layout` for shader
-	// reads (GetBarriers' no-op case: no per-subresource states and a range of every level and layer, as the host
-	// image has them). Repeated shader reads need no barrier and Transit then changes no state.
+	// reads (GetBarriers' no-op case: no per-subresource states and a range of every guest level and layer, which
+	// GetBarriers maps to every host level whatever the host mip skip). Repeated shader reads need no barrier and
+	// Transit then changes no state.
 	[[nodiscard]] bool ReadyForShaderRead(vk::ImageLayout layout, const ImageSubresourceRange& range) const noexcept {
 		return backing.state.layout == layout && backing.state.access_mask == vk::AccessFlagBits2::eShaderRead &&
-		       backing.subresource_states.empty() && info.host_mip_skip == 0 && !info.IsVolume() && range.base_level == 0 &&
-		       range.level_count == info.resources.levels && range.base_layer == 0 &&
+		       backing.subresource_states.empty() && !info.IsVolume() && info.host_mip_skip < info.resources.levels &&
+		       range.base_level == 0 && range.level_count == info.resources.levels && range.base_layer == 0 &&
 		       range.layer_count == info.resources.layers;
 	}
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
