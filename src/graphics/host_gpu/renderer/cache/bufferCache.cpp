@@ -27,6 +27,9 @@ volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_reprotect_mode {0};
 // 1: a guest readback whose window meets an image falls back to the request's own pages.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_narrow_mode {0};
+// KYTY_READBACK_PAGE_RUNS (default 1; 0 for a same-process A/B): KYTY_READBACK_QUEUE readiness over the page runs a
+// guest readback writes back (chenxiao 5f9452f5) instead of its whole window.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_page_runs_mode {1};
 // KYTY_READBACK_QUEUE (readback-queue.h): 1: readbacks whose bytes no in-flight GPU work writes
 // copy on the transfer queue; 2: also those whose last writer is submitted but still running;
 // 3: as 1, and each such copy is repeated on the graphics queue and compared (verification).
@@ -256,7 +259,8 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	std::vector<std::pair<uint64_t, uint64_t>> runs;
 	available_pages.ForEach([&](uint64_t a, uint64_t e) { runs.emplace_back(a, e); });
 	if (const auto queue_mode = kyty_local_readback_queue_mode.load(std::memory_order_relaxed);
-	    (queue_mode == 1 || queue_mode == 3) && m_graphics.readback_queue != nullptr && m_gpu_writes_on &&
+	    (queue_mode == 1 || queue_mode == 3) && kyty_local_readback_page_runs_mode.load(std::memory_order_relaxed) != 0 &&
+	    m_graphics.readback_queue != nullptr && m_gpu_writes_on &&
 	    m_gpu_writes_from != UINT64_MAX && !runs.empty()) {
 		auto& master = m_scheduler.GetMasterSemaphore();
 		master.Refresh();
@@ -365,6 +369,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	request->packed_size = packed_size;
 	// KYTY_READBACK_QUEUE: bytes whose writers the GPU finished (or, mode 2, has been handed)
 	// need not wait behind the rest of the graphics queue.
+	if (kyty_local_readback_page_runs_mode.load(std::memory_order_relaxed) == 0) runs.assign(1, {begin, end});
 	if (ReadbackQueueReady(runs, true, request->producer_tick)) {
 		// Also after the slot's last graphics-queue copy (it is submitted: that path flushes).
 		request->producer_tick = std::max(request->producer_tick, m_download_ticks[slot]);

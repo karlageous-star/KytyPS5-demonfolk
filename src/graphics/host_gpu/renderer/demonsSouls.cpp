@@ -14,6 +14,12 @@
 #include <cstring>
 #include <string>
 
+extern "C" {
+// KYTY_LINEAR_COPY_SPANS (default 1; 0 for a same-process A/B): the linear copy accepts a range over consecutive
+// mappings (chenxiao 9b50c39a), not only a range inside one mapping.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_linear_copy_spans_mode {1};
+}
+
 namespace Libs::Graphics::DemonsSouls {
 bool IsSupportedGame() {
 	// Called by the dispatch path after game metadata has been loaded.
@@ -105,9 +111,10 @@ bool TryLinearCopy(const LinearCopyDispatch& dispatch, BufferCache& cache, uint3
 	// copy of its constants spanned ten, which took the shader path every frame: its destination GPU-written, every
 	// table evaluation reading descriptors there waited for the GPU (~2 drains a frame after the first area). The copy
 	// reads and writes through guest addresses (BufferCache::CopyBuffer), so each mapping's part being unique is enough.
-	if (!LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings(src, bytes) ||
-	    !LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings(dst, bytes) ||
-	    !LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings(parameters.Base48(), 16))
+	const auto unique = kyty_local_linear_copy_spans_mode.load(std::memory_order_relaxed) != 0
+	                        ? &LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings
+	                        : &LibKernel::Memory::IsUniqueGuestBackingRange;
+	if (!unique(src, bytes) || !unique(dst, bytes) || !unique(parameters.Base48(), 16))
 		return false;
 	cache.CopyBuffer(dst, src, bytes, false, false);
 	cache.ScheduleCopyFeedback(dst, bytes);
