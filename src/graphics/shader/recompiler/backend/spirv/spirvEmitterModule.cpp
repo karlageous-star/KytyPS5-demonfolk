@@ -727,8 +727,6 @@ void DefineModule(EmitterState& state) {
 	if (state.lane_count == 2 || state.requirements.subgroup_ballot) {
 		state.builder.RequireCapability(CapabilityGroupNonUniformBallot);
 	}
-	if (state.requirements.subgroup_shuffle && state.program.wave_size == 64u && state.stage != ShaderType::Compute)
-		state.builder.RequireCapability(CapabilityGroupNonUniformArithmetic); // wave OR reductions (spirvEmitterFlow.cpp)
 	if (state.requirements.subgroup_shuffle) {
 		state.builder.RequireCapability(CapabilityGroupNonUniformShuffle);
 	}

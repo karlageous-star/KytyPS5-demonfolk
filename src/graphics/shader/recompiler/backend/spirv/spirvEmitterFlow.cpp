@@ -1,9 +1,9 @@
-#include <cstdio>
-#include <atomic>
-#include <cstdlib>
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -661,7 +661,9 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 				// runs on 32-wide host subgroups: lane 63 does not exist and fragment subgroups can have lanes without a
 				// fragment, which break the scan's chain (dark columns on Demon's Souls' water, PS 7a59c1a20cbe5d4a).
 				// Each lane's scanned value holds its own bits and only bits of the wave, so the subgroup's OR of them
-				// is the union the scan meant.
+				// is the union the scan meant. (The capability only where it is used: every other module keeps its
+				// SPIR-V, so the pipelines precompiled for them stay valid.)
+				state.builder.RequireCapability(CapabilityGroupNonUniformArithmetic);
 				const auto result = state.builder.AllocateId();
 				state.builder.AddFunction({OpGroupNonUniformBitwiseOr, TypeU32(state), result,
 				                           ConstantU32(state, ScopeSubgroup), 0u /* Reduce */, ctx.Arg(inst, 0)});
