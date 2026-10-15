@@ -617,8 +617,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// Materialize the persistent argument owner before final descriptor handles:
 	// a tiny CPU upload must not leave an indirect command using a stream slice
 	// that can be retired when preparation rotates the command buffer.
+	BufferId indirect_id {};
 	if (indirect_args != 0) {
-		m_context.GetBufferCache().EnsureBufferContents(indirect_args, 3u * sizeof(uint32_t));
+		indirect_id = m_context.GetBufferCache().EnsureBufferContents(indirect_args, 3u * sizeof(uint32_t));
 	}
 	RebindBuffers(bindings);
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 7);
@@ -676,10 +677,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk::Buffer indirect_buffer = nullptr;
 	uint64_t   indirect_offset = 0;
 	if (indirect_args != 0) {
-		auto& cache     = m_context.GetBufferCache();
-		auto& owner     = cache.GetBuffer(cache.FindBuffer(indirect_args, 3u * sizeof(uint32_t)));
-		indirect_buffer = owner.Handle();
-		indirect_offset = owner.Offset(indirect_args);
+		auto& cache = m_context.GetBufferCache();
+		// The owner EnsureBufferContents resolved, unless it was deleted or no longer covers the arguments.
+		// Live registered buffers do not overlap, so a live cover is the one FindBuffer would return.
+		auto* owner = cache.GetBufferIfLive(indirect_id);
+		if (owner == nullptr || !owner->IsInBounds(indirect_args, 3u * sizeof(uint32_t))) {
+			owner = &cache.GetBuffer(cache.FindBuffer(indirect_args, 3u * sizeof(uint32_t)));
+		}
+		indirect_buffer = owner->Handle();
+		indirect_offset = owner->Offset(indirect_args);
 	}
 
 	// KYTY_DS_COMPUTE_CHAIN: 1 (default) the Demon's Souls profile leaves out the barrier between two

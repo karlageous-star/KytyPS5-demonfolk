@@ -52,7 +52,7 @@ public:
 		return buffer != nullptr && !buffer->is_deleted ? buffer : nullptr;
 	}
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
-	void                   EnsureBufferContents(uint64_t vaddr, uint64_t size);
+	BufferId               EnsureBufferContents(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,

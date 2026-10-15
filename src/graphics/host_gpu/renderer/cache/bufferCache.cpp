@@ -1870,11 +1870,12 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	return handle;
 }
 
-void BufferCache::EnsureBufferContents(uint64_t vaddr, uint64_t size) {
+BufferId BufferCache::EnsureBufferContents(uint64_t vaddr, uint64_t size) {
 	const auto id     = FindBuffer(vaddr, size);
 	auto&      buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+	return id;
 }
 
 StreamBuffer& BufferCache::GetShaderUploadBuffer() noexcept {
@@ -1892,9 +1893,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
+	// CPU-modified first: a clean range (the usual case) stops here and skips the GPU query.
 	if (!is_written && size <= CACHING_PAGESIZE &&
-	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+	    m_memory_tracker.IsRegionCpuModified(vaddr, size) &&
+	    !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
 		auto& upload = GetShaderUploadBuffer();
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 4);
