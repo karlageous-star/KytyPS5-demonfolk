@@ -3100,7 +3100,9 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 			for (uint32_t layer = dep.range.base_layer; layer < dep.range.base_layer + dep.range.layer_count; ++layer)
 				if (layer >= 32 || textures.IsMetaCleared(dep.desc.info.metadata.range.address, layer)) return false;
 		}
-		image->Transit(dep.layout, vk::AccessFlagBits2::eShaderRead, dep.range, vk_buffer);
+		// Most sampled images are already there: the check costs no call (live tracing keeps every Transit's event).
+		if (LiveTrace::WriteTicks() || !image->ReadyForShaderRead(dep.layout, dep.range))
+			image->Transit(dep.layout, vk::AccessFlagBits2::eShaderRead, dep.range, vk_buffer);
 	}
 	scheduler.BeginRendering(keep_clears ? draw_state.first_rendering : draw_state.rendering);
 
