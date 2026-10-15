@@ -137,7 +137,13 @@ def generate(registry, header):
             declarations.append(f'static {ret} Record_{name}({signature}) {{')
         else:
             declarations.append(f'static VKAPI_ATTR {ret} VKAPI_CALL Wrapped_{name}({signature}) {{')
-            declarations.append('    FlushHeldBarrier();')
+            # State commands (binds, dynamic state, push constants and descriptors) do no work a barrier orders:
+            # a held barrier may follow them, so the hazard barrier of a dispatch, its pipeline bind and its
+            # indirect-argument barrier still become one call. Events are synchronization, not state.
+            state = (re.match(r'vkCmd(Bind|Set|PushConstants|PushDescriptorSet)', name) and
+                     not name.startswith('vkCmdSetEvent'))
+            if not state:
+                declarations.append('    FlushHeldBarrier();')
             declarations.extend(counters)
         if ok:
             deferred.append(name)
