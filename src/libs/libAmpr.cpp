@@ -1476,41 +1476,10 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		            host_path.c_str() + (slash == std::string::npos ? 0 : slash + 1));
 	}, SlowLog::HitchThreshold());
 
-	if (host_path.find('!') != std::string::npos && Common::IsArchivePath(Common::PathFromUtf8(host_path))) {
-		const auto* archive = KeptArchiveFile(host_path);
-		if (archive == nullptr) {
-			LOGF("\tAPR read missing archive file: %s\n", host_path.c_str());
-			return LibKernel::KERNEL_ERROR_ENOENT;
-		}
-		opening = Clock::now() - start;
-		if (file_offset >= archive->Size()) {
-			return OK;
-		}
-		// Decompressed on the archive's host threads, copied into the guest range on this one (pages may fault). One
-		// call for the whole read keeps its chunks in flight on all the lanes.
-		const auto readable = std::min<uint64_t>(size, archive->Size() - file_offset);
-		LibKernel::Memory::PrepareHostOverwrite(destination, readable);
-		while (*bytes_read < readable) {
-			const auto request = static_cast<uint32_t>(std::min<uint64_t>(uint64_t {1} << 30u, readable - *bytes_read));
-			const auto read    = archive->ReadAt(file_offset + *bytes_read, reinterpret_cast<void*>(destination + *bytes_read), request);
-			if (read == 0) {
-				break;
-			}
-			*bytes_read += read;
-		}
-		reading = Clock::now() - start - opening;
-		LogAprRead(host_path, destination, *bytes_read, file_offset);
-		return OK;
-	}
-
 	// The file kept open (LocalPlatform::OpenKeptReadFile): opened per read, a streamed file (audio, read 16 KiB at a
 	// time) lost the cache manager's read-ahead at each close, so each chunk was a disk read of its own; under load
 	// one took 100-550 ms while the game waited for it. Positional reads into a buffer of the thread's (the kernel
-	// cannot write into write-protected guest pages), then copied. The read's protected pages are made the host's first,
-	// once for the whole read (Memory::PrepareHostOverwrite: GPU-written bytes it replaces dropped, writable at once; a
-	// page protected again meanwhile faults as before). Copied through the write faults page by page, a level's banks
-	// went in at 0.3 GB/s (obj_bg_nex.bnk, 95 MB: 291 ms of copying on a job thread while the Nexus loaded, 10-12); with
-	// a preparation per 4 MiB piece each waited for the GPU thread (obj_bg_tow.bnk, 141 MB: 174 ms).
+	// cannot write into write-protected guest pages), then copied.
 	if (uint64_t kept_size = 0; const auto kept = LocalPlatform::OpenKeptReadFile(host_path, &kept_size)) {
 		opening = Clock::now() - start;
 		if (file_offset >= kept_size) {
@@ -1519,7 +1488,6 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		const auto readable = std::min<uint64_t>(size, kept_size - file_offset);
 		thread_local std::vector<uint8_t> kept_buffer;
 		kept_buffer.resize(static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable)));
-		LibKernel::Memory::PrepareHostOverwrite(destination, readable);
 		while (*bytes_read < readable) {
 			const auto request = static_cast<uint32_t>(std::min<uint64_t>(kept_buffer.size(), readable - *bytes_read));
 			const auto before  = Clock::now();
@@ -1560,7 +1528,6 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 
 	std::vector<uint8_t> buffer(
 	    static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable)));
-	LibKernel::Memory::PrepareHostOverwrite(destination, readable);
 	while (*bytes_read < readable) {
 		const auto request =
 		    static_cast<uint32_t>(std::min<uint64_t>(buffer.size(), readable - *bytes_read));

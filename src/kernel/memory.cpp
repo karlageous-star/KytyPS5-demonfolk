@@ -1379,37 +1379,6 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	(void)GetGpuResources().InvalidateMemory(vaddr, size);
 }
 
-void InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
-	if (size == 0) {
-		return;
-	}
-	(void)GetGpuResources().InvalidateMemoryForWrite(vaddr, size);
-}
-
-void PrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
-	if (size == 0 || UINT64_MAX - vaddr < size || g_gpu_resources == nullptr) return;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	// From the first page a store would fault on to the end of the last one.
-	uint64_t first = 0, last = 0;
-	bool     any   = false;
-	for (uint64_t at = vaddr; at < vaddr + size;) {
-		MEMORY_BASIC_INFORMATION info {};
-		if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) == 0) return;
-		const auto end = std::min(reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize, vaddr + size);
-		if (end <= at) return;
-		const bool writable = info.State == MEM_COMMIT && (info.Protect & PAGE_GUARD) == 0 &&
-		                      (info.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0;
-		if (!writable) {
-			if (!any) first = at;
-			any  = true;
-			last = end;
-		}
-		at = end;
-	}
-	if (any) (void)g_gpu_resources->InvalidateMemoryForWrite(first, last - first);
-#endif
-}
-
 bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
 	       g_gpu_resources->InvalidateMemory(vaddr, size);
