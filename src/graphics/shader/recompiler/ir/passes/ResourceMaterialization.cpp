@@ -578,16 +578,35 @@ bool MaterializeAddressProbeIndirectImage(const DescriptorSource::IndirectImage&
 
 	IndirectImage next;
 	next.keys = keys.Take();
+	// The probed entries are made readable first, one sync per run of adjacent entries (the same bytes as one sync
+	// an entry: consecutive keys are consecutive descriptors), then read. Nothing records GPU work in between.
+	constexpr uint64_t EntryBytes = 8u * sizeof(uint32_t);
+	const auto entry_of = [&](uint32_t key) {
+		return heap_base + indirect.table_offset + (static_cast<uint64_t>(key) << DenseDescriptorShift);
+	};
+	{
+		thread_local std::vector<uint64_t> entries;
+		entries.clear();
+		for (const auto key: next.keys) {
+			const auto entry = entry_of(key);
+			if (entry + EntryBytes <= AddressMask) entries.push_back(entry);
+		}
+		std::sort(entries.begin(), entries.end());
+		for (size_t i = 0; i < entries.size();) {
+			const auto begin = entries[i];
+			auto       end   = begin + EntryBytes;
+			for (++i; i < entries.size() && entries[i] <= end; ++i) end = std::max(end, entries[i] + EntryBytes);
+			MakeRangeReadable(runtime, begin, end - begin);
+		}
+	}
 	std::vector<DescriptorValue> probed;
 	probed.reserve(next.keys.size());
 	for (const auto key: next.keys) {
 		DescriptorValue candidate;
 		candidate.dword_count = 8u;
-		const auto entry      = heap_base + indirect.table_offset +
-		                   (static_cast<uint64_t>(key) << DenseDescriptorShift);
+		const auto entry      = entry_of(key);
 		bool readable = entry + candidate.dword_count * sizeof(uint32_t) <= AddressMask;
 		if (readable) {
-			MakeRangeReadable(runtime, entry, candidate.dword_count * sizeof(uint32_t));
 			readable = ReadSpecializationDescriptor(runtime, entry, candidate.dwords);
 		}
 		if (!readable || NullImageDescriptor(candidate) ||
