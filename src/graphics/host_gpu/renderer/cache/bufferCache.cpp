@@ -248,6 +248,49 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		if (pending) for (const auto& page: pending->pages)
 			available_pages.Subtract(page.address, page.size);
 	}
+	// KYTY_READBACK_QUEUE (chenxiao 5f9452f5): the bytes written back are those of these pages (the window's others are
+	// at most copied as envelope fill, never written back): they take the transfer queue while no unfinished GPU write
+	// overlaps them, whatever other writes in the window do (at Latria the culling's next stage writing the window sent
+	// ~4 readbacks a frame of final bytes behind the whole graphics queue, ~1.2 ms each). When one does but the
+	// requested pages' bytes are final, the 64 KiB pieces it overlaps stay GPU-owned for a later request.
+	std::vector<std::pair<uint64_t, uint64_t>> runs;
+	available_pages.ForEach([&](uint64_t a, uint64_t e) { runs.emplace_back(a, e); });
+	if (const auto queue_mode = kyty_local_readback_queue_mode.load(std::memory_order_relaxed);
+	    (queue_mode == 1 || queue_mode == 3) && m_graphics.readback_queue != nullptr && m_gpu_writes_on &&
+	    m_gpu_writes_from != UINT64_MAX && !runs.empty()) {
+		auto& master = m_scheduler.GetMasterSemaphore();
+		master.Refresh();
+		const uint64_t completed  = master.KnownGpuTick();
+		const uint64_t page_begin = address & ~(TRACKER_PAGE_SIZE - 1);
+		const uint64_t page_end   = (address + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+		if (completed >= m_gpu_writes_from && InflightWriteTick(page_begin, page_end, completed, true) == 0) {
+			constexpr uint64_t Piece = uint64_t {1} << 16u;
+			const auto         drop  = [&](uint64_t from, uint64_t to) {
+				if (from < to && InflightWriteTick(from, to, completed, true) != 0) available_pages.Subtract(from, to - from);
+			};
+			bool narrowed = false;
+			for (const auto& [run_begin, run_end]: runs) {
+				if (InflightWriteTick(run_begin, run_end, completed, true) == 0) continue;
+				narrowed = true;
+				// (By piece, the requested pages apart.)
+				for (uint64_t at = run_begin; at < run_end;) {
+					const uint64_t next = std::min(run_end, (at / Piece + 1) * Piece);
+					if (next <= page_begin || at >= page_end) {
+						drop(at, next);
+					} else {
+						drop(at, std::max(at, page_begin));
+						drop(std::min(next, page_end), next);
+					}
+					at = next;
+				}
+			}
+			if (narrowed) {
+				LiveCounters::Add(LiveCounters::RbNarrowed);
+				runs.clear();
+				available_pages.ForEach([&](uint64_t a, uint64_t e) { runs.emplace_back(a, e); });
+			}
+		}
+	}
 	std::vector<DownloadCopy> copies;
 	std::vector<GuestRange> pages;
 	available_pages.ForEach([&](uint64_t a, uint64_t end) {
@@ -322,8 +365,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	request->packed_size = packed_size;
 	// KYTY_READBACK_QUEUE: bytes whose writers the GPU finished (or, mode 2, has been handed)
 	// need not wait behind the rest of the graphics queue.
-	if (const std::pair<uint64_t, uint64_t> window[] {{begin, end}};
-	    ReadbackQueueReady(window, true, request->producer_tick)) {
+	if (ReadbackQueueReady(runs, true, request->producer_tick)) {
 		// Also after the slot's last graphics-queue copy (it is submitted: that path flushes).
 		request->producer_tick = std::max(request->producer_tick, m_download_ticks[slot]);
 		std::vector<ReadbackQueue::Queue::Region> regions;
