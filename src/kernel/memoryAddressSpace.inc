@@ -692,25 +692,23 @@ public:
 		if (!verify) {
 			if (size == 0 || UINT64_MAX - vaddr < size) return false; // (as FindContainingUnlocked)
 			auto lock = MapReadLock();
-			// The mapping over each 256 KiB of address and whether no byte of it is mapped twice (the usual case), kept
-			// while its region's mappings (RegionEpoch) and the aliases anywhere (m_alias_epoch) stay the same: any range in
-			// such a mapping is unique. The game asks about ~1000 ranges a frame (and every write fault one), most of them
-			// new (ring buffers), in a few mappings: two cold tree lookups each. (By 4 MiB and one epoch for every mapping
-			// change, the game's ever finer mappings evicted each other and its streaming invalidated them all.)
+			// The mapping over each 4 MiB of address and whether no byte of it is mapped twice (the usual case), kept until
+			// the mappings change (every change moves the epoch under the exclusive lock): any range in such a mapping is
+			// unique. The game asks about ~1000 ranges a frame, most of them new (ring buffers), in a few mappings: two cold
+			// tree lookups each.
 			struct Owner {
 				const GuestBackingStore* store;
-				uint64_t                 epoch, alias_epoch;
+				uint64_t                 epoch;
 				MapEntry                 entry;
 				bool                     unique;
 			};
-			thread_local std::array<Owner, 1024> owners {};
-			auto&      owner = owners[(vaddr >> 18u) % owners.size()];
-			const auto epoch = RegionEpoch(vaddr);
-			if (owner.store != this || owner.epoch != epoch || owner.alias_epoch != m_alias_epoch ||
+			thread_local std::array<Owner, 256> owners {};
+			auto& owner = owners[(vaddr >> 22u) % owners.size()];
+			if (owner.store != this || owner.epoch != m_mapping_epoch ||
 			    !GuestFreeRangeContains(owner.entry.vaddr, owner.entry.size, vaddr, size)) {
 				MapEntry entry {};
 				if (!FindContainingUnlocked(vaddr, size, &entry)) return false;
-				owner = {this, epoch, m_alias_epoch, entry, CoverageUnique(entry.backing_offset, entry.backing_offset + entry.size)};
+				owner = {this, m_mapping_epoch, entry, CoverageUnique(entry.backing_offset, entry.backing_offset + entry.size)};
 			}
 			if (owner.unique) return true;
 			const auto physical = owner.entry.backing_offset + vaddr - owner.entry.vaddr;
@@ -957,9 +955,7 @@ private:
 		auto last  = CoverageSplit(end);
 		for (auto it = first; it != last; ++it) {
 			EXIT_IF(delta < 0 && it->second == 0);
-			const bool aliased = it->second > 1;
-			it->second         = static_cast<uint32_t>(static_cast<int>(it->second) + delta);
-			if ((it->second > 1) != aliased) ++m_alias_epoch; // (a byte gained or lost its second mapping)
+			it->second = static_cast<uint32_t>(static_cast<int>(it->second) + delta);
 		}
 		// Merge keys that no longer start a different count.
 		for (auto it: {first, last}) {
@@ -1175,9 +1171,6 @@ private:
 	// evicted each other and their reads searched m_maps).
 	std::array<HostReadTranslation, 1024> m_host_read_translations {};
 	uint64_t m_mapping_epoch = 1;
-	// Moves when some physical byte gains or loses its second guest mapping (AddCoverage): uniqueness proven before holds
-	// while it stays (and the mapping's region epoch, RegionEpoch).
-	uint64_t m_alias_epoch = 1;
 };
 
 class GuestAddressSpace {
