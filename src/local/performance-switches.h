@@ -111,8 +111,9 @@ inline void InitializePerformanceSwitches() {
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 	    Switch {"KYTY_VULKAN_RECORDING", &kyty_local_vulkan_recording_mode},
 	    Switch {"KYTY_DEFERRED_SUBMIT", &kyty_local_deferred_submit_mode},
-	    // 1: back-to-back buffer-only pipeline barriers of the recording thread become one call.
-	    Switch {"KYTY_BARRIER_MERGE", &kyty_local_barrier_merge_mode},
+	    // Back-to-back pipeline barriers of the recording thread become one call: 1 buffer-only vkCmdPipelineBarrier,
+	    // 2 vkCmdPipelineBarrier2 (stages widened to the union), 3 both.
+	    Switch {"KYTY_BARRIER_MERGE", &kyty_local_barrier_merge_mode, 0, 3},
 	    // 1: native XPR draws; 2: verification (the normal path draws and is compared).
 	    Switch {"KYTY_NATIVE_XPR", &kyty_local_native_xpr_mode, 0, 2},
 	    Switch {"KYTY_DRAW_PACKETS", &kyty_local_draw_packets_mode},

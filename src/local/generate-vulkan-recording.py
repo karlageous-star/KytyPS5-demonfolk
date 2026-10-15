@@ -123,7 +123,9 @@ def generate(registry, header):
         # KYTY_BARRIER_MERGE: vkCmdPipelineBarrier's body is Record_vkCmdPipelineBarrier; its wrapper (after it) may hold
         # a buffer-only barrier to merge with the next one (vulkan-recording.cpp HoldBarrier). Every other wrapper
         # records a held barrier first, so it keeps its place before whatever this thread records next.
-        merged = name == 'vkCmdPipelineBarrier'
+        # (vkCmdPipelineBarrier2 likewise with HoldBarrier2; the KHR alias is recorded as it comes.)
+        holder = {'vkCmdPipelineBarrier': 'HoldBarrier', 'vkCmdPipelineBarrier2': 'HoldBarrier2'}.get(name)
+        merged = holder is not None
         counters = []
         # Commands that do GPU work or synchronize: unchanged between two barriers = none in between.
         if re.match(r'vkCmd(Draw|Dispatch|Copy|Fill|Clear|Blit|Resolve|UpdateBuffer|BeginRendering|PipelineBarrier|WriteTimestamp|ExecuteCommands)', name):
@@ -172,7 +174,7 @@ def generate(registry, header):
         if merged:
             declarations.append(f'static VKAPI_ATTR {ret} VKAPI_CALL Wrapped_{name}({signature}) {{')
             declarations.extend(counters)
-            declarations.append(f'    if (HoldBarrier({", ".join(pnames)})) return;')
+            declarations.append(f'    if ({holder}({", ".join(pnames)})) return;')
             declarations.append('    FlushHeldBarrier();')
             declarations.append(f'    Record_{name}({", ".join(pnames)});')
             declarations.append('}')

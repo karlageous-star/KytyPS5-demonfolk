@@ -318,7 +318,20 @@ struct HeldBarrier {
     std::vector<VkBufferMemoryBarrier> buffers;
     bool held = false;
 };
+// KYTY_BARRIER_MERGE bit 1 (=3 with the above): the same for vkCmdPipelineBarrier2, whose barriers carry their own
+// stages. Calls merged become one with every barrier's stages and accesses widened to the union of all of them: each
+// then orders and makes visible what the calls did, a dependency chained through the first call included. Image
+// barriers keep their layouts; a call with an image the held calls transition is recorded after them, not merged.
+struct HeldBarrier2 {
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    VkDependencyFlags flags = 0;
+    std::vector<VkMemoryBarrier2> memory;
+    std::vector<VkBufferMemoryBarrier2> buffers;
+    std::vector<VkImageMemoryBarrier2> images;
+    uint32_t calls = 0;
+};
 thread_local HeldBarrier g_held;
+thread_local HeldBarrier2 g_held2;
 // A merged call stays well inside a recording chunk.
 constexpr size_t HeldBarrierLimit = 256;
 void FlushHeldBarrier();
@@ -326,7 +339,7 @@ bool HoldBarrier(VkCommandBuffer command, VkPipelineStageFlags source, VkPipelin
                  VkDependencyFlags flags, uint32_t memory_count, const VkMemoryBarrier* memory,
                  uint32_t buffer_count, const VkBufferMemoryBarrier* buffers, uint32_t image_count,
                  const VkImageMemoryBarrier* /*images*/) {
-    if (kyty_local_barrier_merge_mode.load(std::memory_order_relaxed) == 0 || image_count != 0 ||
+    if ((kyty_local_barrier_merge_mode.load(std::memory_order_relaxed) & 1u) == 0 || image_count != 0 ||
         (flags & ~static_cast<VkDependencyFlags>(VK_DEPENDENCY_BY_REGION_BIT)) != 0 || (memory_count != 0 && !memory) ||
         (buffer_count != 0 && !buffers) || RecordingStream() == nullptr)
         return false;
@@ -334,6 +347,7 @@ bool HoldBarrier(VkCommandBuffer command, VkPipelineStageFlags source, VkPipelin
         if (memory[i].pNext) return false;
     for (uint32_t i = 0; i < buffer_count; ++i)
         if (buffers[i].pNext || buffers[i].srcQueueFamilyIndex != buffers[i].dstQueueFamilyIndex) return false;
+    if (g_held2.calls != 0) FlushHeldBarrier();
     auto& held = g_held;
     if (held.held && (held.command != command || held.memory.size() + memory_count > HeldBarrierLimit ||
                       held.buffers.size() + buffer_count > HeldBarrierLimit))
@@ -354,14 +368,99 @@ bool HoldBarrier(VkCommandBuffer command, VkPipelineStageFlags source, VkPipelin
     held.buffers.insert(held.buffers.end(), buffers, buffers + buffer_count);
     return true;
 }
+bool HoldBarrier2(VkCommandBuffer command, const VkDependencyInfo* info) {
+    if ((kyty_local_barrier_merge_mode.load(std::memory_order_relaxed) & 2u) == 0 || info == nullptr || info->pNext ||
+        (info->dependencyFlags & ~static_cast<VkDependencyFlags>(VK_DEPENDENCY_BY_REGION_BIT)) != 0 ||
+        (info->memoryBarrierCount != 0 && !info->pMemoryBarriers) ||
+        (info->bufferMemoryBarrierCount != 0 && !info->pBufferMemoryBarriers) ||
+        (info->imageMemoryBarrierCount != 0 && !info->pImageMemoryBarriers) || RecordingStream() == nullptr)
+        return false;
+    for (uint32_t i = 0; i < info->memoryBarrierCount; ++i)
+        if (info->pMemoryBarriers[i].pNext) return false;
+    for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
+        const auto& barrier = info->pBufferMemoryBarriers[i];
+        if (barrier.pNext || barrier.srcQueueFamilyIndex != barrier.dstQueueFamilyIndex) return false;
+    }
+    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
+        const auto& barrier = info->pImageMemoryBarriers[i];
+        if (barrier.pNext || barrier.srcQueueFamilyIndex != barrier.dstQueueFamilyIndex) return false;
+    }
+    if (g_held.held) FlushHeldBarrier();
+    auto& held     = g_held2;
+    bool  separate = held.calls != 0 &&
+                    (held.command != command || held.memory.size() + info->memoryBarrierCount > HeldBarrierLimit ||
+                     held.buffers.size() + info->bufferMemoryBarrierCount > HeldBarrierLimit ||
+                     held.images.size() + info->imageMemoryBarrierCount > HeldBarrierLimit);
+    for (uint32_t i = 0; i < info->imageMemoryBarrierCount && !separate; ++i)
+        for (const auto& image: held.images)
+            if (image.image == info->pImageMemoryBarriers[i].image) {
+                separate = true;
+                break;
+            }
+    if (separate) FlushHeldBarrier();
+    if (held.calls == 0) {
+        held.command = command;
+        held.flags   = info->dependencyFlags;
+        held.memory.clear();
+        held.buffers.clear();
+        held.images.clear();
+    }
+    held.flags &= info->dependencyFlags;
+    held.memory.insert(held.memory.end(), info->pMemoryBarriers, info->pMemoryBarriers + info->memoryBarrierCount);
+    held.buffers.insert(held.buffers.end(), info->pBufferMemoryBarriers,
+                        info->pBufferMemoryBarriers + info->bufferMemoryBarrierCount);
+    held.images.insert(held.images.end(), info->pImageMemoryBarriers,
+                       info->pImageMemoryBarriers + info->imageMemoryBarrierCount);
+    ++held.calls;
+    return true;
+}
 #include "local-vulkan-recording.inc"
 void FlushHeldBarrier() {
-    auto& held = g_held;
-    if (!held.held) return;
-    held.held = false;
-    Record_vkCmdPipelineBarrier(held.command, held.source, held.destination, held.flags,
-                                static_cast<uint32_t>(held.memory.size()), held.memory.data(),
-                                static_cast<uint32_t>(held.buffers.size()), held.buffers.data(), 0, nullptr);
+    if (auto& held = g_held; held.held) {
+        held.held = false;
+        Record_vkCmdPipelineBarrier(held.command, held.source, held.destination, held.flags,
+                                    static_cast<uint32_t>(held.memory.size()), held.memory.data(),
+                                    static_cast<uint32_t>(held.buffers.size()), held.buffers.data(), 0, nullptr);
+    }
+    if (auto& held = g_held2; held.calls != 0) {
+        if (held.calls > 1) {
+            VkPipelineStageFlags2 source = 0, destination = 0;
+            VkAccessFlags2        source_access = 0, destination_access = 0;
+            const auto gather = [&](const auto& list) {
+                for (const auto& barrier: list) {
+                    source |= barrier.srcStageMask;
+                    destination |= barrier.dstStageMask;
+                    source_access |= barrier.srcAccessMask;
+                    destination_access |= barrier.dstAccessMask;
+                }
+            };
+            const auto widen = [&](auto& list) {
+                for (auto& barrier: list) {
+                    barrier.srcStageMask  = source;
+                    barrier.dstStageMask  = destination;
+                    barrier.srcAccessMask = source_access;
+                    barrier.dstAccessMask = destination_access;
+                }
+            };
+            gather(held.memory);
+            gather(held.buffers);
+            gather(held.images);
+            widen(held.memory);
+            widen(held.buffers);
+            widen(held.images);
+        }
+        held.calls = 0;
+        VkDependencyInfo info {};
+        info.sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        info.dependencyFlags          = held.flags;
+        info.memoryBarrierCount       = static_cast<uint32_t>(held.memory.size());
+        info.pMemoryBarriers          = held.memory.data();
+        info.bufferMemoryBarrierCount = static_cast<uint32_t>(held.buffers.size());
+        info.pBufferMemoryBarriers    = held.buffers.data();
+        info.imageMemoryBarrierCount  = static_cast<uint32_t>(held.images.size());
+        info.pImageMemoryBarriers     = held.images.data();
+        Record_vkCmdPipelineBarrier2(held.command, &info);
+    }
 }
 } // namespace
 
