@@ -20,6 +20,8 @@
 extern "C" {
 // Dispatches recorded per submission (KYTY_DISPATCH_BATCH).
 volatile std::atomic_uint32_t kyty_local_dispatch_batch {32};
+// KYTY_BATCH_WHILE_BUSY=1 (chenxiao 0c29dbf9): a dispatch batch goes on while the GPU still runs work handed to it.
+volatile std::atomic_uint32_t kyty_local_batch_while_busy_mode {0};
 // 0: refresh the master timeline before every drain attempt.
 // 1: prove the pending-operation queue empty before the timeline query and the
 //    operation lock. Draws and dispatches call this with nothing to retire.
@@ -202,8 +204,15 @@ void CommandScheduler::CompleteDispatch() {
 	// next batch begin before this one drains, so its size trades that drain
 	// against how early the queue receives work. Dispatches inside a batch keep
 	// the same chain barriers at any size.
-	const auto batch = kyty_local_dispatch_batch.load(std::memory_order_relaxed);
-	if (++m_recorded_dispatches < std::clamp(batch, 1u, 65536u)) {
+	const auto batch = std::clamp(kyty_local_dispatch_batch.load(std::memory_order_relaxed), 1u, 65536u);
+	if (++m_recorded_dispatches < batch) {
+		return;
+	}
+	// While the GPU still runs work handed to it (m_driver_tick: the last tick the driver took) the batch goes on,
+	// asked at the batch's end and every 4 dispatches after it, up to 8 batches.
+	if (kyty_local_batch_while_busy_mode.load(std::memory_order_relaxed) != 0 && m_recorded_dispatches < 8 * batch &&
+	    ((m_recorded_dispatches != batch && (m_recorded_dispatches & 3u) != 0) ||
+	     !IsFree(m_driver_tick.load(std::memory_order_acquire)))) {
 		return;
 	}
 	CheckActive();
@@ -504,6 +513,7 @@ struct DeferredSubmit {
 	uint64_t             tick;
 	uint64_t             upload_sequence; // KYTY_ASYNC_UPLOAD copies this buffer reads
 	uint32_t             timestamp_slot;  // live trace
+	std::atomic<uint64_t>* driver_tick; // CommandScheduler::m_driver_tick (the last tick the driver took)
 };
 void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
                   const vk::detail::DispatchLoaderDynamic& dispatch) {
@@ -544,6 +554,7 @@ void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
 	if (result != VK_SUCCESS) {
 		EXIT("deferred vkQueueSubmit failed: %d, tick=%" PRIu64 "\n", static_cast<int>(result), submit.tick);
 	}
+	submit.driver_tick->store(submit.tick, std::memory_order_release);
 	LocalVulkanRecording::NoteDeferredSubmitDone();
 }
 } // namespace
@@ -572,6 +583,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		deferred.upload_sequence = AsyncUpload::SubmitSequence();
 		deferred.queue           = m_graphics.queue;
 		deferred.queue_mutex = &m_graphics.queue_mutex;
+		deferred.driver_tick = &m_driver_tick;
 		deferred.waits       = submit.num_wait_semaphores;
 		deferred.signals     = submit.num_signal_semaphores;
 		for (uint32_t i = 0; i < deferred.waits; ++i) {
@@ -657,6 +669,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
+		m_driver_tick.store(tick, std::memory_order_release);
 	}
 
 	if (result != vk::Result::eSuccess) {
@@ -694,6 +707,7 @@ void CommandScheduler::QueueSubmit(const SubmitJob& job) {
 	{
 		Common::LockGuard lock(m_graphics.queue_mutex);
 		result = m_graphics.queue.submit(1, &info, nullptr);
+		m_driver_tick.store(job.tick, std::memory_order_release);
 	}
 	if (result != vk::Result::eSuccess) {
 		ReportVulkanFatal("async vkQueueSubmit", result, job.tick, job.debug_op, job.debug_submit,

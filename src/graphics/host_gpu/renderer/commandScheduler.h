@@ -111,6 +111,8 @@ private:
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
 	uint32_t                     m_recorded_dispatches = 0;
+	// The last tick handed to the driver (its vkQueueSubmit returned: on the recording worker for a deferred one).
+	std::atomic<uint64_t> m_driver_tick {0};
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	// Count of live entries in m_pending_operations, updated under
