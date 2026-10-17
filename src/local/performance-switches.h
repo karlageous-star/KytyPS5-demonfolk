@@ -40,6 +40,7 @@ extern volatile std::atomic<uint32_t> kyty_local_unmap_protect_skip_mode;
 extern volatile std::atomic<uint32_t> kyty_local_window_stream_mode;
 extern volatile std::atomic<uint32_t> kyty_local_sync_readback_scoped_drain_mode;
 extern volatile std::atomic<uint32_t> kyty_local_sync_readback_narrow_mode;
+extern volatile std::atomic<uint32_t> kyty_local_vblank_no_burst_mode;
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 extern volatile std::atomic_uint32_t kyty_local_vulkan_recording_mode;
 extern volatile std::atomic_uint32_t kyty_local_deferred_submit_mode;
@@ -132,6 +133,8 @@ inline void InitializePerformanceSwitches() {
 	    // Default 1; 0 for an A/B: readback readiness over the written page runs; the linear copy over mappings.
 	    Switch {"KYTY_READBACK_PAGE_RUNS", &kyty_local_readback_page_runs_mode},
 	    Switch {"KYTY_LINEAR_COPY_SPANS", &kyty_local_linear_copy_spans_mode},
+	    // Presentation: 1 does not make up a vblank late by more than a period with vblanks back to back.
+	    Switch {"KYTY_VBLANK_NO_BURST", &kyty_local_vblank_no_burst_mode},
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 	    Switch {"KYTY_VULKAN_RECORDING", &kyty_local_vulkan_recording_mode},
 	    Switch {"KYTY_DEFERRED_SUBMIT", &kyty_local_deferred_submit_mode},

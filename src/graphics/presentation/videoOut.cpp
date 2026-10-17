@@ -35,6 +35,12 @@
 #include <thread>
 #include <vector>
 
+extern "C" {
+// KYTY_VBLANK_NO_BURST (default 0): 1 does not make up a vblank late by more than a period with vblanks back to back
+// (a burst flipped the frames queued meanwhile at once, where a console's vblanks keep their rate).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_vblank_no_burst_mode {0};
+}
+
 namespace Libs::Graphics {
 struct GraphicContext;
 } // namespace Libs::Graphics
@@ -832,6 +838,9 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			const auto frame_end = Common::Timer::QueryPerformanceCounter();
 			total_wait +=
 			    static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
+			if (kyty_local_vblank_no_burst_mode.load(std::memory_order_relaxed) != 0) {
+				total_wait = std::max(total_wait, -static_cast<int64_t>(period));
+			}
 			continue;
 		}
 
@@ -875,6 +884,10 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		const auto frame_end = Common::Timer::QueryPerformanceCounter();
 		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
+		// (A vblank late by more than a period, the thread held up: not made up for with vblanks back to back.)
+		if (kyty_local_vblank_no_burst_mode.load(std::memory_order_relaxed) != 0) {
+			total_wait = std::max(total_wait, -static_cast<int64_t>(period));
+		}
 	}
 }
 
