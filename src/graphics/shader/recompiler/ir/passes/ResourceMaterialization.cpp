@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -1210,6 +1211,16 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		if (descriptor.Type() != 0) {
 			descriptor_value.dwords.fill(0);
 			descriptor = {};
+		}
+		if (descriptor.AddTid() && program.stage != ShaderType::Compute) {
+			// (Rare outside compute: a few of them logged, the V# whole, in case it is not one the game made.)
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+				std::printf("Shader %016llx (stage %d): buffer %u's V# adds the lane (ADD_TID): %08x %08x %08x %08x\n",
+				            static_cast<unsigned long long>(program.shader_hash), static_cast<int>(program.stage), i,
+				            descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3]);
+				std::fflush(stdout);
+			}
 		}
 		auto       packed_stride = descriptor.PackedStride();
 		const auto stride        = packed_stride & 0x3fffu;

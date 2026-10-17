@@ -228,9 +228,8 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 						Fail(program, "buffer operation has invalid resource metadata");
 					}
 					if ((program.info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
-						if (program.stage != ShaderType::Compute) {
-							Fail(program, "buffer ADD_TID is only valid for compute shaders");
-						}
+						// ADD_TID (the index plus the lane) in any stage, as the GPU takes it: a pixel shader's V# had
+						// it at Boletaria 1-1 (10-17), where this exited the emulator.
 						requirements.subgroup_local_invocation_id = true;
 					}
 				}
