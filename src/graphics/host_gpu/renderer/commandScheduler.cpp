@@ -29,9 +29,11 @@ volatile std::atomic_uint32_t kyty_local_batch_while_busy_mode {0};
 // +1.9 in every round), p99 53.7 -> 49.7 ms, 16.8 drain flushes a frame, the same picture. Mode 1 barely fires
 // (0.1 a frame): the GPU runs dry while the render thread records draws inside one render pass.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_flush_on_drain_mode {2};
-// KYTY_FLUSH_DEFER (default 0): a flush point nothing waits on (a label without an interrupt, the end of a queue's
-// slice) leaves the open buffer open while the GPU still has at least this many submissions to run (DeferrableFlush).
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_flush_defer_mode {0};
+// KYTY_FLUSH_DEFER (default 2; 0: never): a flush point nothing waits on (a label without an interrupt, the end of a
+// queue's slice) leaves the open buffer open while the GPU still has at least this many submissions to run
+// (DeferrableFlush). Demon's Souls new game, 1080p, live A/B 0 -> 2: +0.86 FPS in each of 4 rounds (24.46 -> 25.32, E8,
+// medium preset) and +0.36 (E5, logging on).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_flush_defer_mode {2};
 // 0: refresh the master timeline before every drain attempt.
 // 1: prove the pending-operation queue empty before the timeline query and the
 //    operation lock. Draws and dispatches call this with nothing to retire.

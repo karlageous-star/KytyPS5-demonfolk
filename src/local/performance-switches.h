@@ -135,7 +135,7 @@ inline void InitializePerformanceSwitches() {
 	    // Default 2: recorded work is submitted once the GPU has drained, ending an open render pass (1: outside them; 0: never).
 	    Switch {"KYTY_FLUSH_ON_DRAIN", &kyty_local_flush_on_drain_mode, 0, 2},
 	    // Submissions the GPU has still to run for a flush nothing waits on (a label without an interrupt, a queue
-	    // slice's end) to be deferred (0: never, the default; N: while it has N or more: CommandScheduler::DeferrableFlush).
+	    // slice's end) to be deferred (default 2; 0: never; N: while it has N or more: CommandScheduler::DeferrableFlush).
 	    Switch {"KYTY_FLUSH_DEFER", &kyty_local_flush_defer_mode, 0, 64},
 	    // Opt-in (default 0): 1 skips the GPU-written range search for a range with no read-watched page (memory.cpp).
 	    Switch {"KYTY_SYNC_WATCH_SKIP", &kyty_local_sync_watch_skip_mode},
