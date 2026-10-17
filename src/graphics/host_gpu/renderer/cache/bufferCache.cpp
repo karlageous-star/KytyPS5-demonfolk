@@ -44,6 +44,9 @@ volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode {0};
 // (RetireStaleBuffers); 0 (default) never retires one. Opt-in: a buffer read only through the BDA page table can be
 // retired, and its next read faults back and reads zeros once (chenxiao saw bda_fault_pages ~0).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_buffer_retire_mode {0};
+// KYTY_UPLOAD_BARRIER=transfer (opt-in, UploadDirtyRanges): 1 makes an upload's copy wait for earlier transfers only,
+// not for all GPU work; 0 (default) is the full drain. A live switch, for an in-session A/B.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_upload_barrier_mode {0};
 extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 }
 
@@ -1800,10 +1803,14 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		// to them reads them back first, in an earlier command buffer). What stays ordered is the
 		// emulator's own transfers over the range (uploads, readback and forward copies, image uploads).
 		// S8: ~500 uploads a frame, each a full drain (2,157 barriers, ~5.5 ms of GPU time a frame).
-		static const bool transfer_only = [] {
+		static const bool transfer_from_env = [] {
 			const char* value = std::getenv("KYTY_UPLOAD_BARRIER");
-			return value != nullptr && std::string_view(value) == "transfer";
+			const bool  set   = value != nullptr && std::string_view(value) == "transfer";
+			if (set) kyty_local_upload_barrier_mode.store(1, std::memory_order_relaxed);
+			return set;
 		}();
+		(void)transfer_from_env;
+		const bool transfer_only = kyty_local_upload_barrier_mode.load(std::memory_order_relaxed) != 0;
 		if (transfer_only) {
 			before.srcAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
 		}
