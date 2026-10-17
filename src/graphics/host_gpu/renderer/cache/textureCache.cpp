@@ -43,6 +43,9 @@
 // 1: a partial refresh uploads only the rows of tile blocks over the dirty ranges of a large
 // subresource, not the whole subresource (UploadImagePartial).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_partial_row_bands_mode {0};
+// KYTY_HTILE_PRESERVE (default 0): 1 keeps an HTile's metadata (its slice clear state) when the depth image using it is
+// deleted. HTile belongs to guest memory, not to a native image; 0 drops the state with the image, as before.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_htile_preserve_mode {0};
 
 namespace Libs::Graphics {
 
@@ -448,7 +451,8 @@ void TextureCache::DeleteImage(ImageId id) {
 		    ((image->info.metadata.kind == ImageMetadataKind::Dcc &&
 		      metadata->second.type == MetaDataInfo::Type::Dcc) ||
 		     (image->info.metadata.kind == ImageMetadataKind::Htile &&
-		      metadata->second.type == MetaDataInfo::Type::HTile))) {
+		      metadata->second.type == MetaDataInfo::Type::HTile &&
+		      kyty_local_htile_preserve_mode.load(std::memory_order_relaxed) == 0))) {
 			// A later binding may have reused this address for another metadata type.
 			m_surface_metas.erase(metadata);
 			m_meta_epoch.fetch_add(1, std::memory_order_release);
