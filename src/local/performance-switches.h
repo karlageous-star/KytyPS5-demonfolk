@@ -31,6 +31,7 @@ extern volatile std::atomic_uint32_t kyty_local_batch_while_busy_mode;
 extern volatile std::atomic<uint32_t> kyty_local_flush_on_drain_mode;
 extern volatile std::atomic<uint32_t> kyty_local_flush_defer_mode;
 extern volatile std::atomic_uint32_t kyty_local_sync_watch_skip_mode;
+extern volatile std::atomic<uint32_t> kyty_local_transfer_chain_mode;
 extern volatile std::atomic_uint32_t kyty_local_chain_bda_reads_mode;
 extern volatile std::atomic<uint32_t> kyty_local_readback_page_runs_mode;
 extern volatile std::atomic<uint32_t> kyty_local_linear_copy_spans_mode;
@@ -139,6 +140,8 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_FLUSH_DEFER", &kyty_local_flush_defer_mode, 0, 64},
 	    // Opt-in (default 0): 1 skips the GPU-written range search for a range with no read-watched page (memory.cpp).
 	    Switch {"KYTY_SYNC_WATCH_SKIP", &kyty_local_sync_watch_skip_mode},
+	    // Opt-in (default 0): independent buffer copies recorded back to back share one barrier ahead and one after.
+	    Switch {"KYTY_TRANSFER_CHAIN", &kyty_local_transfer_chain_mode},
 	    // 1: a compute dispatch that reads memory only through pointers chains on its BDA read ranges.
 	    Switch {"KYTY_CHAIN_BDA_READS", &kyty_local_chain_bda_reads_mode},
 	    // Default 1; 0 for an A/B: readback readiness over the written page runs; the linear copy over mappings.

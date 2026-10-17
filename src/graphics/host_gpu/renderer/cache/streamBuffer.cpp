@@ -23,6 +23,8 @@ extern "C" {
 // buffer the cache retired while the game streams. VMA synchronizes internally, and a buffer
 // is destroyed only after the GPU is done with it.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_buffer_reclaim_mode {0};
+// Defined in context.cpp (CommandBuffer::TransferHandle).
+extern volatile std::atomic<uint32_t> kyty_local_transfer_chain_mode;
 }
 
 namespace Libs::Graphics {
@@ -307,11 +309,23 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 		EXIT("Buffer: overlapping self-copy\n");
 	}
 	command.EndRendering();
+	const auto host_access  = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eHostWrite;
+	// KYTY_TRANSFER_CHAIN: no barriers of its own; the chain's one barrier ahead and one after (CommandBuffer::
+	// TransferHandle). Copies the host reads or writes around keep theirs.
+	if (kyty_local_transfer_chain_mode.load(std::memory_order_relaxed) != 0 &&
+	    !static_cast<bool>((source_before | destination_before | source_after | destination_after) & host_access)) {
+		const CommandBuffer::TransferAccess accesses[] = {
+		    {static_cast<VkBuffer>(source.Handle()), source_offset, source_offset + size, false},
+		    {static_cast<VkBuffer>(Handle()), destination_offset, destination_offset + size, true},
+		};
+		const vk::BufferCopy copy {source_offset, destination_offset, size};
+		command.TransferHandle(accesses).copyBuffer(source.Handle(), Handle(), 1, &copy);
+		return;
+	}
 	const vk::BufferMemoryBarrier before[] = {
 	    source.Barrier(source_offset, size, source_before, vk::AccessFlagBits::eTransferRead),
 	    Barrier(destination_offset, size, destination_before, vk::AccessFlagBits::eTransferWrite),
 	};
-	const auto host_access  = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eHostWrite;
 	auto       before_stage = vk::PipelineStageFlags {vk::PipelineStageFlagBits::eAllCommands};
 	if (static_cast<bool>((source_before | destination_before) & host_access)) {
 		before_stage |= vk::PipelineStageFlagBits::eHost;

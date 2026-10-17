@@ -152,6 +152,17 @@ public:
 	void               RecordChainAccess(std::span<const ChainAccess> accesses, bool unknown) const;
 	// Local diagnostic (GPU marks): the handle without draining a pending dependency.
 	[[nodiscard]] vk::CommandBuffer RawHandle() const noexcept { return m_buffer; }
+	// KYTY_TRANSFER_CHAIN (kyty_local_transfer_chain_mode): buffer copies recorded back to back share one barrier ahead
+	// (everything before them, before transfers) and one after (drained by the next Handle()), while none of them reads
+	// or writes what another writes; a conflicting copy waits for the earlier ones (a transfer barrier). Buffer::CopyFrom
+	// without host access. Demon's Souls records runs of up to 80 independent 96-160 byte copies (L1 capture, 10-18).
+	struct TransferAccess {
+		VkBuffer buffer  = VK_NULL_HANDLE;
+		uint64_t begin   = 0;
+		uint64_t end     = 0;
+		bool     written = false;
+	};
+	[[nodiscard]] vk::CommandBuffer TransferHandle(std::span<const TransferAccess> accesses) const;
 
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
@@ -175,6 +186,10 @@ private:
 	mutable bool        m_compute_access_pending = false;
 	mutable std::vector<ChainAccess> m_chain_access;
 	mutable bool        m_chain_unknown          = false;
+	// KYTY_TRANSFER_CHAIN: copies recorded since the chain's barrier ahead, whose barrier after is still to come.
+	mutable bool                        m_transfer_pending = false;
+	mutable std::vector<TransferAccess> m_transfer_access;
+	void                                DrainTransferChain() const;
 	mutable uint64_t    m_graphics_generation    = 0;
 	vk::CommandBuffer   m_buffer          = nullptr;
 	uint32_t            m_timestamp_slot  = UINT32_MAX; // live trace GPU timestamps

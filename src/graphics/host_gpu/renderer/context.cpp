@@ -18,8 +18,16 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstring>
+
+extern "C" {
+// KYTY_TRANSFER_CHAIN (default 0; live): independent buffer copies recorded back to back share one barrier ahead and one
+// after (CommandBuffer::TransferHandle).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_transfer_chain_mode {0};
+}
+
 namespace Libs::Graphics {
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
@@ -31,6 +39,7 @@ bool CommandBuffer::IsInvalid() const {
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	DrainTransferChain();
 	if (m_compute_access_pending) {
 		ShaderAccessBarrier(m_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		m_compute_access_pending = false;
@@ -42,6 +51,49 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 
 vk::CommandBuffer CommandBuffer::ChainHandle() const {
 	EXIT_IF(IsInvalid() || m_rendering);
+	DrainTransferChain();
+	return m_buffer;
+}
+
+// The chain's barrier after: the copies' transfers before every later command, their writes visible to it.
+void CommandBuffer::DrainTransferChain() const {
+	if (!m_transfer_pending) return;
+	const vk::MemoryBarrier after {vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite,
+	                               vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite};
+	m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
+	                         vk::DependencyFlagBits::eByRegion, 1, &after, 0, nullptr, 0, nullptr);
+	m_transfer_pending = false;
+	m_transfer_access.clear();
+}
+
+vk::CommandBuffer CommandBuffer::TransferHandle(std::span<const TransferAccess> accesses) const {
+	EXIT_IF(IsInvalid() || m_rendering);
+	if (m_compute_access_pending) (void)Handle(); // the pending compute dependency first (no transfer chain then)
+	if (!m_transfer_pending) {
+		// The barrier ahead: everything recorded before, at any stage, before the transfers; its writes visible to them.
+		const vk::MemoryBarrier before {vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		                                vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite};
+		m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+		                         vk::DependencyFlagBits::eByRegion, 1, &before, 0, nullptr, 0, nullptr);
+	} else {
+		bool conflict = m_transfer_access.size() + accesses.size() > 256;
+		for (const auto& pending: m_transfer_access) {
+			for (const auto& access: accesses) {
+				conflict = conflict || (pending.buffer == access.buffer && (pending.written || access.written) &&
+				                        access.begin < pending.end && pending.begin < access.end);
+			}
+		}
+		if (conflict) {
+			// A copy touching what an earlier one of the chain writes (or writing what one reads) waits for them.
+			const vk::MemoryBarrier between {vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite,
+			                                 vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite};
+			m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
+			                         vk::DependencyFlagBits::eByRegion, 1, &between, 0, nullptr, 0, nullptr);
+			m_transfer_access.clear();
+		}
+	}
+	m_transfer_access.insert(m_transfer_access.end(), accesses.begin(), accesses.end());
+	m_transfer_pending = true;
 	return m_buffer;
 }
 
@@ -76,6 +128,8 @@ void CommandBuffer::RecordChainAccess(std::span<const ChainAccess> accesses, boo
 vk::CommandBuffer CommandBuffer::HandleForFullBarrier() const {
 	EXIT_IF(IsInvalid());
 	// The caller records a full AllCommands memory dependency immediately.
+	m_transfer_pending = false;
+	m_transfer_access.clear();
 	m_compute_access_pending = false;
 	m_chain_access.clear();
 	m_chain_unknown = false;
