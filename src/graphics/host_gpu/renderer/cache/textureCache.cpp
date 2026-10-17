@@ -78,6 +78,9 @@ constexpr uint64_t PartialUploadMaxShare = 2;
 constexpr uint64_t PartialStageGap = uint64_t {64} << 10;
 // UploadImageRanges: a mixed refresh takes guest memory (or a GPU-written buffer) this much at a time.
 constexpr uint64_t ChunkedUploadPiece = uint64_t {64} << 20;
+// A mixed refresh of an image from this size takes pieces (UploadImageRanges); below it, the changed subresources detile
+// from one source over the whole image (UploadImagePartial's buffer mode), the same request as the whole upload.
+constexpr uint64_t ChunkedUploadMin = uint64_t {256} << 20;
 
 // Bounded attribution only: a fault span reports the faulting byte, not the
 // instruction's write width. Log before dirty ranges are dropped; never change
@@ -1851,15 +1854,22 @@ void TextureCache::InitializeImage(ImageId id) {
 		           !image.BufferDirtyRanges().empty() && BufferPartialOn() &&
 		           kyty_local_partial_mixed_upload_mode.load(std::memory_order_relaxed) != 0 &&
 		           kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 1) {
-			// CPU writes over known parts of it and GPU buffer writes over known parts: the subresources over either alone,
-			// each piece from guest memory or from the buffer the GPU wrote it in. The partial upload takes no image with
-			// buffer writes and stages guest bytes alone; a texture pool's range over memory the GPU writes too (issue #49:
-			// 1 GB of 1024x1024 slots) went up whole each time the game streamed a texture into it, 190-360 ms frames.
-			auto ranges = image.CpuDirtyRanges();
-			for (const auto& [begin, end]: image.BufferDirtyRanges()) Image::AddRange(ranges, begin, end);
+			// CPU writes over known parts of it and GPU buffer writes over known parts: the subresources over either alone.
+			// The partial upload takes no image with buffer writes and stages guest bytes alone; a texture pool's range over
+			// memory the GPU writes too (issue #49: 1 GB of 1024x1024 slots) went up whole each time the game streamed a
+			// texture into it, 190-360 ms frames. The sources are the whole upload's (one for all of it below
+			// ChunkedUploadMin, a piece at a time past it): asked for pieces, the buffer cache made and joined buffers inside
+			// the image's range again and again (an 8 GB laptop's GPU faults in the culling chain came 3 times in 4 tours
+			// with that, 10-18).
 			g_partial_fail  = "";
 			partial_attempt = true;
-			uploaded        = UploadImageRanges(image, ranges);
+			if (image.info.data.size >= ChunkedUploadMin) {
+				auto ranges = image.CpuDirtyRanges();
+				for (const auto& [begin, end]: image.BufferDirtyRanges()) Image::AddRange(ranges, begin, end);
+				uploaded = UploadImageRanges(image, ranges);
+			} else {
+				uploaded = UploadImagePartial(image, true, true);
+			}
 			partial_outcome = uploaded ? "mixed_ok" : g_partial_fail;
 			if (!uploaded) {
 				LiveCounters::Add(LiveCounters::PartialFallbacks);
@@ -2594,10 +2604,18 @@ bool TextureCache::UploadImageChunked(Image& image) {
 	return true;
 }
 
-bool TextureCache::UploadImagePartial(Image& image, bool from_buffer) {
+bool TextureCache::UploadImagePartial(Image& image, bool from_buffer, bool mixed) {
 	// Tiler scratch from this operation stays alive until its last use (tiler.h ScratchHold).
 	const TileManager::ScratchHold scratch_hold(m_tiler);
 	const auto& info    = image.info;
+	// mixed (InitializeImage): the CPU's changed ranges and the GPU's, the subresources over them from the image's buffer
+	// (the whole upload's source, as from_buffer; the guest bytes are in it too).
+	std::vector<std::pair<uint64_t, uint64_t>> mixed_dirty;
+	if (mixed) {
+		from_buffer = true;
+		mixed_dirty = image.CpuDirtyRanges();
+		for (const auto& [begin, end]: image.BufferDirtyRanges()) Image::AddRange(mixed_dirty, begin, end);
+	}
 	// A reduced image (KYTY_TEXTURE_QUALITY=reduced) holds guest levels host_mip_skip and up as its levels 0 and up:
 	// dirty bytes of the levels it leaves out are not uploaded, the others go to their level less the skip (as the
 	// whole-image upload does). Every change of a streamed texture uploaded the whole image before.
@@ -2634,7 +2652,7 @@ bool TextureCache::UploadImagePartial(Image& image, bool from_buffer) {
 	// A fragmented dirty set uploads the whole subresource rather than many small dispatches.
 	constexpr size_t MaxBandsPerSubresource = 16;
 	// from_buffer: the ranges GPU buffer writes changed; their newest bytes are in the buffer, not in memory.
-	const auto&          dirty    = from_buffer ? image.BufferDirtyRanges() : image.CpuDirtyRanges();
+	const auto&          dirty    = mixed ? mixed_dirty : from_buffer ? image.BufferDirtyRanges() : image.CpuDirtyRanges();
 	const bool           bands_on = kyty_local_partial_row_bands_mode.load(std::memory_order_relaxed) != 0;
 	uint64_t             picked   = 0;
 	std::vector<Pick>    picks;

@@ -230,10 +230,11 @@ public:
 			return;
 		}
 		AddRange(m_buffer_ranges, begin, end);
-		// (More in a large image with KYTY_PARTIAL_MIXED_UPLOAD: where the whole is GBs, a texture pool's range over memory
-		// the GPU writes in many places, issue #49. Otherwise a few.)
+		// (More in a large image with KYTY_PARTIAL_MIXED_UPLOAD, an image uploaded a piece at a time anyway (256 MiB and up,
+		// TextureCache's ChunkedUploadMin): where the whole is GBs, a texture pool's range over memory the GPU writes in
+		// many places, issue #49. Otherwise a few.)
 		const bool large_ranges = kyty_local_partial_mixed_upload_mode.load(std::memory_order_relaxed) != 0 &&
-		                          info.data.size >= (uint64_t {64} << 20u);
+		                          info.data.size >= (uint64_t {256} << 20u);
 		if (m_buffer_ranges.size() > (large_ranges ? 256u : 32u)) {
 			m_buffer_whole = true;
 			m_buffer_ranges.clear();

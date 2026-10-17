@@ -187,7 +187,8 @@ private:
 	void               UntrackImagePages(Image& image, uint64_t begin, uint64_t end);
 	void               RetrackHoles(Image& image);
 	void               FinishRefresh(Image& image);
-	[[nodiscard]] bool UploadImagePartial(Image& image, bool from_buffer = false);
+	// mixed: the CPU's and the GPU's changed ranges, from the image's buffer (KYTY_PARTIAL_MIXED_UPLOAD, a small image).
+	[[nodiscard]] bool UploadImagePartial(Image& image, bool from_buffer = false, bool mixed = false);
 	[[nodiscard]] bool UploadDepthPartial(Image& image);
 	void               UpdatePartialHashes(Image& image, bool all);
 	[[nodiscard]] bool CheckPartialHashes(const Image& image);
