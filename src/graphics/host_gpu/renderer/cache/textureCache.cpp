@@ -874,6 +874,8 @@ void TextureCache::RefreshCopySource(ImageId id) {
 }
 
 bool TextureCache::CopyD16(Image& destination, Image& source) {
+	// Tiler scratch from this operation stays alive until its last use (tiler.h ScratchHold).
+	const TileManager::ScratchHold scratch_hold(m_tiler);
 	const bool source_depth      = source.info.IsDepth();
 	const bool destination_depth = destination.info.IsDepth();
 	if (source_depth == destination_depth) {
@@ -1446,6 +1448,8 @@ void TextureCache::TrimUploadedTexture(Image& image, bool cpu_written_only) {
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	// Tiler scratch from this operation stays alive until its last use (tiler.h ScratchHold).
+	const TileManager::ScratchHold scratch_hold(m_tiler);
 	const auto& info    = image.info;
 	const auto  binding = UploadBinding(image);
 	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
@@ -1633,6 +1637,8 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 }
 
 void TextureCache::UploadStencil(Image& image, Buffer& source, uint64_t source_offset) {
+	// Tiler scratch from this operation stays alive until its last use (tiler.h ScratchHold).
+	const TileManager::ScratchHold scratch_hold(m_tiler);
 	const auto&     info = image.info;
 	TileBlockLayout block {};
 	if (!info.HasStencil() || info.samples != 1 || image.backing.samples != 1 ||
@@ -2131,6 +2137,8 @@ bool TextureCache::UploadDepthPartial(Image& image) {
 			EXIT_NOT_IMPLEMENTED(!TileGetBlockLayout(TileBlockFamily::Depth64KB, info.bytes_per_block, block));
 		}
 		for (size_t first = 0; first < picked.size();) {
+			// One batch's scratch is released when the batch has been recorded (tiler.h ScratchHold).
+			const TileManager::ScratchHold scratch_hold(m_tiler);
 			size_t batch_count = 0;
 			uint64_t batch_bytes = 0;
 			while (first + batch_count < picked.size()) {
@@ -2187,6 +2195,8 @@ bool TextureCache::UploadDepthPartial(Image& image) {
 			first += batch_count;
 		}
 	} else {
+		// Tiler scratch from this path stays alive until its last use (tiler.h ScratchHold).
+		const TileManager::ScratchHold scratch_hold(m_tiler);
 		// Existing single-reservation path remains the default and the oversized-layer fallback.
 		std::vector<BufferCache::StagingPiece> pieces;
 		std::vector<uint64_t> staged(picked.size());
@@ -2300,6 +2310,8 @@ bool TextureCache::UploadImageChunked(Image& image) {
 		}
 		uint64_t uploaded_bytes = 0;
 		for (uint32_t first = 0; first < layers;) {
+			// One batch's scratch is released when the batch has been recorded (tiler.h ScratchHold).
+			const TileManager::ScratchHold scratch_hold(m_tiler);
 			std::vector<BufferCache::StagingPiece> pieces;
 			std::vector<vk::BufferImageCopy> copies;
 			std::vector<GpuTileInfo> tiles;
@@ -2415,6 +2427,8 @@ bool TextureCache::UploadImageChunked(Image& image) {
 	bool complete = true;
 	const auto record_batches = [&](TileManager::Result scratch) {
 		for (size_t first = 0; first < entries.size();) {
+			// One batch's scratch is released when the batch has been recorded (tiler.h ScratchHold).
+			const TileManager::ScratchHold scratch_hold(m_tiler);
 			std::vector<BufferCache::StagingPiece> pieces;
 			std::vector<GpuTileInfo> tiles;
 			std::vector<vk::BufferImageCopy> copies;
@@ -2489,6 +2503,8 @@ bool TextureCache::UploadImageChunked(Image& image) {
 }
 
 bool TextureCache::UploadImagePartial(Image& image, bool from_buffer) {
+	// Tiler scratch from this operation stays alive until its last use (tiler.h ScratchHold).
+	const TileManager::ScratchHold scratch_hold(m_tiler);
 	const auto& info    = image.info;
 	// A reduced image (KYTY_TEXTURE_QUALITY=reduced) holds guest levels host_mip_skip and up as its levels 0 and up:
 	// dirty bytes of the levels it leaves out are not uploaded, the others go to their level less the skip (as the
@@ -3460,6 +3476,8 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {
+	// Tiler scratch from this operation stays alive until its last use (tiler.h ScratchHold).
+	const TileManager::ScratchHold scratch_hold(m_tiler);
 	const auto&    info             = image.info;
 	const auto     layers           = info.resources.layers;
 	const auto     full_slice_size  = info.data.size / layers;
@@ -3517,6 +3535,8 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 
 void TextureCache::DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,
                                      uint64_t destination_size, DownloadPlan plan) {
+	// Tiler scratch from this operation stays alive until its last use (tiler.h ScratchHold).
+	const TileManager::ScratchHold scratch_hold(m_tiler);
 	if (!plan.valid) {
 		EXIT("TextureCache: invalid image download plan\n");
 	}

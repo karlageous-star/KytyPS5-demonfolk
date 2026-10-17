@@ -2206,6 +2206,15 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
 	EXIT_IF(src == nullptr || dst == nullptr);
+	if (src_memory && src->is_deleted) {
+		// Obtaining the destination created a buffer that joined (and deleted) the source's. The
+		// deleted buffer is freed once the current tick completes, and that synchronization may
+		// already have submitted the tick the join was recorded in: copy from the joined buffer.
+		const auto joined = ObtainBuffer(src_vaddr, size, false, true, BufferId {});
+		src        = joined.first;
+		src_offset = joined.second;
+		EXIT_IF(src == nullptr || src->is_deleted);
+	}
 	if (src == dst && src_offset < dst_offset + size && dst_offset < src_offset + size) {
 		EXIT("BufferCache: resolved Vulkan copy ranges overlap\n");
 	}

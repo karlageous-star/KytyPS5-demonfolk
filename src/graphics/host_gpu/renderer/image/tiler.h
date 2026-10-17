@@ -75,6 +75,22 @@ public:
 	               uint64_t tiled_offset, uint64_t tiled_capacity, uint64_t linear_capacity,
 	               std::span<const GpuTileInfo> infos,
 	               ColorTransform               transform = ColorTransform::None);
+	// Scratch lifetime: a buffer from GetScratchBuffer, Detile, TileImage or SwapBgra16 returns
+	// to the pool, or is destroyed, once the scheduler tick current at its allocation has
+	// completed. That is enough only while the caller is done with the buffer before anything
+	// can submit that tick (a StreamBuffer::Map wrap does). A caller that keeps using such a
+	// buffer after more work that may submit the tick must hold a ScratchHold for its whole
+	// operation: releases inside a hold wait for the outermost hold to end and are then stamped
+	// with the tick current at that point.
+	class ScratchHold final {
+	public:
+		explicit ScratchHold(TileManager& tiler): m_tiler(tiler) { m_tiler.BeginScratchHold(); }
+		~ScratchHold() { m_tiler.EndScratchHold(); }
+		KYTY_CLASS_NO_COPY(ScratchHold);
+
+	private:
+		TileManager& m_tiler;
+	};
 	[[nodiscard]] Result GetScratchBuffer(uint64_t size);
 	void                 UseScratch(uint64_t size, const std::function<void(Result)>& record);
 	void                 ConvertD16(Result source, Result target, D16Direction direction, bool d32,
@@ -127,6 +143,9 @@ private:
 	                                             uint64_t alignment, uint64_t max_range,
 	                                             uint32_t max_groups) noexcept;
 	void                          DeferDestroy(Scratch scratch);
+	void                          DeferRelease(Scratch scratch);
+	void                          BeginScratchHold();
+	void                          EndScratchHold();
 	void Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
 	             std::span<const GpuTileInfo> infos, uint64_t source_base, uint64_t target_base,
 	             std::vector<Dispatch>& dispatches);
@@ -158,6 +177,10 @@ private:
 	std::mutex                 m_scratch_mutex;
 	std::vector<PooledScratch> m_scratch_pool;
 	uint64_t                   m_scratch_pool_bytes = 0;
+	// ScratchHold nesting depth and the scratch buffers whose release waits for its end.
+	std::mutex                 m_hold_mutex;
+	uint32_t                   m_hold_depth = 0;
+	std::vector<Scratch>       m_held;
 };
 
 } // namespace Libs::Graphics

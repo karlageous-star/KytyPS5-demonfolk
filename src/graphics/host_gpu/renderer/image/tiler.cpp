@@ -202,8 +202,42 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 }
 
 // Once the GPU is done with the current work the buffer goes back to the pool (or, past its
-// budget, is freed).
+// budget, is freed). Inside a ScratchHold the release waits for the outermost hold to end.
 void TileManager::DeferDestroy(Scratch scratch) {
+	{
+		std::scoped_lock lock(m_hold_mutex);
+		if (m_hold_depth != 0) {
+			// A ScratchHold is open: its caller may still use the buffer in a later tick.
+			m_held.push_back(scratch);
+			return;
+		}
+	}
+	DeferRelease(scratch);
+}
+
+void TileManager::BeginScratchHold() {
+	std::scoped_lock lock(m_hold_mutex);
+	m_hold_depth++;
+}
+
+void TileManager::EndScratchHold() {
+	std::vector<Scratch> held;
+	{
+		std::scoped_lock lock(m_hold_mutex);
+		EXIT_IF(m_hold_depth == 0);
+		if (--m_hold_depth != 0) {
+			return;
+		}
+		held.swap(m_held);
+	}
+	// Every command that uses these buffers was recorded in this tick or an earlier one.
+	for (const auto& scratch: held) {
+		DeferRelease(scratch);
+	}
+}
+
+// Runs once the scheduler tick current now has completed.
+void TileManager::DeferRelease(Scratch scratch) {
 	m_scheduler.DeferOperation([this, scratch] {
 		const auto capacity = ScratchCapacity(scratch.size);
 		{
