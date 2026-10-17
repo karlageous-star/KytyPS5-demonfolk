@@ -147,6 +147,8 @@ bool                   RestoreGuestWritable(uint64_t vaddr, uint64_t size);
 bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size,
                                          const char** failure_reason = nullptr);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// The end of the guest mapping (one committed virtual range) `vaddr` lies in; 0 when none.
+[[nodiscard]] uint64_t MappingEnd(uint64_t vaddr);
 // Whether guest mappings cover all of [vaddr, vaddr + size), and the parts they cover (as
 // (address, size), in order): what can be read of a range that reaches into unmapped memory.
 [[nodiscard]] bool     IsFullyMapped(uint64_t vaddr, uint64_t size);

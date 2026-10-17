@@ -1287,6 +1287,10 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	return clamped_size;
 }
 
+uint64_t MappingEnd(uint64_t vaddr) {
+	return g_virtual_ranges != nullptr ? g_virtual_ranges->MappingEnd(vaddr) : 0;
+}
+
 bool IsFullyMapped(uint64_t vaddr, uint64_t size) {
 	return g_virtual_ranges == nullptr || g_virtual_ranges->ClampRangeSize(vaddr, size) == size;
 }

@@ -1731,8 +1731,17 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
-		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
-		    total_size += bytes;
+		    // A run over consecutive mappings (the game maps its heaps a few hundred KiB at a time) goes out as a copy
+		    // per mapping: each has a backing pointer of its own, so the upload worker reads it and takes its write
+		    // protections (UploadCopies). One copy over a boundary had none, and the upload's bytes were read and its
+		    // pages protected on this thread (Latria standing: ReapplyProtection 5.9% of the render thread).
+		    for (uint64_t at = 0; at < bytes;) {
+			    const uint64_t end   = LibKernel::Memory::MappingEnd(address + at);
+			    const uint64_t piece = end > address + at ? std::min(bytes - at, end - (address + at)) : bytes - at;
+			    copies.emplace_back(total_size, buffer.Offset(address + at), piece);
+			    total_size += piece;
+			    at += piece;
+		    }
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
 	if (source) {
