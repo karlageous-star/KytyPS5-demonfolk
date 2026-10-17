@@ -24,6 +24,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "frame-capture.h"
@@ -417,6 +418,27 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
 	const auto census_shader = sh_ctx.GetCs().cs_regs.data_addr;
+	// KYTY_SKIP_EMPTY_INDIRECT=1 (opt-in, off by default; Jetsku f04c9587): an indirect dispatch whose guest
+	// arguments no GPU write is pending for says zero groups in some dimension, so it does nothing and is not
+	// recorded (no binding, barrier or dispatch). Thread-dimension dispatches ignore the arguments: not skipped.
+	static const bool skip_empty_indirect = [] {
+		const char* value = std::getenv("KYTY_SKIP_EMPTY_INDIRECT");
+		return value != nullptr && std::atoi(value) == 1;
+	}();
+	if (skip_empty_indirect && indirect_args != 0 && !use_thread_dimensions &&
+	    !m_context.GetBufferCache().HasGpuDirtyBytes(indirect_args, 3u * sizeof(uint32_t))) {
+		std::array<uint32_t, 3> groups {};
+		if (Libs::LibKernel::Memory::TryReadBacking(indirect_args, groups.data(), sizeof(groups)) &&
+		    (groups[0] == 0 || groups[1] == 0 || groups[2] == 0)) {
+			static std::atomic<uint32_t> skipped_log {0};
+			if (skipped_log.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("GraphicsRenderDispatchDirect: KYTY_SKIP_EMPTY_INDIRECT skips an indirect dispatch of "
+				     "%ux%ux%u groups\n",
+				     groups[0], groups[1], groups[2]);
+			}
+			return;
+		}
+	}
 	std::optional<LiveCensus::Scope> phase;
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 0);
 	std::string unevaluated;
