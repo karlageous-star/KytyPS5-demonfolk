@@ -25,6 +25,8 @@ volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 // 1: RangeSet fast paths (rangeSet.h) for the GPU-modified range set.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_range_set_fast_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_reprotect_mode {0};
+// Live switch (same-process A/B): ObtainBuffer's memo of repeated shader writes.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_write_memo_mode {1};
 // 1: a guest readback whose window meets an image falls back to the request's own pages.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_narrow_mode {0};
 // KYTY_READBACK_PAGE_RUNS (default 1; 0 for a same-process A/B): KYTY_READBACK_QUEUE readiness over the page runs a
@@ -703,6 +705,7 @@ void BufferCache::FinishGuestReadback(size_t slot, bool detach) {
 	LiveCounters::Add(LiveCounters::ReadbackParts, request->parts.size());
 	LiveCounters::Add(LiveCounters::GpuRangeEntries, m_gpu_modified_ranges.Count());
 	for (const auto& part: request->parts) m_gpu_modified_ranges.Subtract(part.address, part.size);
+	++m_gpu_coverage_epoch;
 	// The renderer may have dirtied other pages in the widened window since handoff.
 	for (const auto& page: request->pages)
 		m_memory_tracker.UnmarkRegionAsGpuModified(page.address, page.size);
@@ -894,6 +897,7 @@ bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t s
 		WriteBackGpuOwned(part.address, feedback.download.Mapped().data() + part.offset, part.size, "feedback");
 	}
 	for (const auto& copy: copies) m_gpu_modified_ranges.Subtract(copy.address, copy.size);
+	++m_gpu_coverage_epoch;
 	// Only complete dirty-page coverage allows dropping protection. CPU-clean bytes
 	// are never published from the snapshot. Any later upload/GPU write invalidates it.
 	m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
@@ -1174,6 +1178,7 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 	for (const auto& copy: copies) {
 		m_gpu_modified_ranges.Subtract(copy.address, copy.size);
 	}
+	++m_gpu_coverage_epoch;
 }
 
 bool BufferCache::TryReportLodStatsOnGpu(uint64_t address, bool reset) {
@@ -1912,6 +1917,25 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 
+	// A range written again with nothing changed since (m_write_memo): no lookup, synchronization or range Add.
+	// (Light-loop chains write the same few shared blocks in every dispatch: about 2100 of 3200 shader-written
+	// ranges a frame at Latria were repeats, each costing ObtainBuffer a page-table lookup, a GPU-written coverage
+	// query and a RangeSet Add; ~57% of written requests hit.)
+	auto& memo = m_write_memo[((vaddr >> 4u) ^ (size * 0x9e3779b97f4a7c15ull >> 40u)) % m_write_memo.size()];
+	if (is_written && memo.vaddr == vaddr && memo.size == size && memo.texel == is_texel_buffer &&
+	    memo.registration == RegistrationEpoch() && memo.coverage == m_gpu_coverage_epoch &&
+	    kyty_local_write_memo_mode.load(std::memory_order_relaxed) != 0) {
+		auto* hit = m_slot_buffers.try_get(memo.id);
+		if (hit != nullptr && !hit->is_deleted && hit->IsInBounds(vaddr, size)) {
+			TouchBuffer(*hit);
+			InvalidateCopyFeedback(vaddr, size);
+			NoteGpuWrite(vaddr, size, GpuWriteOrigin::WritableBinding);
+			LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
+			LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
+			return {hit, hit->Offset(vaddr)};
+		}
+	}
+
 	auto* buffer = m_slot_buffers.try_get(id);
 	if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(vaddr, size)) {
 		id     = FindBuffer(vaddr, size);
@@ -1925,6 +1949,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		NoteGpuWrite(vaddr, size, GpuWriteOrigin::WritableBinding);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
+		memo = {vaddr, size, RegistrationEpoch(), m_gpu_coverage_epoch, id, is_texel_buffer};
 	}
 	return {buffer, buffer->Offset(vaddr)};
 }
@@ -2206,6 +2231,7 @@ void BufferCache::ForwardCopy(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t s
 	if (!LibKernel::Memory::TryReadBackingToHost(src_vaddr, bytes.data(), size)) return;
 	WriteBackGpuOwned(dst_vaddr, bytes.data(), size, "forward");
 	m_gpu_modified_ranges.Subtract(dst_vaddr, size);
+	++m_gpu_coverage_epoch; // (the write memo: these bytes are no longer GPU-written)
 	for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE)
 		if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE))
 			m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
