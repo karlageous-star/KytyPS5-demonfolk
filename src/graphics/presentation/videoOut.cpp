@@ -26,6 +26,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <list>
 #include <thread>
@@ -953,12 +957,38 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 	cfg.flip_status.gcQueueNum     = 0;
 }
 
+// KYTY_LOW_LATENCY=1 (off by default): a frame's flip is prepared only once the frames before it that wait for a vblank
+// were shown. A game faster than the display otherwise keeps about two frames queued (~30 ms from its flip to the
+// present at 60 Hz); held to one, input shows a frame sooner, but a frame late for its vblank is no longer covered by
+// a queued one. (At most 50 ms: a paused or closing port does not hold the GPU thread.)
+static bool LowLatency() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_LOW_LATENCY");
+		return value != nullptr && std::atoi(value) != 0;
+	}();
+	return on;
+}
+
 void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	VideoOutConfig* cfg        = nullptr;
 	uint64_t        generation = 0;
 	int             index      = 0;
 	{
 		Common::LockGuard lock(m_mutex);
+		if (LowLatency()) {
+			const auto waiting = [&] {
+				return std::any_of(m_requests.begin(), m_requests.end(), [&](const auto& r) {
+					return r.id < request_id && (r.state == RequestState::Ready || r.state == RequestState::Presenting);
+				});
+			};
+			const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+			while (waiting()) {
+				const auto now = std::chrono::steady_clock::now();
+				if (now >= until) break;
+				m_done_cond_var.WaitFor(&m_mutex,
+				                        static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(until - now).count()));
+			}
+		}
 		auto request = std::find_if(m_requests.begin(), m_requests.end(),
 		                            [request_id](const auto& r) { return r.id == request_id; });
 		if (request == m_requests.end()) {
