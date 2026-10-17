@@ -73,6 +73,10 @@ extern "C" {
 // (Diagnostic: microseconds UnmapBacking waits after it mapped views again, before ReapplyRemappedViews: the window
 // kyty_local_protective_remap 0 leaves, widened.)
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_remap_window_us {0};
+// KYTY_SYNC_WATCH_SKIP (opt-in, default 0): 1 lets SyncGpuCleanBacking return at once for a range with no read-watched
+// page, before the search of the GPU-written ranges (chenxiao 31119bdf). It relies on GPU-written pages being
+// read-watched from the write on, which only debug validators check: opt-in until a run shows it holds here.
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_sync_watch_skip_mode {0};
 }
 
 namespace VirtualMemory = Common::VirtualMemory;
@@ -1255,7 +1259,10 @@ bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	// No page of it read-watched: no GPU-written buffer bytes there (a GPU-written page is read-watched from the write on:
 	// a CPU read faults), so nothing to download. (The command processor asks for every indirect register table, about
 	// 11K a frame at 1-1, in memory the CPU writes: each a search of the GPU-written ranges.)
-	if (!GetGpuResources().HasReadWatchers(vaddr, size)) return true;
+	if (kyty_local_sync_watch_skip_mode.load(std::memory_order_relaxed) != 0 &&
+	    !GetGpuResources().HasReadWatchers(vaddr, size)) {
+		return true;
+	}
 	if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
 		// KYTY_SYNC_LOG: which shader's resource evaluation drains the GPU for its words.
 		static const bool log = std::getenv("KYTY_SYNC_LOG") != nullptr;
