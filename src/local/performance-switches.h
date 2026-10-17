@@ -33,6 +33,7 @@ extern volatile std::atomic<uint32_t> kyty_local_readback_page_runs_mode;
 extern volatile std::atomic<uint32_t> kyty_local_linear_copy_spans_mode;
 extern volatile std::atomic_uint32_t kyty_local_async_lod_stats_mode;
 extern volatile std::atomic<uint32_t> kyty_local_buffer_reclaim_mode;
+extern volatile std::atomic<uint32_t> kyty_local_buffer_retire_mode;
 extern volatile std::atomic<uint32_t> kyty_local_unmap_protect_skip_mode;
 extern volatile std::atomic<uint32_t> kyty_local_sync_readback_scoped_drain_mode;
 extern volatile std::atomic<uint32_t> kyty_local_sync_readback_narrow_mode;
@@ -90,6 +91,8 @@ inline void InitializePerformanceSwitches() {
 	    // 1: buffer upload copies on the upload worker; 2: image staging copies as well.
 	    Switch {"KYTY_ASYNC_UPLOAD", &kyty_local_async_upload_mode, 0, 2},
 	    Switch {"KYTY_BUFFER_RECLAIM", &kyty_local_buffer_reclaim_mode},
+	    // Default 1; 0 for an A/B: the buffers no binding used for a while are never retired (RetireStaleBuffers).
+	    Switch {"KYTY_BUFFER_RETIRE", &kyty_local_buffer_retire_mode},
 	    Switch {"KYTY_UNMAP_PROTECT_SKIP", &kyty_local_unmap_protect_skip_mode},
 	    Switch {"KYTY_BDA_DIRTY_REGIONS", &kyty_local_bda_dirty_regions_mode},
 	    Switch {"KYTY_GLOBAL_BARRIER_DEDUPE", &kyty_local_global_barrier_dedupe},

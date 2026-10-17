@@ -40,6 +40,9 @@ volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode {0};
 // 1: shader constants stream through a host-visible upload ring.
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_stream_upload_mode {0};
+// KYTY_BUFFER_RETIRE (performance-switches.h): 1 retires the buffers no binding used for a while
+// (RetireStaleBuffers); 0 never retires one.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_buffer_retire_mode {1};
 extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 }
 
@@ -1654,6 +1657,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	if (accumulate_stream_score) {
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
+	new_buffer.bda_read |= overlap.bda_read;
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
 	// The new owner holds these bytes only once the copy ran.
@@ -2283,8 +2287,47 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+// KYTY_BUFFER_RETIRE (live; 0 never retires). Per flip, up to 64 buffers no binding used for 600 flips go, whatever
+// the memory use. The collector below waits for a frame without BDA shaders, which Demon's Souls never has, so every
+// buffer it registered stayed; those inside the BDA shaders' read windows had their CPU-written pages uploaded and
+// write-protected again at each BDA preparation. Passed over (moved to the back of the list): buffers with GPU-owned
+// bytes (their download stays the collector's) and buffers BDA shaders read with no buffer registered (bda_read: such
+// reads touch no LRU entry, and one after the buffer went would read zeros once).
+void BufferCache::RetireStaleBuffers(uint64_t tick) {
+	constexpr uint64_t StaleTicks     = 600;
+	constexpr size_t   MaxRetirements = 64;
+	if (kyty_local_buffer_retire_mode.load(std::memory_order_relaxed) == 0 || tick <= StaleTicks) return;
+	thread_local std::vector<BufferId> stale, kept;
+	stale.clear();
+	kept.clear();
+	m_lru_cache.ForEachItemBelow(tick - StaleTicks, [&](BufferId id) {
+		const auto& buffer = m_slot_buffers[id];
+		if (buffer.is_deleted) return false;
+		// The guest readbacks over the buffer complete first (the collector drains each candidate the same way):
+		// their copies may still read it, and the GPU-owned bytes they hold decide below.
+		DrainGuestReadback(buffer.CpuAddress(), buffer.Size());
+		if (buffer.bda_read || m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size()) ||
+			m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size()))
+			kept.push_back(id);
+		else
+			stale.push_back(id);
+		return stale.size() == MaxRetirements;
+	});
+	// (The ones passed over go to the back of the list: the next flips' walks do not cross them again.)
+	for (const auto id: kept) TouchBuffer(m_slot_buffers[id]);
+	if (stale.empty()) return;
+	for (const auto id: stale) {
+		auto& buffer = m_slot_buffers[id];
+		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+		// DeleteBuffer unregisters it (its BDA page table entries go) and frees it once the GPU has passed its tick.
+		DeleteBuffer(id);
+	}
+	LiveCounters::Add(LiveCounters::GcBufferDeletes, stale.size());
+}
+
 void BufferCache::RunGarbageCollector(bool collect) {
 	const auto tick = m_gc_tick++;
+	RetireStaleBuffers(tick);
 	// After a frame with BDA shaders a collected buffer faults straight back, so buffers are kept,
 	// unless video memory is about to run out: on an 8 GB card Demon's Souls filled it by the
 	// title screen (nearly every frame has BDA shaders) and the next allocation failed.

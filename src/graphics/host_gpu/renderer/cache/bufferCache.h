@@ -198,6 +198,8 @@ private:
 	void Unregister(BufferId id);
 	template <bool insert>
 	void ChangeRegister(BufferId id);
+	// The buffers no binding used for a while go (RunGarbageCollector, once a flip).
+	void RetireStaleBuffers(uint64_t tick);
 	void DeleteBuffer(BufferId id);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);

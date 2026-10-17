@@ -75,6 +75,9 @@ public:
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// A shader read it through the BDA page table while no buffer held its pages (FaultManager): such reads touch
+	// no LRU entry, so the stale-buffer retirement passes it over (BufferCache::RetireStaleBuffers).
+	bool bda_read = false;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
