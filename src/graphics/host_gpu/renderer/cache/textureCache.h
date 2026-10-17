@@ -212,6 +212,8 @@ private:
 	void                        PrepareDccClear(ImageId id, const ImageDesc& desc);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] bool           UploadImageChunked(Image& image);
+	// The subresources over `ranges` alone, of an image of any size, a piece at a time (the mixed refresh; false: not taken).
+	[[nodiscard]] bool UploadImageRanges(Image& image, const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
 	[[nodiscard]] TextureTransferPlan
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
 	[[nodiscard]] const TextureTransferPlan& CachedUploadPlan(Image& image, BindingType binding);

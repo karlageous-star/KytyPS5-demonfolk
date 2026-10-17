@@ -110,6 +110,7 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_TEXTURE_RESOLVE_PAGES", &kyty_local_texture_resolve_pages_mode},
 	    Switch {"KYTY_PARTIAL_IMAGE_DIRTY", &kyty_local_partial_image_dirty_mode, 0, 2},
 	    Switch {"KYTY_PARTIAL_ROW_BANDS", &kyty_local_partial_row_bands_mode},
+	    Switch {"KYTY_PARTIAL_MIXED_UPLOAD", &kyty_local_partial_mixed_upload_mode},
 	    Switch {"KYTY_ASYNC_REPROTECT", &kyty_local_async_reprotect_mode},
 	    Switch {"KYTY_READBACK_NARROW", &kyty_local_readback_narrow_mode},
 	    Switch {"KYTY_SYNC_READBACK_SCOPED_DRAIN", &kyty_local_sync_readback_scoped_drain_mode},

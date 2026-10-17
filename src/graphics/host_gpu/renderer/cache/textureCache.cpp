@@ -48,6 +48,9 @@
 extern "C" {
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_htile_preserve_mode {0};
 }
+// 1: an image the CPU and the GPU both wrote parts of uploads the changed subresources of those parts (InitializeImage,
+// UploadImageRanges); 0: the whole image, as before.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_partial_mixed_upload_mode {0};
 
 namespace Libs::Graphics {
 
@@ -73,6 +76,8 @@ constexpr uint64_t PartialDirtyGranule = uint64_t {1} << 20;
 constexpr uint64_t PartialUploadMaxShare = 2;
 // Staged runs of picked subresources closer than this are staged as one run.
 constexpr uint64_t PartialStageGap = uint64_t {64} << 10;
+// UploadImageRanges: a mixed refresh takes guest memory (or a GPU-written buffer) this much at a time.
+constexpr uint64_t ChunkedUploadPiece = uint64_t {64} << 20;
 
 // Bounded attribution only: a fault span reports the faulting byte, not the
 // instruction's write width. Log before dirty ranges are dropped; never change
@@ -1750,6 +1755,16 @@ void TextureCache::UploadStencil(Image& image, Buffer& source, uint64_t source_o
 	image.Upload(copies, linear.buffer, linear.offset, linear.size);
 }
 
+// KYTY_BUFFER_PARTIAL=0: an image GPU buffer writes changed is uploaded whole, not its written parts (InitializeImage).
+// The counterpart of chenxiao's kyty_local_buffer_ranges_mode for the mixed refresh's gate.
+[[nodiscard]] static bool BufferPartialOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_BUFFER_PARTIAL");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
 // Local diagnostic: why the latest UploadImagePartial fell back to a whole upload (SLOW log).
 static thread_local const char* g_partial_fail = "";
 static bool PartialFail(const char* why) {
@@ -1831,6 +1846,23 @@ void TextureCache::InitializeImage(ImageId id) {
 				if (!uploaded) {
 					LiveCounters::Add(LiveCounters::PartialFallbacks);
 				}
+			}
+		} else if (image.IsBufferModified() && image.IsPartiallyCpuDirty() && !image.IsMaybeCpuDirty() &&
+		           !image.BufferDirtyRanges().empty() && BufferPartialOn() &&
+		           kyty_local_partial_mixed_upload_mode.load(std::memory_order_relaxed) != 0 &&
+		           kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 1) {
+			// CPU writes over known parts of it and GPU buffer writes over known parts: the subresources over either alone,
+			// each piece from guest memory or from the buffer the GPU wrote it in. The partial upload takes no image with
+			// buffer writes and stages guest bytes alone; a texture pool's range over memory the GPU writes too (issue #49:
+			// 1 GB of 1024x1024 slots) went up whole each time the game streamed a texture into it, 190-360 ms frames.
+			auto ranges = image.CpuDirtyRanges();
+			for (const auto& [begin, end]: image.BufferDirtyRanges()) Image::AddRange(ranges, begin, end);
+			g_partial_fail  = "";
+			partial_attempt = true;
+			uploaded        = UploadImageRanges(image, ranges);
+			partial_outcome = uploaded ? "mixed_ok" : g_partial_fail;
+			if (!uploaded) {
+				LiveCounters::Add(LiveCounters::PartialFallbacks);
 			}
 		} else if (image.IsBufferModified() && image.IsCpuDirty()) {
 			partial_outcome = "cpu_dirty_gate";
@@ -2782,6 +2814,108 @@ bool TextureCache::UploadImagePartial(Image& image, bool from_buffer) {
 	if (kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 2) {
 		UpdatePartialHashes(image, false);
 	}
+	return true;
+}
+
+// The subresources over `ranges` alone, of an image of any size: the mixed refresh (InitializeImage). A piece of up to
+// ChunkedUploadPiece at a time, each from the source ObtainBufferForImage picks for its range: staged guest bytes, or the
+// buffer a GPU write holds it in. False: the whole upload takes the image (g_partial_fail names why).
+bool TextureCache::UploadImageRanges(Image& image, const std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+	const auto& info    = image.info;
+	const auto  binding = UploadBinding(image);
+	const auto  base    = info.data.address;
+	if (binding == BindingType::DepthTarget) {
+		return PartialFail("depth");
+	}
+	if (info.IsVolume() || base % 256 != 0) {
+		return PartialFail("binding");
+	}
+	const auto& plan = CachedUploadPlan(image, binding);
+	if (!plan.valid || plan.swap_bgra16 || plan.tiles.empty() || plan.tiles.size() != plan.regions.size()) {
+		return PartialFail("plan");
+	}
+	// The subresources over the ranges (a level a reduced image leaves out is not uploaded, as in UploadImagePartial).
+	const uint32_t      skip = info.host_mip_skip;
+	std::vector<bool>   wanted(plan.tiles.size(), false);
+	std::vector<size_t> order(plan.tiles.size());
+	uint64_t            picked = 0;
+	for (size_t index = 0; index < plan.tiles.size(); index++) {
+		const auto& tile = plan.tiles[index];
+		if (plan.regions[index].bufferOffset < tile.linear_offset) {
+			return PartialFail("tile_offset");
+		}
+		order[index]     = index;
+		const auto begin = base + tile.tiled_offset;
+		if (plan.regions[index].imageSubresource.mipLevel < skip ||
+		    !IntersectsRanges(ranges, begin, begin + tile.tiled_size)) {
+			continue;
+		}
+		wanted[index] = true;
+		picked += tile.tiled_size;
+	}
+	if (picked > info.data.size / PartialUploadMaxShare) {
+		return PartialFail("share");
+	}
+	std::sort(order.begin(), order.end(), [&](size_t left, size_t right) {
+		return plan.tiles[left].tiled_offset < plan.tiles[right].tiled_offset;
+	});
+	uint64_t uploaded = 0;
+	for (size_t at = 0; at < order.size();) {
+		if (!wanted[order[at]]) {
+			at++;
+			continue;
+		}
+		// The piece: the wanted subresources after it (in order) up to ChunkedUploadPiece, unless one of them is GPU-written
+		// (its own piece, from the buffer that holds it).
+		const auto& first   = plan.tiles[order[at]];
+		uint64_t    begin   = base + first.tiled_offset;
+		uint64_t    end     = begin + first.tiled_size;
+		size_t      next    = at + 1;
+		const bool  written = m_buffer_cache.IsRegionGpuModified(begin, end - begin);
+		while (!written && next < order.size()) {
+			const auto&    tile       = plan.tiles[order[next]];
+			const uint64_t tile_begin = base + tile.tiled_offset;
+			const uint64_t tile_end   = tile_begin + tile.tiled_size;
+			if (!wanted[order[next]] || std::max(end, tile_end) - begin > ChunkedUploadPiece ||
+			    m_buffer_cache.IsRegionGpuModified(tile_begin, tile.tiled_size)) {
+				break;
+			}
+			end = std::max(end, tile_end);
+			next++;
+		}
+		begin                              = begin & ~uint64_t {255};
+		end                                = std::min(info.data.End(), (end + 255) & ~uint64_t {255});
+		const auto [source, source_offset] = m_buffer_cache.ObtainBufferForImage(begin, end - begin);
+		if (source == nullptr) {
+			EXIT("TextureCache: failed to obtain image upload source\n");
+		}
+		// The piece's scratch is released once it is recorded (tiler.h ScratchHold).
+		const TileManager::ScratchHold scratch_hold(m_tiler);
+		std::vector<GpuTileInfo>         tiles;
+		std::vector<vk::BufferImageCopy> regions;
+		uint64_t                         linear_total = 0;
+		for (size_t k = at; k < next; k++) {
+			auto       tile          = plan.tiles[order[k]];
+			auto       region        = plan.regions[order[k]];
+			const auto linear_offset = (linear_total + 255) & ~uint64_t {255};
+			region.bufferOffset      = linear_offset + (region.bufferOffset - tile.linear_offset);
+			region.imageSubresource.mipLevel -= skip;
+			tile.linear_offset = linear_offset;
+			tile.tiled_offset  = base + tile.tiled_offset - begin;
+			linear_total       = linear_offset + tile.linear_size;
+			tiles.push_back(tile);
+			regions.push_back(region);
+		}
+		const auto linear = m_tiler.Detile(source->Handle(), source_offset, end - begin, linear_total, tiles);
+		for (auto& region: regions) {
+			region.bufferOffset += linear.offset;
+		}
+		image.Upload(regions, linear.buffer, linear.offset, linear.size);
+		uploaded += end - begin;
+		at = next;
+	}
+	LiveCounters::Add(LiveCounters::PartialUploads);
+	LiveCounters::Add(LiveCounters::PartialUploadBytes, uploaded);
 	return true;
 }
 
