@@ -387,6 +387,21 @@ uint64_t PhysicalMemory() {
 	return GlobalMemoryStatusEx(&status) != 0 ? status.ullTotalPhys : 0;
 }
 
+uint64_t TrimPrivateWorkingSet(uint64_t min_address) {
+	uint64_t                 asked = 0;
+	MEMORY_BASIC_INFORMATION info {};
+	for (const auto* at = reinterpret_cast<const uint8_t*>(min_address);
+	     VirtualQuery(at, &info, sizeof(info)) == sizeof(info);
+	     at = static_cast<const uint8_t*>(info.BaseAddress) + info.RegionSize) {
+		// Plain read-write only: write-combined upload memory (PAGE_READWRITE | PAGE_WRITECOMBINE) stays.
+		if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE && info.Protect == PAGE_READWRITE) {
+			(void)VirtualUnlock(info.BaseAddress, info.RegionSize);
+			asked += info.RegionSize;
+		}
+	}
+	return asked;
+}
+
 void MakeCriticalThread() {
 	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 }
@@ -570,6 +585,10 @@ uint64_t PhysicalMemory() {
 	const long pages = sysconf(_SC_PHYS_PAGES);
 	const long size  = sysconf(_SC_PAGE_SIZE);
 	return pages > 0 && size > 0 ? static_cast<uint64_t>(pages) * static_cast<uint64_t>(size) : 0;
+}
+
+uint64_t TrimPrivateWorkingSet(uint64_t /*min_address*/) {
+	return 0;
 }
 
 void MakeCriticalThread() {}

@@ -59,6 +59,11 @@ void MakeCriticalThread();
 // The PC's physical memory in bytes; 0 when unknown.
 uint64_t PhysicalMemory();
 
+// This process's committed read-write private memory at or above `min_address` leaves its working set (Windows:
+// VirtualUnlock on pages that are not locked). The pages keep their contents: the pagefile holds them once Windows
+// needs the RAM, and the next touch brings them back. Returns the bytes of the regions asked (0: not supported).
+uint64_t TrimPrivateWorkingSet(uint64_t min_address);
+
 // A temporary file for scratch data, deleted when it is closed or the process ends (Windows keeps it
 // in memory while it can: FILE_ATTRIBUTE_TEMPORARY); 0 when none could be made. Writes and reads go
 // to any offset, from any thread.
