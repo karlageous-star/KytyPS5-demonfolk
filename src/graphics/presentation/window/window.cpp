@@ -1068,6 +1068,11 @@ void WindowContext::UpdateTitle() {
 	if (const auto shared = SystemMemoryFallbackBytes() + VideoMemoryOverBudgetBytes(); shared >= (uint64_t {1} << 20u)) {
 		text += fmt::format(" | SHARED MEMORY {} MB", shared >> 20u);
 	}
+	// Space pauses the emulator (the last frame is shown again at the display's rate): say so, or a paused game
+	// looks hung (N7, 2026-10-17).
+	if (loop.paused.load(std::memory_order_acquire)) {
+		text += " | PAUSED (Space to resume)";
+	}
 
 	RunOnMainThread([this, text = std::move(text)] { SDL_SetWindowTitle(window, text.c_str()); });
 }
