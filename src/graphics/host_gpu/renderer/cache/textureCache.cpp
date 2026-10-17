@@ -4115,6 +4115,12 @@ void TextureCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	// KYTY_VRAM_FIRST: video memory past its budget or a game buffer or image in system memory: the freed images kept
+	// for reuse go first (up to a 16th of the budget).
+	if (kyty_local_vram_first_mode.load(std::memory_order_relaxed) != 0 &&
+	    (VideoMemoryOverBudgetBytes() != 0 || SystemMemoryFallbackBytes() != 0)) {
+		m_graphics.TrimImagePool();
+	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}

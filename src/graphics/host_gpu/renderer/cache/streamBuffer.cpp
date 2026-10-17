@@ -166,6 +166,11 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
 	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	// KYTY_VRAM_FIRST: a device-local buffer asks for the video memory types only; past the budget (then the
+	// pool trimmed, then over it) it falls back to any type, as before, only when video memory refuses it.
+	const bool vram_first = usage == MemoryUsage::DeviceLocal && graphics.CanReportMemoryUsage() &&
+	                        kyty_local_vram_first_mode.load(std::memory_order_relaxed) != 0;
+	if (vram_first) allocation_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
@@ -177,8 +182,16 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	// the images kept for reuse and over budget.
 	if (!create()) {
 		graphics.TrimImagePool();
-		allocation_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-		if (!create()) graphics.ReportMemoryFallback("a buffer could not be created", size);
+		bool created = vram_first && create();
+		if (!created) {
+			allocation_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+			created = create();
+		}
+		if (!created && vram_first) {
+			allocation_info.requiredFlags = 0;
+			created                       = create();
+		}
+		if (!created) graphics.ReportMemoryFallback("a buffer could not be created", size);
 	}
 	EXIT_NOT_IMPLEMENTED(native_buffer == VK_NULL_HANDLE);
 
@@ -205,6 +218,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &properties);
 	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
 	if (usage == MemoryUsage::DeviceLocal && (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
+		m_in_system_memory = true;
+		NoteSystemMemoryFallback(static_cast<int64_t>(size));
 		graphics.ReportMemoryFallback("a GPU buffer is in system memory", size);
 	}
 	if (allocation_result.pMappedData != nullptr) {
@@ -214,6 +229,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 }
 
 Buffer::~Buffer() {
+	if (m_in_system_memory) NoteSystemMemoryFallback(-static_cast<int64_t>(m_size));
 	if (m_buffer != nullptr) {
 		if (kyty_local_buffer_reclaim_mode.load(std::memory_order_relaxed) != 0) {
 			Reclaimer().Push(m_graphics->allocator, m_buffer, m_allocation);

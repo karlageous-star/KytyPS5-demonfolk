@@ -1063,6 +1063,12 @@ void WindowContext::UpdateTitle() {
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
 
+	// Game buffers or images in system memory, or video memory past its budget (Windows then moves allocations out of
+	// it): the GPU reads those over the bus. Said next to the fps while it lasts.
+	if (const auto shared = SystemMemoryFallbackBytes() + VideoMemoryOverBudgetBytes(); shared >= (uint64_t {1} << 20u)) {
+		text += fmt::format(" | SHARED MEMORY {} MB", shared >> 20u);
+	}
+
 	RunOnMainThread([this, text = std::move(text)] { SDL_SetWindowTitle(window, text.c_str()); });
 }
 

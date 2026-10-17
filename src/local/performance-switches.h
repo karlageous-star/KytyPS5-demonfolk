@@ -19,6 +19,7 @@
 extern "C" {
 extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 extern volatile std::atomic_uint32_t kyty_local_image_pool_mode;
+extern volatile std::atomic<uint32_t> kyty_local_vram_first_mode;
 extern volatile std::atomic_uint32_t kyty_local_backing_read_mode;
 extern volatile std::atomic_uint32_t kyty_local_stream_upload_mode;
 extern volatile std::atomic_uint32_t kyty_local_binding_scratch_mode;
@@ -106,6 +107,8 @@ inline void InitializePerformanceSwitches() {
 	    // Images and command submission.
 	    Switch {"KYTY_IMAGE_BARRIER_DEDUPE", &kyty_local_image_barrier_dedupe},
 	    Switch {"KYTY_IMAGE_POOL", &kyty_local_image_pool_mode},
+	    // Default 1; 0 for an A/B: game buffers and images stay in video memory (system memory only as a last resort).
+	    Switch {"KYTY_VRAM_FIRST", &kyty_local_vram_first_mode},
 	    Switch {"KYTY_PENDING_DRAIN", &kyty_local_pending_drain_mode},
 	    // Dispatches recorded per submission.
 	    Switch {"KYTY_DISPATCH_BATCH", &kyty_local_dispatch_batch, 1, 65536},

@@ -46,6 +46,8 @@ public:
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
+	// A device-local buffer that got system memory (video memory full even past its budget).
+	[[nodiscard]] bool               IsInSystemMemory() const noexcept { return m_in_system_memory; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
@@ -92,6 +94,7 @@ private:
 	VmaAllocation                 m_allocation = nullptr;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
+	bool                          m_in_system_memory = false;
 	std::span<uint8_t>            m_mapped;
 };
 

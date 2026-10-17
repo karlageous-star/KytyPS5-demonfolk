@@ -35,6 +35,37 @@ namespace Libs::Graphics {
 
 void FlushBufferReclaimer(); // streamBuffer.cpp (KYTY_BUFFER_RECLAIM)
 
+} // namespace Libs::Graphics
+
+extern "C" {
+// KYTY_VRAM_FIRST (default 1; 0: as before, for an A/B): a game buffer or image asks for video memory within the
+// budget, then without the freed images kept for reuse, then past the budget (Windows moves out what it uses
+// least), and gets system memory only when all of that fails. VMA's budgeted choice among all memory types put
+// game buffers in system memory while 1.3 GB of video memory sat free inside its blocks (N3: four buffers,
+// 1.05 GB, read over the bus every frame). Images of 16 MiB or more get their own memory: freed, they no longer
+// leave holes in the shared blocks (N3: 17 holes of 16 MiB or more, 769 MiB).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_vram_first_mode {1};
+}
+
+namespace Libs::Graphics {
+
+namespace {
+std::atomic<int64_t>  g_system_fallback_bytes {0};
+std::atomic<uint64_t> g_over_budget_bytes {0};
+} // namespace
+
+void NoteSystemMemoryFallback(int64_t bytes) {
+	g_system_fallback_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+uint64_t SystemMemoryFallbackBytes() {
+	return static_cast<uint64_t>(std::max<int64_t>(g_system_fallback_bytes.load(std::memory_order_relaxed), 0));
+}
+
+uint64_t VideoMemoryOverBudgetBytes() {
+	return g_over_budget_bytes.load(std::memory_order_relaxed);
+}
+
 // Local diagnostic (live `vma <path>`): VMA is thread-safe, so the live thread writes it.
 static VmaAllocator g_report_allocator = nullptr;
 // Freed images kept for reuse (KYTY_IMAGE_POOL): at most 1 GiB, and a 16th of the GPU's memory budget.
@@ -132,7 +163,7 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 	vmaGetHeapBudgets(allocator, budgets);
 	const bool discrete =
 	    physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
-	uint64_t usage = 0;
+	uint64_t usage = 0, over = 0;
 	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
 		const bool device_local =
 		    static_cast<bool>(physical_device_memory_properties.memoryHeaps[heap].flags &
@@ -140,7 +171,10 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 		if (!discrete || device_local) {
 			usage += budgets[heap].usage;
 		}
+		if (device_local && budgets[heap].usage > budgets[heap].budget) over += budgets[heap].usage - budgets[heap].budget;
 	}
+	// (The window title's SHARED figure: past the budget Windows moves allocations out of video memory.)
+	g_over_budget_bytes.store(over, std::memory_order_relaxed);
 	return usage;
 }
 
@@ -307,6 +341,20 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	// KYTY_VRAM_FIRST: within the budget first (then without the pool, then past it); a large image in memory of
+	// its own, so that freeing it leaves no hole in a shared block.
+	const bool vram_first = kyty_local_vram_first_mode.load(std::memory_order_relaxed) != 0 && CanReportMemoryUsage();
+	if (vram_first) {
+		constexpr vk::DeviceSize DedicatedMin = vk::DeviceSize {16} << 20u;
+		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceImageMemoryRequirements != nullptr) {
+			vk::DeviceImageMemoryRequirements requirements_info {};
+			requirements_info.pCreateInfo = &image_info;
+			const auto requirements      = device.getImageMemoryRequirements(requirements_info);
+			if (requirements.memoryRequirements.size >= DedicatedMin)
+				alloc_info.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+		}
+		alloc_info.flags |= VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+	}
 	const auto create = [&] {
 		vk::Image::CType native_image = VK_NULL_HANDLE;
 		const auto       result       = static_cast<vk::Result>(
@@ -319,15 +367,27 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	// to sample, but the game goes on).
 	if (!create()) {
 		TrimImagePool();
-		if (!create()) {
+		bool created = create();
+		if (!created && (alloc_info.flags & VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT) != 0) {
+			alloc_info.flags &= ~static_cast<VmaAllocationCreateFlags>(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT);
+			created = create();
+		}
+		if (!created) {
+			alloc_info.flags &= ~static_cast<VmaAllocationCreateFlags>(VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT);
 			alloc_info.requiredFlags  = 0;
 			alloc_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-			const bool created        = create();
+			created                   = create();
 			VmaAllocationInfo allocated {};
 			if (created) vmaGetAllocationInfo(allocator, image.allocation, &allocated);
 			ReportMemoryFallback(created ? "an image is in system memory" : "an image could not be created",
 			                     allocated.size);
 			if (!created) return false;
+			VkMemoryPropertyFlags properties = 0;
+			vmaGetAllocationMemoryProperties(allocator, image.allocation, &properties);
+			if ((properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
+				image.in_system_memory = true;
+				NoteSystemMemoryFallback(static_cast<int64_t>(allocated.size));
+			}
 		}
 	}
 
@@ -361,7 +421,21 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
-	if (kyty_local_image_pool_mode.load(std::memory_order_relaxed) != 0) {
+	if (image.in_system_memory) {
+		VmaAllocationInfo allocation_info {};
+		vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
+		NoteSystemMemoryFallback(-static_cast<int64_t>(allocation_info.size));
+		image.in_system_memory = false;
+		vmaDestroyImage(allocator, image.image, image.allocation);
+		image.image      = nullptr;
+		image.allocation = nullptr;
+		return;
+	}
+	// KYTY_VRAM_FIRST: nothing is kept for reuse while video memory is past its budget or something is in system
+	// memory (the pool held up to a 16th of the budget).
+	const bool short_of_vram = kyty_local_vram_first_mode.load(std::memory_order_relaxed) != 0 &&
+	                           (VideoMemoryOverBudgetBytes() != 0 || SystemMemoryFallbackBytes() != 0);
+	if (kyty_local_image_pool_mode.load(std::memory_order_relaxed) != 0 && !short_of_vram) {
 		VmaAllocationInfo allocation_info {};
 		vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
 		std::scoped_lock lock(g_image_pool_mutex);

@@ -6,11 +6,17 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <tuple>
 #include <vector>
 #include <vk_mem_alloc.h>
+
+extern "C" {
+// KYTY_VRAM_FIRST (vma.cpp): game buffers and images stay in video memory, system memory only as a last resort.
+extern volatile std::atomic<uint32_t> kyty_local_vram_first_mode;
+}
 
 namespace Libs::Graphics {
 
@@ -174,7 +180,15 @@ struct VulkanImage {
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
+	// Made in system memory: video memory was full even past its budget (counted in SystemMemoryFallbackBytes).
+	bool                         in_system_memory = false;
 };
+
+// Device-intended memory (game buffers, images) that got system memory, and the video memory heaps' use past
+// their budget (Windows then moves allocations out to system memory): the window title shows their sum as SHARED.
+void     NoteSystemMemoryFallback(int64_t bytes);
+[[nodiscard]] uint64_t SystemMemoryFallbackBytes();
+[[nodiscard]] uint64_t VideoMemoryOverBudgetBytes();
 
 
 
