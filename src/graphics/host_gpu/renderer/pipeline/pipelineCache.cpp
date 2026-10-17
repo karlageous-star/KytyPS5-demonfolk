@@ -779,6 +779,17 @@ struct PipelineCache::ProgramCache {
 		}
 
 		Libs::LibKernel::Memory::g_srt_shader_hash = params.hash;
+		// KYTY_TRANSLATE_STATS=1: each program's guest address the first time the session asks for it (warmed programs
+		// included), so a GPU trace (marks by address) joins the TRANSLATE_STATS lines (by hash).
+		static const bool translate_addresses = [] {
+			const char* value = std::getenv("KYTY_TRANSLATE_STATS");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (translate_addresses && printed_addresses.insert(params.hash ^ (params.Base() << 1u)).second) {
+			std::printf("TRANSLATE_ADDR stage=%s hash=0x%016llx address=0x%llx code_dwords=%zu\n", label + 17,
+			            static_cast<unsigned long long>(params.hash), static_cast<unsigned long long>(params.Base()),
+			            params.code.size());
+		}
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = static_cast<uint32_t>(params.user_data.size());
@@ -1324,6 +1335,7 @@ struct PipelineCache::ProgramCache {
 	                   std::pair<SourceEntry*, const Permutation*>>
 	    by_program;
 	ProgramKey                                                  lookup_key;
+	std::set<uint64_t>                                          printed_addresses; // KYTY_TRANSLATE_STATS
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 };
