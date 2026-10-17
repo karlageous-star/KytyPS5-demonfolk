@@ -740,7 +740,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return value == nullptr ? 1 : std::atoi(value);
 	}();
 	const bool chain_enabled = chain_mode != 0;
-	const bool        chain            = chain_enabled && DemonsSouls::IsSupportedGame();
+	// The fenced programs (fe938d3a2d22b5c2 by default, KYTY_CHAIN_FENCE) never join a chain: their dispatches get the
+	// barriers around them, as the other games' do.
+	const bool        chain            = chain_enabled && DemonsSouls::IsSupportedGame() &&
+	                                     DemonsSouls::ComputeChains(program.shader_hash);
 	auto              vk_buffer        = chain ? buffer.ChainHandle() : buffer.Handle();
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,

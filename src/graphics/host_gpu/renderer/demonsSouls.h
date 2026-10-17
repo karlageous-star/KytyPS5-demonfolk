@@ -16,6 +16,10 @@ constexpr bool IsSupportedTitle(std::string_view title) {
 	return title == "PPSA01340" || title == "PPSA01341" || title == "PPSA01342";
 }
 bool IsSupportedGame();
+// The chain fence for one program's dispatches: false for the fenced programs (a default list, or KYTY_CHAIN_FENCE=
+// <hash>[;<hash>...] and KYTY_CHAIN_FENCE_RANGE=<lo>-<hi>, hex) and, with KYTY_CHAIN_ONLY=<hash>[;<hash>...], for every
+// program not listed there. It narrows the chains KYTY_DS_COMPUTE_CHAIN allows; the caller checks that gate.
+bool ComputeChains(uint64_t shader_hash);
 // The registers of a dispatch the linear copy shader reads: its user data, workgroup and thread-group inputs.
 struct LinearCopyDispatch {
 	std::span<const uint32_t> user_data;
