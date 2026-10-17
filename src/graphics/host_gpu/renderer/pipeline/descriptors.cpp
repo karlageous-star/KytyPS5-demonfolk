@@ -774,6 +774,14 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	} else if (TileTextureElementLayout element {}; !TileGetTextureElementLayout(format, element)) {
 		// A stale descriptor (a compute pass while Latria loaded, format 129) has no layout to size.
 		rejection = "format without a texel layout";
+	} else if (TileSurfaceLayout probe {};
+	           tile != Prospero::TileMode::kLinear &&
+	           !TileGetTiledTextureLayout({format, tile, volume ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,
+	                                       width, height, volume ? depth : 1u, levels, 1u},
+	                                      probe)) {
+		// No layout for the shape in its tiling: TileGetTextureTotalSize would end the emulator (10-15, a Nexus walk: an
+		// indirect dispatch's texture of format 128, tile 27, 68x1; the same 67-68x1 tile 27 shape as 10-13's format 182).
+		rejection = "tiling without a layout";
 	} else {
 		pitch = TileGetTexturePitch(format, width, tile);
 		if (!TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers, levels,
