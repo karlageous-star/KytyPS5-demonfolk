@@ -385,6 +385,10 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
 		bool                                         table_mode = false; // an empty handle: refused
+		// The warm file's record that made it (KYTY_WARMUP_RECENT stamps it on use), and the records the warm-up
+		// found this permutation for (see ProgramCache::UseRecord).
+		uint32_t                                     record = LocalShaderWarmup::NoShader;
+		std::vector<uint32_t>                        aliases;
 	};
 
 	// A permutation the prefetch translated, its SPIR-V in the prefetch's scratch file.
@@ -864,6 +868,7 @@ struct PipelineCache::ProgramCache {
 				const auto* selected = source.guarded_permutation;
 				publish_stage(selected->program);
 				selected->program.bindings.AdvancePushData(push_data_cursor);
+				UseRecord(*selected);
 				return selected->handle;
 			}
 			if (const auto permutation = find_permutation();
@@ -877,6 +882,7 @@ struct PipelineCache::ProgramCache {
 				}
 				publish_stage(permutation->program);
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
+				UseRecord(*permutation);
 				return permutation->handle;
 			}
 			if (borrowed_specialization) specialization = *borrowed_specialization;
@@ -1036,7 +1042,7 @@ struct PipelineCache::ProgramCache {
 				    params, options, std::move(translated), std::move(specialization), push_data_cursor));
 			}
 		}
-		const auto& permutation = entry->second.permutations.back();
+		auto& permutation = entry->second.permutations.back();
 		if (warmup.Enabled()) {
 			LocalShaderWarmup::Record record;
 			record.stage = stage;
@@ -1051,7 +1057,10 @@ struct PipelineCache::ProgramCache {
 			else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) record.pixel = input_info;
 			else record.compute = input_info;
 			const auto index = warmup.Add(record);
-			if (index != LocalShaderWarmup::NoShader) recorded_programs[permutation.handle.id] = index;
+			if (index != LocalShaderWarmup::NoShader) {
+				recorded_programs[permutation.handle.id] = index;
+				permutation.record = index;
+			}
 		}
 		publish_stage(permutation.program);
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -1066,6 +1075,7 @@ struct PipelineCache::ProgramCache {
 		            counts[static_cast<size_t>(ShaderType::Pixel)],
 		            counts[static_cast<size_t>(ShaderType::Compute)],
 		            counts[static_cast<size_t>(ShaderType::Mesh)]);
+		UseRecord(permutation);
 		return permutation.handle;
 	}
 
@@ -1079,6 +1089,18 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan plan;
 		ShaderRecompiler::CompileResult    result;
 	};
+
+	// KYTY_WARMUP_RECENT=<n> (default off): the start-up warm-up translates and builds only the records that one of the
+	// last n sessions used. The others stay recorded; their first use translates them on the render thread.
+	static uint32_t WarmupRecentSessions() {
+		uint32_t sessions = 0;
+		if (const char* value = std::getenv("KYTY_WARMUP_RECENT"); value && *value) {
+			const auto end    = value + std::strlen(value);
+			const auto parsed = std::from_chars(value, end, sessions);
+			if (parsed.ec != std::errc {} || parsed.ptr != end || sessions > 1000) sessions = 0;
+		}
+		return sessions;
+	}
 
 	static uint32_t WarmupThreads() {
 		uint32_t threads = 1;
@@ -1167,6 +1189,9 @@ struct PipelineCache::ProgramCache {
 			else PipelineCacheLog("Shader warmup: could not adopt {}", Common::PathToString(adopt_from));
 		}
 		PipelineCacheLog("Shader warmup: loaded {} shader inputs and {} pipeline recipes", warmup.records.size(), warmup.pipelines.size());
+		// KYTY_WARMUP_RECENT=<n>: this run is a session for the use stamps (LocalShaderWarmup::Cache::BeginSession).
+		const uint32_t recent = WarmupRecentSessions();
+		if (recent != 0) warmup.BeginSession();
 		if (!compile || warmup.records.empty()) return;
 		const auto begin = std::chrono::steady_clock::now();
 		// 0 means all recorded inputs. A caller can explicitly bound startup time.
@@ -1206,7 +1231,11 @@ struct PipelineCache::ProgramCache {
 					return p.specialization == record.specialization && p.program.bindings.push_data_start_dword ==
 					    ShaderRecompiler::IR::PushData::StartFor(record.push_cursor, p.program.bindings.ShaderDataDwords());
 				});
-				if (found != entry->second.permutations.end()) { warm_permutations[index] = &*found; continue; }
+				if (found != entry->second.permutations.end()) {
+					warm_permutations[index] = &*found;
+					found->aliases.push_back(uint32_t(index));
+					continue;
+				}
 			}
 			// The compiler consumes the user-data width; values are resolved anew by
 			// MaterializeResources when the guest actually draws or dispatches.
@@ -1236,6 +1265,7 @@ struct PipelineCache::ProgramCache {
 			}
 			auto& permutation = entry->second.permutations.back();
 			recorded_programs[permutation.handle.id] = uint32_t(index);
+			permutation.record = uint32_t(index);
 			warm_permutations[index] = &permutation;
 			if (++compiled % 250 == 0) PipelineCacheLog("Shader warmup: compiling {}/{}", compiled, warmup.records.size());
 		}
@@ -1249,6 +1279,11 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<uint64_t, uint32_t> recorded_programs;
 	std::vector<Permutation*> warm_permutations;
 	std::chrono::steady_clock::time_point warm_deadline = std::chrono::steady_clock::time_point::max();
+	// KYTY_WARMUP_RECENT: a draw's permutation stamps the warm records it stands for (no-op while the switch is off).
+	void UseRecord(const Permutation& permutation) {
+		if (permutation.record != LocalShaderWarmup::NoShader) warmup.Use(permutation.record);
+		for (const auto index: permutation.aliases) warmup.Use(index);
+	}
 	uint32_t RecordedIndex(const ShaderProgram& program) const {
 		const auto it = recorded_programs.find(program.id);
 		return it == recorded_programs.end() ? LocalShaderWarmup::NoShader : it->second;

@@ -225,6 +225,7 @@ public:
         StopWriter();
         records.clear(); pipelines.clear(); record_index.clear(); pipeline_index.clear();
         changed = false; total_bytes = 8;
+        last_used.clear(); uses.clear(); session = 0; uses_changed = false;
         if (!signature.ends_with('\n')) signature += '\n';
         path = location; identity = "KytyShaderWarmup4:" + signature;
         if (!std::filesystem::exists(path)) return true;
@@ -258,6 +259,39 @@ public:
         return true;
     }
 
+    // KYTY_WARMUP_RECENT=<n> (see ProgramCache::Warm). Starts a session. The side file `<file>.use` holds the number of
+    // the last session that started and, per record, the last session that used it (0: no recorded use). A record the
+    // side file does not cover has stamp 0.
+    void BeginSession() {
+        std::vector<uint32_t> contents;
+        session = 1;
+        last_used.assign(records.size(), 0u);
+        if (ReadFile(UsePath(), UseSignature(), contents) && contents.size() >= 2 && contents[1] == contents.size() - 2) {
+            session = contents[0] + 1;
+            for (size_t i = 0; i < records.size() && i + 2 < contents.size(); ++i) last_used[i] = contents[i + 2];
+        }
+        uses.clear();
+        // Saved now, so that a run which ends early cannot hand its session number to the next run.
+        uses_changed = !SaveUses(session, last_used);
+    }
+    // The first use of a record in this session stamps it. Render thread only; the writer thread saves the stamps.
+    void Use(uint32_t index) {
+        if (session == 0 || index >= last_used.size() || last_used[index] == session) return;
+        last_used[index] = session;
+        uses_changed = true;
+        if (worker.joinable()) {
+            std::lock_guard lock(writer_mutex);
+            uses.emplace_back(index, session);
+        }
+    }
+    // Whether a record was used in one of the last `sessions` sessions before this one. Stamp 0 means no recorded use:
+    // only the first session, which has no history to go by, takes such a record.
+    bool Recent(uint32_t index, uint32_t sessions) const {
+        if (index >= last_used.size()) return true;
+        if (last_used[index] == 0) return session <= 1;
+        return uint64_t(last_used[index]) + sessions >= session;
+    }
+
     uint32_t Add(Record& record) {
         if (!Enabled()) return NoShader;
         Writer writer;
@@ -276,22 +310,32 @@ public:
         // Copy once at startup. The render thread subsequently enqueues only a
         // new immutable record; serialization/checksums/disk I/O run here.
         worker = std::jthread([this, saved = records, saved_pipelines = pipelines,
-                              dirty = changed](std::stop_token stop) mutable {
+                              dirty = changed, saved_stamps = last_used,
+                              stamp_session = session](std::stop_token stop) mutable {
+            bool stamps_dirty = false;
             for (;;) {
                 std::vector<Pending> updates;
+                std::vector<std::pair<uint32_t, uint32_t>> stamps;
                 {
                     std::unique_lock lock(writer_mutex);
                     writer_cv.wait_for(lock, stop, std::chrono::seconds(5), [] { return false; });
                     updates.swap(pending);
+                    stamps.swap(uses);
                 }
                 for (auto& update : updates) {
                     (update.pipeline ? saved_pipelines : saved).push_back(std::move(update.words));
                     dirty = true;
                 }
+                for (const auto& [index, stamp] : stamps) {
+                    if (index >= saved_stamps.size()) saved_stamps.resize(index + 1, 0u);
+                    saved_stamps[index] = stamp;
+                    stamps_dirty = true;
+                }
                 if (dirty) {
                     writer_ok = SaveSnapshot(saved, saved_pipelines);
                     if (writer_ok) dirty = false;
                 }
+                if (stamps_dirty) stamps_dirty = !SaveUses(stamp_session, saved_stamps);
                 if (stop.stop_requested()) break;
             }
         });
@@ -299,6 +343,7 @@ public:
 
     bool Save() {
         StopWriter();
+        if (uses_changed && SaveUses(session, last_used)) uses_changed = false;
         if (!Enabled() || !changed) return true;
         const bool ok = SaveSnapshot(records, pipelines);
         if (ok) changed = false;
@@ -321,6 +366,12 @@ public:
 
 private:
     struct Pending { bool pipeline; std::vector<uint32_t> words; };
+    // KYTY_WARMUP_RECENT (session 0: off): this run's session, each record's last session of use (0: none recorded), and
+    // the uses the writer thread has not taken yet (under writer_mutex).
+    uint32_t                                   session = 0;
+    std::vector<uint32_t>                      last_used;
+    bool                                       uses_changed = false;
+    std::vector<std::pair<uint32_t, uint32_t>> uses;
     using Index = std::unordered_multimap<uint64_t, uint32_t>;
     std::filesystem::path path;
     std::string identity;
@@ -362,9 +413,13 @@ private:
         const auto id = uint32_t(entries.size());
         total_bytes += words.size() * 4 + 4;
         entries.push_back(std::move(words)); index.emplace(hash, id); changed = true;
+        // A new record is used by the call that made it.
+        const bool stamp = !pipeline && session != 0;
+        if (stamp) { last_used.resize(id, 0u); last_used.push_back(session); uses_changed = true; }
         if (worker.joinable()) {
             std::lock_guard lock(writer_mutex);
             pending.push_back({pipeline, entries.back()});
+            if (stamp) uses.emplace_back(id, session);
         }
         return id;
     }
@@ -432,6 +487,33 @@ private:
         return Visit(input, vertex) && (vertex.stage == ShaderType::Mesh
             ? r.vertex_input.attribute_count == 0 && r.vertex_input.binding_count == 0
             : r.vertex_input.attribute_count == vertex.vertex.resources_num);
+    }
+    // The side file's signature line: its own name, then the warm file's identity.
+    std::string UseSignature() const { return "KytyShaderUse1:" + identity; }
+    std::filesystem::path UsePath() const {
+        auto use = path;
+        use += ".use";
+        return use;
+    }
+    // The session and the stamps (one word each), in the warm file's layout: signature line, XXH3 checksum, words.
+    bool SaveUses(uint32_t saved_session, const std::vector<uint32_t>& stamps) {
+        std::error_code ec;
+        if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path(), ec);
+        if (ec) return false;
+        std::vector<uint32_t> words {saved_session, uint32_t(stamps.size())};
+        words.insert(words.end(), stamps.begin(), stamps.end());
+        const auto bytes = words.size() * 4;
+        const uint64_t checksum = XXH3_64bits(words.data(), bytes);
+        const auto use = UsePath();
+        auto temporary = use;
+        temporary += ".tmp";
+        const auto signature = UseSignature();
+        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+        file.write(signature.data(), signature.size()); file.write(reinterpret_cast<const char*>(&checksum), 8);
+        file.write(reinterpret_cast<const char*>(words.data()), bytes); file.close();
+        if (!file) return false;
+        std::filesystem::rename(temporary, use, ec);
+        return !ec;
     }
     bool SaveSnapshot(std::vector<std::vector<uint32_t>>& saved,
                       std::vector<std::vector<uint32_t>>& saved_pipelines) {
