@@ -19,6 +19,7 @@
 #include "graphics/shader/recompiler/ir/passes/WaterfallDescriptor.h"
 
 #include <algorithm>
+#include <functional>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -814,23 +815,39 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		// The final IR: its size, the selects whose condition is not a constant (each vector register write merges with
 		// the old value under exec: Translator::WriteOperand), the phis and the ballots.
 		uint32_t ir_insts = 0, selects = 0, phis = 0, ballots = 0;
+		// The non-constant selects by (select opcode, the opcode producing its condition; "arg" for a non-instruction).
+		std::map<std::pair<std::string_view, std::string_view>, uint32_t> select_kinds;
 		for (const auto* block: ir.blocks) {
 			for (const auto& inst: block->Instructions()) {
 				ir_insts++;
 				switch (inst.GetOpcode()) {
 					case IR::ValueOpcode::SelectU1:
 					case IR::ValueOpcode::SelectU32:
-					case IR::ValueOpcode::SelectF32: selects += inst.Arg(0).IsImmediate() ? 0u : 1u; break;
+					case IR::ValueOpcode::SelectF32:
+						if (!inst.Arg(0).IsImmediate()) {
+							selects++;
+							const auto* producer = inst.Arg(0).TryInstruction();
+							select_kinds[{IR::ValueOpcodeName(inst.GetOpcode()),
+							              producer != nullptr ? IR::ValueOpcodeName(producer->GetOpcode()) : "arg"}]++;
+						}
+						break;
 					case IR::ValueOpcode::Phi: phis++; break;
 					case IR::ValueOpcode::Ballot: ballots++; break;
 					default: break;
 				}
 			}
 		}
+		std::vector<std::pair<uint32_t, std::string>> kinds;
+		for (const auto& [key, count]: select_kinds)
+			kinds.emplace_back(count, fmt::format("{}/{}", key.first, key.second));
+		std::sort(kinds.begin(), kinds.end(), std::greater<>());
+		std::string top;
+		for (size_t i = 0; i < std::min<size_t>(kinds.size(), 6); i++)
+			top += fmt::format("{}{}={}", i != 0 ? "," : "", kinds[i].second, kinds[i].first);
 		std::printf("TRANSLATE_STATS stage=%s hash=0x%016" PRIx64 " instructions=%u movrels=%u movreld=%u spirv_words=%zu"
-		            " ir=%u selects=%u phis=%u ballots=%u\n",
+		            " ir=%u selects=%u phis=%u ballots=%u select_kinds=%s\n",
 		            StageName(options.stage), options.shader_hash, translated.stat_instructions, translated.stat_movrels,
-		            translated.stat_movreld, spirv.size(), ir_insts, selects, phis, ballots);
+		            translated.stat_movreld, spirv.size(), ir_insts, selects, phis, ballots, top.c_str());
 	}
 	CompileResult result;
 	result.spirv   = std::move(spirv);
