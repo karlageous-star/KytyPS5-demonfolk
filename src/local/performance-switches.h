@@ -36,6 +36,7 @@ extern volatile std::atomic_uint32_t kyty_local_async_lod_stats_mode;
 extern volatile std::atomic<uint32_t> kyty_local_buffer_reclaim_mode;
 extern volatile std::atomic<uint32_t> kyty_local_buffer_retire_mode;
 extern volatile std::atomic<uint32_t> kyty_local_unmap_protect_skip_mode;
+extern volatile std::atomic<uint32_t> kyty_local_window_stream_mode;
 extern volatile std::atomic<uint32_t> kyty_local_sync_readback_scoped_drain_mode;
 extern volatile std::atomic<uint32_t> kyty_local_sync_readback_narrow_mode;
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
@@ -95,6 +96,8 @@ inline void InitializePerformanceSwitches() {
 	    // Opt-in (default 0): 1 retires the buffers no binding used for a while (RetireStaleBuffers).
 	    Switch {"KYTY_BUFFER_RETIRE", &kyty_local_buffer_retire_mode},
 	    Switch {"KYTY_UNMAP_PROTECT_SKIP", &kyty_local_unmap_protect_skip_mode},
+	    // Opt-in (default 0): 1 takes the next 64 KiB for a write fault that continues a sequential stream.
+	    Switch {"KYTY_WINDOW_STREAM", &kyty_local_window_stream_mode},
 	    Switch {"KYTY_BDA_DIRTY_REGIONS", &kyty_local_bda_dirty_regions_mode},
 	    Switch {"KYTY_GLOBAL_BARRIER_DEDUPE", &kyty_local_global_barrier_dedupe},
 	    Switch {"KYTY_RANGE_SET_FAST", &kyty_local_range_set_fast_mode},

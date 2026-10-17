@@ -70,6 +70,8 @@ public:
 
 private:
 	[[nodiscard]] bool        TryInvalidateCpuWriteWindow(uint64_t fault);
+	// One window of the fault's mapped range: [window_begin, window_begin + window_size) within it.
+	[[nodiscard]] bool        TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t window_begin, uint64_t window_size);
 	void                      SynchronizeDirtyBdaRegions(GuestRange range);
 	void RefreshBdaRanges();
 	PageManager               m_page_manager;

@@ -20,6 +20,11 @@ extern "C" {
 // 1: watchers removed while memory is released skip the host protection change there
 // (PageManager::SetUnmappingRange); a write fault on a page nothing watches unprotects it.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_unmap_protect_skip_mode {0};
+// KYTY_WINDOW_STREAM (performance-switches.h, opt-in): 1 takes the next 64 KiB at once for a write fault in the 16 KiB
+// window right after the one the same thread's last window fault ended in, within 2 ms (a sequential stream of writes).
+// 0 (default) keeps the 16 KiB window. Opt-in because it invalidates 4x the pages (uploads +9%, on the upload worker).
+// Measured by chenxiao 87280083 (1-1 route, 120 cap, A-B-A over 29 points): window faults -13.6%, fps +0.7%, 1% low +3.8%.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_window_stream_mode {0};
 }
 
 namespace Libs::Graphics {
@@ -54,9 +59,30 @@ bool GpuResourceManager::TryInvalidateCpuWriteWindow(uint64_t fault) {
 	// A small window amortizes faults from sequential CPU writes. Expanding a
 	// fault is allowed only for mapped, unaliased pages with no GPU/image owner.
 	constexpr uint64_t window_size  = 4 * TRACKER_PAGE_SIZE;
+	constexpr uint64_t stream_size  = 16 * TRACKER_PAGE_SIZE;
 	const auto         window_begin = fault & ~(window_size - 1);
-	GuestRange         selected {};
-	uint64_t           mapping_epoch;
+	if (kyty_local_window_stream_mode.load(std::memory_order_relaxed) != 0) {
+		// The window after the one this thread's last window fault ended in, within 2 ms (~6.4M TSC ticks at 3.2 GHz):
+		// a stream, whose next 64 KiB goes at once (the next fault in it is the window after that).
+		thread_local uint64_t last_end = 0, last_tsc = 0;
+		const uint64_t        now      = __rdtsc();
+		const bool            stream   = window_begin == last_end && now - last_tsc < 6'400'000;
+		if (stream && TryInvalidateCpuWriteWindow(fault, window_begin, stream_size)) {
+			last_end = window_begin + stream_size;
+			last_tsc = now;
+			return true;
+		}
+		if (!TryInvalidateCpuWriteWindow(fault, window_begin, window_size)) return false;
+		last_end = window_begin + window_size;
+		last_tsc = now;
+		return true;
+	}
+	return TryInvalidateCpuWriteWindow(fault, window_begin, window_size);
+}
+
+bool GpuResourceManager::TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t window_begin, uint64_t window_size) {
+	GuestRange selected {};
+	uint64_t   mapping_epoch;
 	{
 		std::shared_lock mapped_lock(m_mapped_ranges_mutex);
 		mapping_epoch = m_mapping_epoch;
