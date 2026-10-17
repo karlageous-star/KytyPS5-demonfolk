@@ -92,7 +92,14 @@ bool SmallUploadRingEnabled() {
 	return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
+// The upload ring is host-visible memory resident all the time (512 MiB: the largest resident block of the process
+// besides guest memory, R2 2026-10-17). KYTY_UPLOAD_RING_MB=<64..512> sizes it; KYTY_RAM_SMALL_UPLOAD_RING=1 is 128.
+// A smaller ring waits for the GPU sooner when a level load uploads a lot at once.
 uint64_t UploadRingSize() {
+	if (const char* value = std::getenv("KYTY_UPLOAD_RING_MB"); value != nullptr && *value != '\0') {
+		const auto mib = std::strtoull(value, nullptr, 10);
+		if (mib >= 64 && mib <= 512) return mib * MiB;
+	}
 	return SmallUploadRingEnabled() ? 128 * MiB : 512 * MiB;
 }
 
