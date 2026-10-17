@@ -502,7 +502,8 @@ inline uint32_t Select(EmitterState& state, uint32_t type, uint32_t condition,
 }
 
 struct ValueEmitContext {
-	explicit ValueEmitContext(EmitterState& state_): state(state_) {}
+	explicit ValueEmitContext(EmitterState& state_);
+	~ValueEmitContext();
 
 	uint32_t              Def(IR::Value value);
 	uint32_t              Arg(const IR::Inst& inst, size_t index);

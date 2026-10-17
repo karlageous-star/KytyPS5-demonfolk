@@ -521,6 +521,24 @@ uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t 
 	return value;
 }
 
+// The definitions of the thread's last programs (two: a wave64 program's halves), their buckets kept for its next ones:
+// grown from empty, a program's rehashed into ever bigger bucket arrays, memory the system had to zero-fill (the
+// shader prefetch's threads: ~1.1 GB a minute).
+static thread_local std::vector<std::unordered_map<const IR::Inst*, uint32_t>> t_definitions;
+
+ValueEmitContext::ValueEmitContext(EmitterState& state_): state(state_) {
+	if (!t_definitions.empty()) {
+		definitions = std::move(t_definitions.back());
+		t_definitions.pop_back();
+	}
+}
+
+ValueEmitContext::~ValueEmitContext() {
+	if (t_definitions.size() >= 2 || definitions.bucket_count() > (size_t {1} << 18u)) return;
+	definitions.clear();
+	t_definitions.push_back(std::move(definitions));
+}
+
 uint32_t ValueEmitContext::Result(const IR::Inst& inst) {
 	if (const auto found = definitions.find(&inst); found != definitions.end()) {
 		return found->second;
