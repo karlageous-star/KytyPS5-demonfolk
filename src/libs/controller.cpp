@@ -279,8 +279,13 @@ void GameController::Connect(int id) {
 void GameController::Disconnect(int id) {
 	Common::LockGuard lock(m_mutex);
 
+	// SDL2 reports every removed joystick as a removed controller, also one that never was one (a wheel, a virtual or
+	// unmapped device: "we don't know if this was a game controller"), and a controller that could not be opened was
+	// never connected here (issue #49: the game ended when such a device went away).
 	const auto it = std::find(m_connected_ids.begin(), m_connected_ids.end(), id);
-	EXIT_IF(it == m_connected_ids.end());
+	if (it == m_connected_ids.end()) {
+		return;
+	}
 
 	m_connected_ids.erase(it);
 

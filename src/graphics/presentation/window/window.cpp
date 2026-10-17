@@ -341,7 +341,10 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 }
 
 static void GameEventController([[maybe_unused]] const EventController& f) {
-	EXIT_NOT_IMPLEMENTED(f.remapped);
+	// (A new mapping for a connected controller, e.g. from Steam: its buttons arrive mapped from then on.)
+	if (f.remapped) {
+		return;
+	}
 
 #ifdef KYTY_DBG_INPUT
 	if (f.added || f.removed) {
@@ -359,10 +362,13 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 #endif
 
 	if (f.added) {
-		auto* pad = SDL_GameControllerOpen(f.id);
-		EXIT_NOT_IMPLEMENTED(pad == nullptr);
-		int id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad));
-		Controller::Connect(id);
+		// (One that cannot be opened, e.g. gone again by now, stays out: its removal is then ignored too.)
+		if (auto* pad = SDL_GameControllerOpen(f.id); pad != nullptr) {
+			int id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad));
+			Controller::Connect(id);
+		} else {
+			LOGF("Controller %d could not be opened: %s\n", f.id, SDL_GetError());
+		}
 	}
 
 	if (f.removed) {
