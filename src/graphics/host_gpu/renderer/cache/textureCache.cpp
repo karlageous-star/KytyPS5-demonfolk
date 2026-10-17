@@ -330,12 +330,33 @@ bool TextureCache::SafeToDownload(const Image& image) {
 	return !m_buffer_cache.HasGpuDirtyBytes(range.address, range.size);
 }
 
-ImageId TextureCache::InsertImage(const ImageInfo& info) {
-	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+// Collector runs (flips) before memory an image could not be made for is asked for again.
+constexpr uint64_t FailedRetryTicks = 30;
+
+ImageId TextureCache::InsertImage(const ImageInfo& info, bool may_fail) {
+	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info, may_fail);
+	if (may_fail && m_slot_images[id].CreateFailed()) {
+		// (Never registered: the slot goes, and the image is not asked for again for a while.)
+		if (m_scheduler.Active()) {
+			m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
+		} else {
+			m_slot_images.erase(id);
+		}
+		if (m_failed_images.size() >= 16) m_failed_images.erase(m_failed_images.begin());
+		m_failed_images.push_back({info.data.address, info.data.size, m_gc_tick});
+		return {};
+	}
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
 	return id;
+}
+
+bool TextureCache::RecentlyFailed(const ImageInfo& info) const {
+	return std::ranges::any_of(m_failed_images, [&](const FailedImage& failed) {
+		return failed.address == info.data.address && info.data.size >= failed.size &&
+		       m_gc_tick < failed.tick + FailedRetryTicks;
+	});
 }
 
 void TextureCache::StampRegistrationPages(const Image& image, uint64_t epoch) {
@@ -2914,7 +2935,7 @@ bool TextureCache::PromoteReduced(const ImageIds& ids, const ImageDesc& desc, bo
 	return freed;
 }
 
-ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool may_fail) {
 	size_t         slow_candidates = 0;
 	SlowLog::Scope slow([&](double ms) {
 		std::printf("SLOW FindImage %.1f ms addr=0x%llx size=0x%llx type=%u fmt=%u %ux%ux%u levels=%u layers=%u "
@@ -3013,7 +3034,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				info.host_mip_skip = TextureQuality::MipSkip();
 				m_reduced_images++;
 			}
-			result         = InsertImage(info);
+			// (No image: the caller binds a null one. Memory it could not have is not asked for at every draw.)
+			if (may_fail && RecentlyFailed(info)) return {};
+			result         = InsertImage(info, may_fail);
+			if (!result) return {};
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {

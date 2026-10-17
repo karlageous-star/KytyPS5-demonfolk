@@ -49,7 +49,10 @@ public:
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
-	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// `may_fail` (a sampled texture's lookup, KYTY_POOL_IMAGE_SHARE): no image when the GPU cannot make one (its memory
+	// full, or more layers or bytes than the format allows), an invalid id, and none tried again for that memory for a
+	// while.
+	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false, bool may_fail = false);
 	// Addresses that gained their first registered image, in registration
 	// order: a caller that proved "no image starts here" at StartEpoch() E only
 	// needs the addresses logged after E.
@@ -157,7 +160,13 @@ private:
 	// Resolution epoch of the last (un)registration per image page.
 	using ImageEpochTable = MultiLevelPageTable<uint64_t, 20, 40, 10>;
 
-	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
+	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info, bool may_fail = false);
+	// Images the GPU could not make (InsertImage's `may_fail`): their memory is not asked for again for a while.
+	struct FailedImage {
+		uint64_t address = 0, size = 0, tick = 0;
+	};
+	std::vector<FailedImage>  m_failed_images;
+	[[nodiscard]] bool        RecentlyFailed(const ImageInfo& info) const;
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);

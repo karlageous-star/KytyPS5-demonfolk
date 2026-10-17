@@ -64,9 +64,13 @@ public:
 
 class Image final {
 public:
-	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
+	// `may_fail`: an image the GPU cannot make (its memory full, more layers or bytes than the format allows) is left
+	// without one (CreateFailed) instead of ending the emulator: a sampled texture's lookup binds a null image instead.
+	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info, bool may_fail = false);
 	~Image();
 	KYTY_CLASS_NO_COPY(Image);
+
+	[[nodiscard]] bool CreateFailed() const noexcept { return m_create_failed; }
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
 	// Levels of the host image (fewer than the guest's with reduced texture quality).
@@ -292,6 +296,7 @@ private:
 
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
+	bool              m_create_failed    = false;
 	uint64_t          m_maybe_cpu_hash   = 0;
 	static void NoteCpuDirty() noexcept { s_cpu_dirty_epoch.fetch_add(1, std::memory_order_release); }
 	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {1};

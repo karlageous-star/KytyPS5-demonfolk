@@ -48,6 +48,9 @@
 
 extern "C" {
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_binding_scratch_mode {0};
+// KYTY_POOL_IMAGE_SHARE (default 0): 1 binds a sampled texture the GPU cannot make as a null image, not the end of the
+// emulator (issue #49). The layer sharing of chenxiao c3a332ba is not part of it.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_pool_image_share_mode {0};
 }
 
 namespace Libs::Graphics {
@@ -907,7 +910,14 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	desc.allow_reduced = !storage && !resource.exact_texels && !resource.depth_compare &&
 	                     resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
 
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+	const bool may_fail = !storage && kyty_local_pool_image_share_mode.load(std::memory_order_relaxed) != 0;
+	auto       id                  = texture_cache.FindImage(desc, shader_conversion, may_fail);
+	if (!id) {
+		return bind_null(fmt::format("no image could be made for the texture: {}x{} layers={} levels={} format={} "
+		                             "addr=0x{:016x} size=0x{:x}",
+		                             width, height, desc.info.resources.layers, desc.info.resources.levels,
+		                             static_cast<uint32_t>(format), desc.info.data.address, desc.info.data.size));
+	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
