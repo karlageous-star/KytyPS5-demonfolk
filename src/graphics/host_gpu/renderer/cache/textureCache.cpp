@@ -45,7 +45,9 @@
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_partial_row_bands_mode {0};
 // KYTY_HTILE_PRESERVE (default 0): 1 keeps an HTile's metadata (its slice clear state) when the depth image using it is
 // deleted. HTile belongs to guest memory, not to a native image; 0 drops the state with the image, as before.
+extern "C" {
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_htile_preserve_mode {0};
+}
 
 namespace Libs::Graphics {
 
