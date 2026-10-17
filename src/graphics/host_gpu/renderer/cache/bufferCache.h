@@ -123,6 +123,11 @@ public:
 	};
 	void SynchronizeRegionRequest(SyncRegionRequest& request);
 	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch; }
+	// Moves whenever a buffer is unregistered (deleted, or joined into a new one): Vulkan buffers a binding resolved
+	// before it is unchanged are still the owners of their bytes. A join copies the old buffer's bytes into the new
+	// one in the open command buffer, so a binding to the old one GPU work records after it reads or writes bytes
+	// nothing reads again (the old buffer lives until the tick). The render thread's.
+	[[nodiscard]] uint64_t UnregisterEpoch() const { return m_unregister_epoch; }
 	// The registration epoch of the last change of a buffer covering the tracker region of `vaddr`: a region
 	// request's proof only depends on the buffers of its own region.
 	[[nodiscard]] uint64_t RegionRegistrationEpoch(uint64_t vaddr) const {
@@ -254,6 +259,7 @@ private:
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
 	uint64_t m_registration_epoch = 1;
+	uint64_t m_unregister_epoch   = 1;
 	std::vector<uint64_t> m_region_registrations; // per tracker region, see RegionRegistrationEpoch
 	struct SyncBuffer {
 		uint64_t start;

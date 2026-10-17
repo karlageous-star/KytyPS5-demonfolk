@@ -1239,6 +1239,8 @@ void RenderExecutor::PrepareGraphicsBindingsInto(const ShaderStageRuntime& verte
 		FindBuffers(*bindings.pixel);
 	}
 	PrepareBdaBindings(bindings.vertex, bindings.pixel ? &*bindings.pixel : nullptr);
+	auto&    cache = m_context.GetBufferCache();
+	uint64_t epoch = cache.UnregisterEpoch();
 	RebindBuffers(bindings.vertex);
 	if (bindings.pixel) {
 		RebindBuffers(*bindings.pixel);
@@ -1246,6 +1248,21 @@ void RenderExecutor::PrepareGraphicsBindingsInto(const ShaderStageRuntime& verte
 	RebindImages(bindings.vertex);
 	if (bindings.pixel) {
 		RebindImages(*bindings.pixel);
+	}
+	// A buffer resolved here can be joined into a new one by what comes after it (a later buffer's lookup, an image's
+	// refresh asking the buffer cache for its bytes): the old Vulkan buffer no longer owns the bytes, and the draw's writes
+	// there are lost (an 8 GB laptop's culling chain hung on counts it read later, 10-18). Resolved again until nothing was
+	// unregistered meanwhile.
+	for (uint32_t attempt = 0; attempt < 4 && cache.UnregisterEpoch() != epoch; ++attempt) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
+			std::printf("Bindings: a buffer was unregistered while a draw's bindings were made (VS 0x%016llx), resolved again\n",
+			            static_cast<unsigned long long>(bindings.vertex.runtime->program->shader_hash));
+		epoch = cache.UnregisterEpoch();
+		RebindBuffers(bindings.vertex);
+		if (bindings.pixel) {
+			RebindBuffers(*bindings.pixel);
+		}
 	}
 }
 
