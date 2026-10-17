@@ -152,11 +152,16 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 }
 
 // Reads through a null pointer (a draw the game leaves unset during loads): no guest memory is mapped
-// there, and the GPU reads zeros where the host would fault.
-constexpr uint64_t NullPageEnd = 0x10000;
+// there, and the GPU reads zeros where the host would fault. Likewise past the guest address space (1 TiB, the
+// trackers' range): an in-game world change (archstone travel to Latria) read an SRT pointer of -1.
+constexpr uint64_t NullPageEnd     = 0x10000;
+constexpr uint64_t GuestAddressEnd = uint64_t {1} << 40u;
+[[nodiscard]] constexpr bool NoGuestMemory(uint64_t address, uint64_t size) {
+	return address < NullPageEnd || address >= GuestAddressEnd || GuestAddressEnd - address < size;
+}
 
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
-	if (value != nullptr && address < NullPageEnd) {
+	if (value != nullptr && NoGuestMemory(address, sizeof(*value))) {
 		*value = 0;
 		return true;
 	}
@@ -219,7 +224,7 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
 	// A GPU-written neighbour may protect a clean descriptor on the same page.
 	// Reading its checked backing alias avoids an unnecessary GPU drain. Dirty,
 	// unmapped and untracked addresses retain the original load/fault behavior.
-	if (address < NullPageEnd) {
+	if (NoGuestMemory(address, sizeof(*value))) {
 		*value = 0;
 	} else if (Libs::LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, value, sizeof(*value))) {
 		LiveCounters::Add(LiveCounters::SrtWatchedReads);
@@ -236,7 +241,7 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
 bool ReadShaderMemorySpan(void*, uint64_t address, uint32_t* values, uint32_t count, bool clean) {
 	// Clean spans also read whole tables (resource materialization); raw spans are SRT groups. The
 	// null page goes word by word (the readers above).
-	return count >= 2 && count <= (clean ? 1024u : 16u) && address >= NullPageEnd &&
+	return count >= 2 && count <= (clean ? 1024u : 16u) && !NoGuestMemory(address, uint64_t {count} * 4u) &&
 	       Libs::LibKernel::Memory::TryReadGpuShaderSpan(address, values, count * 4u, clean);
 }
 
