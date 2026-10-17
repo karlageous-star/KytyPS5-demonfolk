@@ -2293,6 +2293,25 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
 }
 
+// Live `cachemap`: "B address size usage flags" per buffer (usage: 0 device-local, 1 upload, 2 download, 3 stream;
+// flags: d deleted, s in system memory, a read through the BDA page table), then "G begin end" per range of GPU-written
+// bytes the CPU has not read back.
+void BufferCache::WriteCacheMap(std::FILE* file) const {
+	m_slot_buffers.ForEach([&](BufferId /*id*/, const Buffer& buffer) {
+		char   flags[4] {};
+		size_t f = 0;
+		if (buffer.is_deleted) flags[f++] = 'd';
+		if (buffer.IsInSystemMemory()) flags[f++] = 's';
+		if (buffer.bda_read) flags[f++] = 'a';
+		std::fprintf(file, "B %llx %llx %u %s\n", static_cast<unsigned long long>(buffer.CpuAddress()),
+		             static_cast<unsigned long long>(buffer.Size()), static_cast<unsigned>(buffer.Usage()),
+		             f != 0 ? flags : "-");
+	});
+	m_gpu_modified_ranges.ForEach([&](uint64_t begin, uint64_t end) {
+		std::fprintf(file, "G %llx %llx\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end));
+	});
+}
+
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }

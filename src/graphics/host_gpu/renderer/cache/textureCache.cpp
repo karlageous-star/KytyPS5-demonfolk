@@ -1447,6 +1447,39 @@ void TextureCache::TrimUploadedTexture(Image& image, bool cpu_written_only) {
 	}
 }
 
+// Live `cachemap <path>`: "I address size width height layers levels usage state frames-since-upload" per image (usage:
+// t texture, s storage, r render target, d depth target; state: g GPU-modified, b buffer-modified, c CPU-dirty, R
+// registered), then the buffer cache's "B" lines. For tools\cache_residency.py (which guest RAM the caches hold).
+void TextureCache::WriteCacheMap(const char* path) {
+	std::FILE* file = std::fopen(path, "wb");
+	if (file == nullptr) {
+		return;
+	}
+	const uint64_t frame = m_frame.load(std::memory_order_relaxed);
+	m_slot_images.ForEach([&](ImageId /*id*/, const Image& image) {
+		const auto& info = image.info;
+		char        usage[5] {};
+		char        state[5] {};
+		size_t      u = 0;
+		size_t      s = 0;
+		if (image.usage.texture) usage[u++] = 't';
+		if (image.usage.storage) usage[u++] = 's';
+		if (image.usage.render_target) usage[u++] = 'r';
+		if (image.usage.depth_target) usage[u++] = 'd';
+		if (image.IsGpuModified()) state[s++] = 'g';
+		if (image.IsBufferModified()) state[s++] = 'b';
+		if (image.IsCpuDirty()) state[s++] = 'c';
+		if (image.registered) state[s++] = 'R';
+		const long long since =
+		    image.frame_uploaded_last == UINT64_MAX ? -1 : static_cast<long long>(frame - image.frame_uploaded_last);
+		std::fprintf(file, "I %llx %llx %u %u %u %u %s %s %lld\n", static_cast<unsigned long long>(info.data.address),
+		             static_cast<unsigned long long>(info.data.size), info.extent.width, info.extent.height,
+		             info.resources.layers, info.resources.levels, u != 0 ? usage : "-", s != 0 ? state : "-", since);
+	});
+	m_buffer_cache.WriteCacheMap(file);
+	std::fclose(file);
+}
+
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
 	// Tiler scratch from this operation stays alive until its last use (tiler.h ScratchHold).
 	const TileManager::ScratchHold scratch_hold(m_tiler);
@@ -4124,6 +4157,10 @@ void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
 	m_tick_history.Record(tick);
+	if (LiveCounters::g_cache_map_due.load(std::memory_order_acquire)) {
+		WriteCacheMap(LiveCounters::g_cache_map_path);
+		LiveCounters::g_cache_map_due.store(false, std::memory_order_release);
+	}
 	static const bool print_memory = std::getenv("KYTY_MEMORY_STATS") != nullptr;
 	if (print_memory) {
 		static auto last = std::chrono::steady_clock::now();

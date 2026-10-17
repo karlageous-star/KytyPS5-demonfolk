@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <cstdio>
 #include <map>
 #include <memory>
 #include <span>
@@ -171,6 +172,8 @@ public:
 	// The video memory the game buffers in use that got system memory need back, with headroom (0: none): the
 	// texture collector makes this room too (TextureCache::RunGarbageCollector). Updated every 60 flips.
 	[[nodiscard]] uint64_t SpilledRoom() const noexcept { return m_spilled_room; }
+	// Live `cachemap`: one "B" line per buffer (TextureCache::WriteCacheMap). Render thread.
+	void WriteCacheMap(std::FILE* file) const;
 
 private:
 	friend struct BufferCacheTestAccess;

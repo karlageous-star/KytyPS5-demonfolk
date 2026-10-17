@@ -209,6 +209,8 @@ private:
 	[[nodiscard]] DownloadPlan BuildDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void TrimUploadedTexture(Image& image, bool cpu_written_only);
+	// Live `cachemap <path>` (caller holds m_lock): every image and every buffer of the buffer cache, one per line.
+	void WriteCacheMap(const char* path);
 	void UploadStencil(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, DownloadPlan plan);
