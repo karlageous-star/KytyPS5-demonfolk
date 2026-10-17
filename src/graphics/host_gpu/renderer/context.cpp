@@ -22,6 +22,11 @@
 #include <bit>
 #include <cstring>
 
+// windows.h (through common/threads.h) defines MemoryBarrier as a function macro: vk::MemoryBarrier is the struct.
+#ifdef MemoryBarrier
+#undef MemoryBarrier
+#endif
+
 extern "C" {
 // KYTY_TRANSFER_CHAIN (default 0; live): independent buffer copies recorded back to back share one barrier ahead and one
 // after (CommandBuffer::TransferHandle).
