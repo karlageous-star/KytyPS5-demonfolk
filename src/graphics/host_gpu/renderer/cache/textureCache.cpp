@@ -2361,10 +2361,14 @@ bool TextureCache::UploadDepthPartial(Image& image) {
 	return true;
 }
 
+// KYTY_FULL_IMAGE_CHUNKS (default 1; 0: off): a CPU-written image larger than the staging ring uploads a ring-sized batch
+// at a time, not through one temporary upload buffer of its whole size. Demon's Souls' new-game load uploads texture
+// arrays of 135-352 MiB: with the 128 MiB ring the temporaries put ~900 MB of system memory on at once and the load ran
+// a 16 GB PC out of RAM (L2, L4, L5b, 10-18); chunked, its peak private commit was 1.5 GB lower (L6).
 bool TextureCache::UploadImageChunked(Image& image) {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_FULL_IMAGE_CHUNKS");
-		return value != nullptr && std::string_view(value) == "1";
+		return value == nullptr || std::string_view(value) != "0";
 	}();
 	const auto& info = image.info;
 	const uint64_t capacity = m_buffer_cache.ImageStagingCapacity();

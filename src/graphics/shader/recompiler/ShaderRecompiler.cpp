@@ -768,13 +768,14 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::ApplyResourceSpecialization(ir, specialization);
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
-	// KYTY_EXEC_SELECT_FORWARD=1: inside a divergent region every vector register write was a select on the region's
-	// exec value; values only observed where exec holds read the unmasked values instead, leaving one select per
-	// register where the region ends (IR::ForwardMaskedSelects). Demon's Souls' hottest compute shader had 2,359 such
-	// selects for 3,290 instructions (L4, 10-18). It changes the SPIR-V, so the driver compiles each pipeline once more.
+	// KYTY_EXEC_SELECT_FORWARD (default 1; 0: off): inside a divergent region every vector register write was a select on
+	// the region's exec value; values only observed where exec holds read the unmasked values instead, leaving one select
+	// per register where the region ends (IR::ForwardMaskedSelects). Demon's Souls' hottest compute shader had 2,359 such
+	// selects for 3,290 instructions (L4, 10-18); with it the tunnel's GPU frame went 40.0 -> 36.1 ms (L1 -> L6, low
+	// preset), the picture the same. It changes the SPIR-V: the driver compiles each pipeline once more, once.
 	static const bool exec_select_forward = [] {
 		const char* value = std::getenv("KYTY_EXEC_SELECT_FORWARD");
-		return value != nullptr && value[0] == '1';
+		return value == nullptr || value[0] != '0';
 	}();
 	IR::MaskedSelectStats masked_selects;
 	if (exec_select_forward) {
