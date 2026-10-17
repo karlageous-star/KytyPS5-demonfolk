@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 #include <array>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -274,6 +275,37 @@ uint32_t EmitPackHalf(EmitterState& state, uint32_t src) {
 	return EmitExt(state, TypeU32(state), GlslPackHalf2x16, {src});
 }
 
+// KYTY_PACK_HALF_RTZ_NATIVE=1 selects the native-pack form of v_cvt_pkrtz_f16_f32 (default off).
+// PackHalf2x16 rounds to nearest; a half whose magnitude grew is stepped one unit toward zero.
+// Finite, zero and infinite results match the integer emulation. NaN payload bits may differ.
+static bool PackHalfRtzNativeEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PACK_HALF_RTZ_NATIVE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+uint32_t EmitPackFloat2x16RtzNative(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	const auto pair = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeConstruct, TypeF32Vector(state, 2), pair, arg0, arg1});
+	const auto packed = EmitExt(state, TypeU32(state), GlslPackHalf2x16, {pair});
+	const auto back   = EmitExt(state, TypeF32Vector(state, 2), GlslUnpackHalf2x16, {packed});
+	auto       result = packed;
+	for (uint32_t i = 0; i < 2; i++) {
+		const auto rounded = state.builder.AllocateId();
+		state.builder.AddFunction({OpCompositeExtract, TypeF32(state), rounded, back, i});
+		const auto source = i == 0 ? arg0 : arg1;
+		const auto above  = Binary(state, OpFOrdGreaterThan, TypeBool(state),
+		                           EmitExt(state, TypeF32(state), GlslFAbs, {rounded}),
+		                           EmitExt(state, TypeF32(state), GlslFAbs, {source}));
+		const auto step   = Select(state, TypeU32(state), above,
+		                           ConstantU32(state, i == 0 ? 1u : 0x10000u), ConstantU32(state, 0));
+		result = Binary(state, OpISub, TypeU32(state), result, step);
+	}
+	return result;
+}
+
 } // namespace
 
 bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -365,6 +397,10 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Define(inst, EmitExt(state, TypeU32(state), GlslPackUnorm2x16, {ctx.Arg(inst, 0)}));
 			return true;
 		case IR::ValueOpcode::PackFloat2x16Rtz: {
+			if (PackHalfRtzNativeEnabled()) {
+				ctx.Define(inst, EmitPackFloat2x16RtzNative(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1)));
+				return true;
+			}
 			const auto low = EmitF32ToF16RtzBits(state, ctx.Arg(inst, 0));
 			const auto high =
 			    Binary(state, OpShiftLeftLogical, TypeU32(state),
