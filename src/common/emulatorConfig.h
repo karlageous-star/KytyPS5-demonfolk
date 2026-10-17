@@ -95,7 +95,15 @@ std::filesystem::path  GetShaderLogFolder();
 bool                  CommandBufferDumpEnabled();
 std::filesystem::path GetCommandBufferDumpFolder();
 
-bool GraphicsDebugDumpEnabled();
+// Read per draw on the command processor (debug.cpp, descriptors.cpp, LogDrawPhase): a copy of the loaded
+// option, so the check inlines (the common library is not part of the emulator's LTO). Config::Load sets it.
+namespace Detail {
+inline bool g_graphics_debug_dump_enabled = false;
+} // namespace Detail
+
+inline bool GraphicsDebugDumpEnabled() {
+	return Detail::g_graphics_debug_dump_enabled;
+}
 
 OutputDirection       GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();

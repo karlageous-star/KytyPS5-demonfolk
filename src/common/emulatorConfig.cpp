@@ -25,6 +25,7 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(!IsConfiguredUserIdValid(cfg.user_id));
 
 	*g_config = cfg;
+	Detail::g_graphics_debug_dump_enabled = cfg.graphics_debug_dump_enabled;
 }
 
 uint32_t GetScreenWidth() {
@@ -89,10 +90,6 @@ bool CommandBufferDumpEnabled() {
 
 std::filesystem::path GetCommandBufferDumpFolder() {
 	return g_config->command_buffer_dump_folder;
-}
-
-bool GraphicsDebugDumpEnabled() {
-	return g_config->graphics_debug_dump_enabled;
 }
 
 OutputDirection GetPrintfDirection() {
