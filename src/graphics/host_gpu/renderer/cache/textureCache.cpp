@@ -4141,7 +4141,11 @@ void TextureCache::RunGarbageCollector() {
 	    (VideoMemoryOverBudgetBytes() != 0 || SystemMemoryFallbackBytes() != 0)) {
 		m_graphics.TrimImagePool();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	// Less the room the game buffers in use that got system memory need back (BufferCache::MoveSpilledBufferBack):
+	// with none, the trigger as before.
+	const uint64_t spilled_room  = m_buffer_cache.SpilledRoom();
+	const uint64_t collect_above = m_trigger_gc_memory - std::min(m_trigger_gc_memory, spilled_room);
+	if (m_total_used_memory < collect_above) {
 		return;
 	}
 	const auto collect = [&](bool allow_aggressive) {
@@ -4181,6 +4185,9 @@ void TextureCache::RunGarbageCollector() {
 		});
 		for (const auto id: candidates) {
 			if (deletions == 0) {
+				break;
+			}
+			if (spilled_room != 0 && m_total_used_memory < collect_above) {
 				break;
 			}
 			--deletions;

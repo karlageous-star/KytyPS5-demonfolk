@@ -178,6 +178,27 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 	return usage;
 }
 
+uint64_t GraphicContext::GetVideoMemoryRoom() const {
+	// (Without VK_EXT_memory_budget VMA counts only its own blocks against a guessed budget: no figure to go by.)
+	if (allocator == nullptr || !CanReportMemoryUsage()) {
+		return 0;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	const auto& heaps = physical_device_memory_properties.memoryHeaps;
+	uint32_t    video = UINT32_MAX;
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		const bool device_local = static_cast<bool>(heaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal);
+		const bool larger       = video == UINT32_MAX || heaps[heap].size > heaps[video].size;
+		if (device_local && larger) video = heap;
+	}
+	if (video == UINT32_MAX) {
+		return 0;
+	}
+	const auto& budget = budgets[video];
+	return budget.budget > budget.usage ? budget.budget - budget.usage : 0;
+}
+
 uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	if (allocator == nullptr) {
 		return 0;

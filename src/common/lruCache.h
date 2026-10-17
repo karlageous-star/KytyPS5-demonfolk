@@ -41,6 +41,9 @@ public:
 		}
 	}
 
+	// The tick the item was last used at (Touch keeps the newest one).
+	[[nodiscard]] Tick TickOf(size_t id) { return At(id).tick; }
+
 	void Free(size_t id) {
 		auto& item = At(id);
 		Detach(item);

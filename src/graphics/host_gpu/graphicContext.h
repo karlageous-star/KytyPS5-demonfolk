@@ -130,6 +130,9 @@ struct GraphicContext {
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
+	// The video memory heap's budget less its usage (VMA's figures, the largest device-local heap): what a new
+	// device-local allocation can take without going over the budget; 0 without the driver's figures.
+	[[nodiscard]] uint64_t GetVideoMemoryRoom() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	// KYTY_MEMORY_STATS: heap usage and budgets, VMA blocks and allocations (AMD on Windows allows
 	// 4096 device memory allocations), and the image pool.

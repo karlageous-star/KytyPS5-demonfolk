@@ -937,6 +937,11 @@ bool BufferCache::TryGuestReadFromFeedback(uint64_t vaddr, uint64_t size, bool i
 
 void BufferCache::Register(BufferId id) {
 	ChangeRegister<true>(id);
+	// (Without KYTY_VRAM_FIRST, or the driver's figures, there is no room to move one back into.)
+	if (kyty_local_vram_first_mode.load(std::memory_order_relaxed) != 0 && m_graphics.CanReportMemoryUsage() &&
+		m_slot_buffers[id].IsInSystemMemory()) {
+		m_spilled.push_back(id);
+	}
 }
 
 void BufferCache::Unregister(BufferId id) {
@@ -1011,6 +1016,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	if (buffer == nullptr || buffer->is_deleted) {
 		return;
 	}
+	std::erase(m_spilled, id);
 	Unregister(id);
 	// KYTY_READBACK_QUEUE: a copy on the transfer queue may still read it after the graphics timeline
 	// passes (it waits on that timeline only for the bytes' last writer). Freed then, its memory was
@@ -2354,11 +2360,66 @@ void BufferCache::RetireStaleBuffers(uint64_t tick) {
 		DeleteBuffer(id);
 	}
 	LiveCounters::Add(LiveCounters::GcBufferDeletes, stale.size());
+bool BufferCache::MoveSpilledBufferBack(bool bda_frame) {
+	// What a buffer moved back leaves of the budget: VMA's largest new block and the next frames' allocations. A game
+	// buffer in system memory is read over the bus every frame.
+	constexpr uint64_t Headroom = uint64_t {256} << 20u;
+	// In use: read through the BDA page table in this frame, or bound in the last 600 flips (the texture collector's
+	// staleness).
+	constexpr uint64_t InUseTicks = 600;
+	if (m_spilled.empty() || !m_graphics.CanReportMemoryUsage() ||
+	    kyty_local_vram_first_mode.load(std::memory_order_relaxed) == 0) {
+		m_spilled_room = 0;
+		return false;
+	}
+	const uint64_t room   = m_graphics.GetVideoMemoryRoom();
+	uint64_t       needed = 0;
+	BufferId       id {};
+	bool           fits   = false;
+	for (const auto spilled: m_spilled) {
+		const auto& buffer = m_slot_buffers[spilled];
+		if (!bda_frame && m_lru_cache.TickOf(buffer.lru_id) + InUseTicks < m_gc_tick) continue;
+		needed += buffer.Size();
+		if (!fits && buffer.Size() + Headroom <= room) {
+			id   = spilled;
+			fits = true;
+		}
+	}
+	// The room the ones in use need, which the texture collector makes (SpilledRoom).
+	m_spilled_room = needed != 0 ? needed + Headroom : 0;
+	if (!fits || !m_scheduler.Active() || m_scheduler.Current().IsInvalid()) {
+		return false;
+	}
+	const auto begin    = m_slot_buffers[id].CpuAddress();
+	const auto size     = m_slot_buffers[id].Size();
+	const auto moved_id = m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, begin,
+	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
+	if (m_slot_buffers[moved_id].IsInSystemMemory()) {
+		m_slot_buffers.erase(moved_id);
+		return false;
+	}
+	// JoinOverlap's steps with one buffer: the copy, the old buffer out, the new one in. The stream score is kept.
+	auto&       moved  = m_slot_buffers[moved_id];
+	const auto& source = m_slot_buffers[id];
+	moved.IncreaseStreamScore(source.StreamScore());
+	SetVulkanObjectNameF(m_graphics.device, moved.Handle(), "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", begin,
+	    size);
+	moved.CopyFrom(m_scheduler.Current(), source, 0, 0, size);
+	NoteGpuWrite(begin, size, GpuWriteOrigin::BufferJoin);
+	DeleteBuffer(id);
+	Register(moved_id);
+	m_spilled_room = needed > size ? needed - size + Headroom : 0;
+	std::printf("Vulkan: a GPU buffer is back in video memory (%llu bytes)\n", static_cast<unsigned long long>(size));
+	return true;
 }
 
 void BufferCache::RunGarbageCollector(bool collect) {
 	const auto tick = m_gc_tick++;
 	RetireStaleBuffers(tick);
+	// The game buffers in system memory are looked at every 60 flips, collection or not. collect is false in a
+	// frame whose shaders read guest memory through the BDA page table (GpuResourceManager::AdvanceFrame).
+	// Before the early return below.
+	if (tick % 60 == 0) (void)MoveSpilledBufferBack(!collect);
 	// After a frame with BDA shaders a collected buffer faults straight back, so buffers are kept,
 	// unless video memory is about to run out: on an 8 GB card Demon's Souls filled it by the
 	// title screen (nearly every frame has BDA shaders) and the next allocation failed.
