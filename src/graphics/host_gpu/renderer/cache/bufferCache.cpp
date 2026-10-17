@@ -2361,6 +2361,8 @@ void BufferCache::RetireStaleBuffers(uint64_t tick) {
 		DeleteBuffer(id);
 	}
 	LiveCounters::Add(LiveCounters::GcBufferDeletes, stale.size());
+}
+
 bool BufferCache::MoveSpilledBufferBack(bool bda_frame) {
 	// What a buffer moved back leaves of the budget: VMA's largest new block and the next frames' allocations. A game
 	// buffer in system memory is read over the bus every frame.
