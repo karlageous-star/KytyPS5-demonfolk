@@ -1594,11 +1594,12 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 			// What the driver had to compile is kept at once: the cache is otherwise written only
 			// at a normal exit, so after a crash the next launch compiled it all again (2+ minutes).
 			if (std::chrono::steady_clock::now() - begin > std::chrono::seconds(5)) (void)Save();
-			// KYTY_TRIM_AFTER_WARMUP=1 (opt-in): the host heap the warm-up leaves (mostly the driver's pipelines, its
-			// pipeline cache and module copies, about 2.5 GB cold of 3.3 resident on a new game, E2/E3 10-17) leaves the
-			// working set before the game loads anything: its 1080p level load otherwise needs ~10 GB available on a
-			// 16 GB PC. Hot pages come back at their next touch; guest memory (below 1 TiB) is not touched.
-			if (const char* trim = std::getenv("KYTY_TRIM_AFTER_WARMUP"); trim != nullptr && trim[0] == '1') {
+			// KYTY_TRIM_AFTER_WARMUP (default 1; 0: off): the host heap the warm-up leaves (mostly the driver's pipelines,
+			// its pipeline cache and module copies, about 2.5 GB cold of 3.3 resident on a new game, E2/E3 10-17) leaves
+			// the working set before the game loads anything: its 1080p level load otherwise needs ~10 GB available on a
+			// 16 GB PC (E7 ran out without it). Hot pages come back at their next touch; guest memory (below 1 TiB) is
+			// not touched. No change to what is drawn.
+			if (const char* trim = std::getenv("KYTY_TRIM_AFTER_WARMUP"); trim == nullptr || trim[0] != '0') {
 				const auto asked = LocalPlatform::TrimPrivateWorkingSet(uint64_t {1} << 40u);
 				PipelineCacheLog("Shader warmup: {} MiB of host memory asked out of the working set", asked >> 20u);
 			}

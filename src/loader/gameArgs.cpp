@@ -37,7 +37,8 @@ std::string NameOf(const std::string& entry) {
 	return last == std::string::npos ? std::string() : name.substr(0, last + 1);
 }
 
-// KYTY_GRAPHICS_PRESET=medium|low|lowest (unset or high: nothing changes). Demon's Souls' own console variables for
+// KYTY_GRAPHICS_PRESET=medium|low|lowest|high (unset: low, the owner's default since 10-18; high: the game's own
+// settings, nothing changes). Demon's Souls' own console variables for
 // what a frame draws. Low and Lowest are the Graphics Low and Lowest presets of the chenxiao launcher: the level of
 // detail as for a 720 or 480-line picture (r_forceViewportHeightForPixelSizeCalc), sun shadows to 125 or 60 m
 // (sunShadowMaxDistance, 250 by default), and Lowest also without ambient shadowing or spot light shadows. Medium is
@@ -54,11 +55,12 @@ constexpr Preset presets[] = {
 	           "r_enableAmbientShadowing=false;r_enableSpotShadows=false"},
 };
 
-// The entries of the chosen preset (none when it is unset, high, or the game is not Demon's Souls). Called once, from
+// The entries of the chosen preset (low when unset; none for high, or when the game is not Demon's Souls). Called once, from
 // ExtraLines, so the choice is logged once.
 std::vector<std::string> PresetEntries() {
-	const char* name = std::getenv("KYTY_GRAPHICS_PRESET");
-	if (name == nullptr || *name == '\0' || std::strcmp(name, "high") == 0) return {};
+	const char* env  = std::getenv("KYTY_GRAPHICS_PRESET");
+	const char* name = env == nullptr || *env == '\0' ? "low" : env;
+	if (std::strcmp(name, "high") == 0) return {};
 	const Preset* chosen = nullptr;
 	for (const auto& preset: presets) {
 		if (std::strcmp(preset.name, name) == 0) chosen = &preset;
