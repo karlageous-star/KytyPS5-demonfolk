@@ -435,6 +435,10 @@ void CommandProcessor::BufferFlush() {
 	GetScheduler().Flush();
 }
 
+void CommandProcessor::BufferFlushDeferrable() {
+	GetScheduler().DeferrableFlush();
+}
+
 void CommandProcessor::BufferFlushAndWait() {
 	GetScheduler().FlushAndWait();
 }
@@ -694,6 +698,13 @@ void GuestGpu::ThreadRun(void* data) {
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+				// (A flush deferred while the GPU was busy goes before the thread waits: nothing else would submit it.)
+				if (gpu->m_renderer.GetCommandScheduler().FlushPending()) {
+					gpu->m_queue_mutex.Unlock();
+					gpu->m_renderer.GetCommandScheduler().FlushDeferred();
+					gpu->m_queue_mutex.Lock();
+					continue;
+				}
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				LiveTrace::Event(LiveTrace::RenderIdle, 1, 0);
@@ -723,6 +734,12 @@ void GuestGpu::ThreadRun(void* data) {
 					}
 				}
 				if (selected_queue < 0) {
+					if (gpu->m_renderer.GetCommandScheduler().FlushPending()) {
+						gpu->m_queue_mutex.Unlock();
+						gpu->m_renderer.GetCommandScheduler().FlushDeferred();
+						gpu->m_queue_mutex.Lock();
+						continue;
+					}
 					gpu->m_processing = false;
 					LiveTrace::Event(LiveTrace::RenderIdle, 1, 1);
 					const auto idle = std::chrono::steady_clock::now();
@@ -761,7 +778,9 @@ void GuestGpu::ThreadRun(void* data) {
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
-			if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+			// (Idle only once a deferred flush is submitted: the loop above submits it, then signals.)
+			if (gpu->m_commands.empty() && gpu->m_submission_count == 0 &&
+			    !gpu->m_renderer.GetCommandScheduler().FlushPending()) {
 				gpu->m_idle.SignalAll();
 			}
 			continue;
@@ -792,7 +811,9 @@ void GuestGpu::ThreadRun(void* data) {
 			}
 		}
 		gpu->m_processing = false;
-		if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+		// (Idle only once a deferred flush is submitted: the loop above submits it, then signals.)
+		if (gpu->m_commands.empty() && gpu->m_submission_count == 0 &&
+		    !gpu->m_renderer.GetCommandScheduler().FlushPending()) {
 			gpu->m_idle.SignalAll();
 		}
 	}
@@ -855,7 +876,9 @@ bool GuestGpu::Process(Submission& submission) {
 				if (complete) {
 					m_renderer.GetGpuResources().EndSubmission();
 				}
-				cp.BufferFlush();
+				// (A slice stopped at a wait goes to the GPU at once: what it waits for may need it.)
+				if (complete) cp.BufferFlushDeferrable();
+				else cp.BufferFlush();
 			} else if (complete) {
 				m_renderer.GetGpuResources().EndSubmission();
 			}
@@ -881,7 +904,8 @@ bool GuestGpu::Process(Submission& submission) {
 				if (complete) {
 					m_renderer.GetGpuResources().EndSubmission();
 				}
-				cp.BufferFlush();
+				if (complete) cp.BufferFlushDeferrable();
+				else cp.BufferFlush();
 			} else if (complete) {
 				m_renderer.GetGpuResources().EndSubmission();
 			}

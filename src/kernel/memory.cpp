@@ -1252,6 +1252,10 @@ bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
 		return false;
 	}
+	// No page of it read-watched: no GPU-written buffer bytes there (a GPU-written page is read-watched from the write on:
+	// a CPU read faults), so nothing to download. (The command processor asks for every indirect register table, about
+	// 11K a frame at 1-1, in memory the CPU writes: each a search of the GPU-written ranges.)
+	if (!GetGpuResources().HasReadWatchers(vaddr, size)) return true;
 	if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
 		// KYTY_SYNC_LOG: which shader's resource evaluation drains the GPU for its words.
 		static const bool log = std::getenv("KYTY_SYNC_LOG") != nullptr;

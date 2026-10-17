@@ -29,6 +29,9 @@ volatile std::atomic_uint32_t kyty_local_batch_while_busy_mode {0};
 // +1.9 in every round), p99 53.7 -> 49.7 ms, 16.8 drain flushes a frame, the same picture. Mode 1 barely fires
 // (0.1 a frame): the GPU runs dry while the render thread records draws inside one render pass.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_flush_on_drain_mode {2};
+// KYTY_FLUSH_DEFER (default 0): a flush point nothing waits on (a label without an interrupt, the end of a queue's
+// slice) leaves the open buffer open while the GPU still has at least this many submissions to run (DeferrableFlush).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_flush_defer_mode {0};
 // 0: refresh the master timeline before every drain attempt.
 // 1: prove the pending-operation queue empty before the timeline query and the
 //    operation lock. Draws and dispatches call this with nothing to retire.
@@ -211,6 +214,8 @@ void CommandScheduler::CompleteDispatch() {
 	// next batch begin before this one drains, so its size trades that drain
 	// against how early the queue receives work. Dispatches inside a batch keep
 	// the same chain barriers at any size.
+	// (A deferred flush goes here once the GPU is down to its last submission: DeferrableFlush.)
+	if (FlushedDeferred(4)) return;
 	const auto batch = std::clamp(kyty_local_dispatch_batch.load(std::memory_order_relaxed), 1u, 65536u);
 	if (++m_recorded_dispatches < batch) {
 		return;
@@ -237,6 +242,8 @@ void CommandScheduler::CompleteDispatch() {
 // recorded one guest submission for up to 7.9 ms without a flush point: the GPU waited for work already recorded.
 // At most one timeline query each 0.2 ms; the boundary is CompleteDispatch's (an all-commands dependency).
 void CommandScheduler::FlushIfDrained() {
+	// A deferred flush (DeferrableFlush) is asked here whatever KYTY_FLUSH_ON_DRAIN says: every 16 entries.
+	if (m_flush_deferred && FlushedDeferred(1)) return;
 	const auto mode = kyty_local_flush_on_drain_mode.load(std::memory_order_relaxed);
 	if (mode == 0 || !Active() || m_command.IsInvalid() || m_drain_entries++ == 0) {
 		return;
@@ -259,6 +266,49 @@ void CommandScheduler::FlushIfDrained() {
 	                                   vk::PipelineStageFlagBits::eAllCommands, {}, 1, &dependency,
 	                                   0, nullptr, 0, nullptr);
 	Flush();
+}
+
+// A flush point nothing waits on (a label without an interrupt, the end of a queue's slice: CommandProcessor::
+// BufferFlushDeferrable) while the GPU has kyty_local_flush_defer_mode (or more) submissions still to run: the buffer
+// stays open, and goes with the next flush, or once the GPU is down to its last submission (FlushedDeferred: asked by
+// FlushIfDrained and CompleteDispatch, so it never runs dry waiting for this one), or before the GPU thread waits for
+// work (FlushDeferred). Each submission costs the GPU a drain between back-to-back command buffers and the recording
+// thread a submission. Deferring whenever the GPU merely still ran something (one submission) halved the submissions
+// too but starved the GPU after short ones (chenxiao 31119bdf).
+// (Ended as a submission ends it: the render pass and a compute chain's pending barrier, so the commands after it are
+// recorded as they would be into the next buffer.)
+void CommandScheduler::DeferrableFlush() {
+	if (const auto backlog = kyty_local_flush_defer_mode.load(std::memory_order_relaxed);
+	    backlog != 0 && !m_command.IsInvalid() && Backlog() >= backlog) {
+		m_command.EndRendering();
+		(void)m_command.Handle();
+		m_flush_deferred = true;
+		return;
+	}
+	Flush();
+}
+
+void CommandScheduler::FlushDeferred() {
+	if (m_flush_deferred) Flush();
+}
+
+// While a flush is deferred, every 16 units of `weight` (draws or dispatch entries) whether the GPU is down to its last
+// submission: then the open buffer is submitted (true).
+bool CommandScheduler::FlushedDeferred(uint32_t weight) {
+	if (!m_flush_deferred) return false;
+	if ((m_deferred_checks += weight) < 16) return false;
+	m_deferred_checks = 0;
+	if (Backlog() > 1) return false;
+	Flush();
+	return true;
+}
+
+// The submissions the GPU has still to finish (the recording worker's not handed yet included).
+uint64_t CommandScheduler::Backlog() {
+	m_master.Refresh();
+	const auto submitted = m_master.CurrentTick() - 1;
+	const auto done      = m_master.KnownGpuTick();
+	return submitted > done ? submitted - done : 0;
 }
 
 CommandScheduler::~CommandScheduler() {
@@ -639,6 +689,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		}
 		m_command.m_buffer    = nullptr;
 		m_recorded_dispatches = 0;
+		m_flush_deferred      = false;
 		LiveTrace::Event(LiveTrace::GpuSubmit, deferred.tick);
 		return deferred.tick;
 	}
@@ -672,6 +723,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		}
 		m_command.m_buffer = nullptr;
 		m_recorded_dispatches = 0;
+		m_flush_deferred      = false;
 		m_submit_available.notify_one();
 		return job.tick;
 	}
@@ -717,6 +769,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	m_command.m_buffer = nullptr;
 	m_recorded_dispatches = 0;
+	m_flush_deferred      = false;
 	return tick;
 }
 

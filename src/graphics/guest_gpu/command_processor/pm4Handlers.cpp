@@ -2339,7 +2339,9 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		cp.BufferFlush();
+		// (The label is written now; an interrupt is signalled when the GPU is done: only then is the flush urgent.)
+		if (interrupt_selector == 0x00 || interrupt_selector == 0x03) cp.BufferFlushDeferrable();
+		else cp.BufferFlush();
 
 		return 7;
 	}

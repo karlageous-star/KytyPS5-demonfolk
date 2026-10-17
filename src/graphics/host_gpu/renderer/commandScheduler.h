@@ -36,6 +36,11 @@ public:
 	// KYTY_FLUSH_ON_DRAIN: at a draw or dispatch entry, submits what is recorded once the GPU has finished every
 	// earlier submission (never waits).
 	void           FlushIfDrained();
+	// KYTY_FLUSH_DEFER: a flush nothing waits on (CommandProcessor::BufferFlushDeferrable) stays open while the GPU
+	// has kyty_local_flush_defer_mode submissions to run; FlushDeferred submits it before the GPU thread waits.
+	void           DeferrableFlush();
+	void           FlushDeferred();
+	[[nodiscard]] bool FlushPending() const noexcept { return m_flush_deferred; }
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
@@ -106,6 +111,10 @@ private:
 	void QueueSubmit(const SubmitJob& job);
 	void SubmitThread(std::stop_token stop);
 	void StopSubmitThread();
+	// A deferred flush done once the GPU is down to its last submission, asked every 16 units of `weight`
+	// (DeferrableFlush).
+	[[nodiscard]] bool     FlushedDeferred(uint32_t weight);
+	[[nodiscard]] uint64_t Backlog();
 
 	MasterSemaphore              m_master;
 	uint64_t                     m_last_pending_refresh = 0;
@@ -117,6 +126,9 @@ private:
 	// KYTY_FLUSH_ON_DRAIN: draw and dispatch entries since the last submission, and the last drain check (QPC).
 	uint32_t                     m_drain_entries       = 0;
 	uint64_t                     m_last_drain_check    = 0;
+	// KYTY_FLUSH_DEFER: DeferrableFlush left the open buffer open, and the units asked since the last check.
+	bool                         m_flush_deferred      = false;
+	uint32_t                     m_deferred_checks     = 0;
 	// The last tick handed to the driver (its vkQueueSubmit returned: on the recording worker for a deferred one).
 	std::atomic<uint64_t> m_driver_tick {0};
 	std::queue<PendingOperation> m_pending_operations;
