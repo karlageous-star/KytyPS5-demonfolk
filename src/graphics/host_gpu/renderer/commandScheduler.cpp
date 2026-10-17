@@ -23,9 +23,12 @@ extern "C" {
 volatile std::atomic_uint32_t kyty_local_dispatch_batch {32};
 // KYTY_BATCH_WHILE_BUSY=1 (chenxiao 0c29dbf9): a dispatch batch goes on while the GPU still runs work handed to it.
 volatile std::atomic_uint32_t kyty_local_batch_while_busy_mode {0};
-// KYTY_FLUSH_ON_DRAIN (live, opt-in): 1 submits the recorded work at a dispatch entry, or a draw entry outside a
-// render pass, once the GPU has finished every earlier submission; 2 also ends an open render pass for it.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_flush_on_drain_mode {0};
+// KYTY_FLUSH_ON_DRAIN (live; default 2): 1 submits the recorded work at a dispatch entry, or a draw entry outside a
+// render pass, once the GPU has finished every earlier submission; 2 also ends an open render pass for it; 0 never.
+// N7 (new game, tutorial tunnel, same session, 5 interleaved 12 s rounds): 0 -> 2 gave 21.98 -> 23.43 fps (+0.9 to
+// +1.9 in every round), p99 53.7 -> 49.7 ms, 16.8 drain flushes a frame, the same picture. Mode 1 barely fires
+// (0.1 a frame): the GPU runs dry while the render thread records draws inside one render pass.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_flush_on_drain_mode {2};
 // 0: refresh the master timeline before every drain attempt.
 // 1: prove the pending-operation queue empty before the timeline query and the
 //    operation lock. Draws and dispatches call this with nothing to retire.

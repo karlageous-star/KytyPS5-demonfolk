@@ -121,7 +121,7 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_DISPATCH_BATCH", &kyty_local_dispatch_batch, 1, 65536},
 	    // 1: a dispatch batch goes on while the GPU still runs work handed to it (up to 8 batches).
 	    Switch {"KYTY_BATCH_WHILE_BUSY", &kyty_local_batch_while_busy_mode},
-	    // Opt-in: 1 submits recorded work once the GPU has drained (outside render passes); 2 also inside them.
+	    // Default 2: recorded work is submitted once the GPU has drained, ending an open render pass (1: outside them; 0: never).
 	    Switch {"KYTY_FLUSH_ON_DRAIN", &kyty_local_flush_on_drain_mode, 0, 2},
 	    // 1: a compute dispatch that reads memory only through pointers chains on its BDA read ranges.
 	    Switch {"KYTY_CHAIN_BDA_READS", &kyty_local_chain_bda_reads_mode},
