@@ -60,11 +60,18 @@ vk::CommandBuffer CommandBuffer::ChainHandle() const {
 	return m_buffer;
 }
 
+static vk::MemoryBarrier GlobalBarrier(vk::AccessFlags source, vk::AccessFlags destination) {
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = source;
+	barrier.dstAccessMask = destination;
+	return barrier;
+}
+
 // The chain's barrier after: the copies' transfers before every later command, their writes visible to it.
 void CommandBuffer::DrainTransferChain() const {
 	if (!m_transfer_pending) return;
-	const vk::MemoryBarrier after {vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite,
-	                               vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite};
+	const auto after = GlobalBarrier(vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite,
+	                                 vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
 	m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
 	                         vk::DependencyFlagBits::eByRegion, 1, &after, 0, nullptr, 0, nullptr);
 	m_transfer_pending = false;
@@ -76,8 +83,8 @@ vk::CommandBuffer CommandBuffer::TransferHandle(std::span<const TransferAccess> 
 	if (m_compute_access_pending) (void)Handle(); // the pending compute dependency first (no transfer chain then)
 	if (!m_transfer_pending) {
 		// The barrier ahead: everything recorded before, at any stage, before the transfers; its writes visible to them.
-		const vk::MemoryBarrier before {vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-		                                vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite};
+		const auto before = GlobalBarrier(vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		                                  vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite);
 		m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
 		                         vk::DependencyFlagBits::eByRegion, 1, &before, 0, nullptr, 0, nullptr);
 	} else {
@@ -90,8 +97,8 @@ vk::CommandBuffer CommandBuffer::TransferHandle(std::span<const TransferAccess> 
 		}
 		if (conflict) {
 			// A copy touching what an earlier one of the chain writes (or writing what one reads) waits for them.
-			const vk::MemoryBarrier between {vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite,
-			                                 vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite};
+			const auto between = GlobalBarrier(vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite,
+			                                   vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite);
 			m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
 			                         vk::DependencyFlagBits::eByRegion, 1, &between, 0, nullptr, 0, nullptr);
 			m_transfer_access.clear();
