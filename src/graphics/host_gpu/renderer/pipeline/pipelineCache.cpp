@@ -1131,8 +1131,9 @@ struct PipelineCache::ProgramCache {
 	// at most Window records ahead because a result holds a whole program.
 	class WarmWorkers {
 	public:
-		WarmWorkers(const std::vector<std::vector<uint32_t>>& records, uint32_t threads)
-		    : records(records), jobs(records.size()), ready(records.size()) {
+		WarmWorkers(const std::vector<std::vector<uint32_t>>& records, uint32_t threads,
+					const std::vector<uint8_t>& wanted)
+		    : records(records), wanted(wanted), jobs(records.size()), ready(records.size()) {
 			for (uint32_t t = 0; t < threads; ++t) pool.emplace_back([this] { Run(); });
 		}
 		~WarmWorkers() {
@@ -1164,12 +1165,13 @@ struct PipelineCache::ProgramCache {
 				}
 				if (stop.load(std::memory_order_relaxed)) return;
 				const size_t index = jobs.size() - 1 - n;
-				jobs[index]        = PrepareWarmJob(records[index]);
+				if (wanted[index]) jobs[index] = PrepareWarmJob(records[index]);
 				ready[index].store(1, std::memory_order_release);
 				ready[index].notify_one();
 			}
 		}
 		const std::vector<std::vector<uint32_t>>& records;
+		const std::vector<uint8_t>&               wanted; // KYTY_WARMUP_RECENT: false, skipped
 		std::vector<std::unique_ptr<WarmJob>>     jobs;
 		std::vector<std::atomic<uint8_t>>         ready;
 		std::atomic<size_t>                       taken {0};
@@ -1205,8 +1207,22 @@ struct PipelineCache::ProgramCache {
 		warm_permutations.resize(warmup.records.size());
 		size_t compiled = 0;
 		const uint32_t threads = WarmupThreads();
+		// The records the recent sessions did not use stay out. A worker skips them and Warm skips them: their first use
+		// translates them on the render thread, as it does for any record the warm-up never saw.
+		std::vector<uint8_t> wanted(warmup.records.size(), 1);
+		size_t               left_out = 0;
+		if (recent != 0) {
+			for (size_t i = 0; i < wanted.size(); ++i) {
+				if (!warmup.Recent(uint32_t(i), recent)) {
+					wanted[i] = 0;
+					++left_out;
+				}
+			}
+			PipelineCacheLog("Shader warmup: recent {} sessions: {} of {} inputs selected, {} left for first use", recent,
+			                 wanted.size() - left_out, wanted.size(), left_out);
+		}
 		std::optional<WarmWorkers> workers;
-		if (threads > 1) workers.emplace(warmup.records, threads);
+		if (threads > 1) workers.emplace(warmup.records, threads, wanted);
 		for (size_t remaining = warmup.records.size(); remaining != 0; --remaining) {
 			const size_t index = remaining - 1;
 			if (std::chrono::steady_clock::now() >= warm_deadline) break;
@@ -1217,6 +1233,7 @@ struct PipelineCache::ProgramCache {
 				job = workers->Take(index);
 				if (!job) continue;
 			} else {
+				if (!wanted[index]) continue;
 				LocalShaderWarmup::Reader reader {warmup.records[index]};
 				if (!LocalShaderWarmup::Visit(reader, parsed) || !LocalShaderWarmup::ValidKey(parsed)) continue;
 			}
