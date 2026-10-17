@@ -122,6 +122,7 @@ public:
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
+	[[nodiscard]] bool IsRendering() const noexcept { return m_rendering; }
 	// Raw internal graphics operations must invalidate the values recorded by
 	// the ordinary draw path. Compute and transfer commands do not alter them.
 	void InvalidateGraphicsState() const noexcept;

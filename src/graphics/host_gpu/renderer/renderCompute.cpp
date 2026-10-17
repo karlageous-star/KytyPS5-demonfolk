@@ -327,6 +327,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	FrameCapture::Scope frame_capture("Dispatch", true);
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations(true);
+	m_context.GetCommandScheduler().FlushIfDrained();
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 	if (FrameCapture::Active()) {

@@ -33,6 +33,9 @@ public:
 	void           Finish();
 	// Finish a complete dispatch; may submit, but never waits for the GPU.
 	void           CompleteDispatch();
+	// KYTY_FLUSH_ON_DRAIN: at a draw or dispatch entry, submits what is recorded once the GPU has finished every
+	// earlier submission (never waits).
+	void           FlushIfDrained();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
@@ -111,6 +114,9 @@ private:
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
 	uint32_t                     m_recorded_dispatches = 0;
+	// KYTY_FLUSH_ON_DRAIN: draw and dispatch entries since the last submission, and the last drain check (QPC).
+	uint32_t                     m_drain_entries       = 0;
+	uint64_t                     m_last_drain_check    = 0;
 	// The last tick handed to the driver (its vkQueueSubmit returned: on the recording worker for a deferred one).
 	std::atomic<uint64_t> m_driver_tick {0};
 	std::queue<PendingOperation> m_pending_operations;

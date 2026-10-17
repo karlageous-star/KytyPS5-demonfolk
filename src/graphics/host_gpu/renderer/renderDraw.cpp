@@ -1706,6 +1706,7 @@ bool RenderExecutor::TryDrawIndexRun(uint64_t submit_id, CommandBuffer& buffer,
 		return false;
 	if (!m_context.GetGpuResources().IsMapped(run.indices.address, run.indices.size)) return false;
 	m_context.GetCommandScheduler().PopPendingOperations(true);
+	m_context.GetCommandScheduler().FlushIfDrained();
 	LiveTrace::MarkAfter gpu_mark {[&] { return m_context.GetCommandScheduler().Current().RawHandle(); },
 	                               LiveTrace::MarkDraw, buffer.GetShaders().GetPs().ps_regs.data_addr};
 	Common::LockGuard lock(m_context.GetMutex());
@@ -1994,6 +1995,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations(true);
+	m_context.GetCommandScheduler().FlushIfDrained();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 	LiveCensus::Scope census(LiveCensus::Draw, sh_ctx.GetVs().gs_regs.data_addr, sh_ctx.GetPs().ps_regs.data_addr);
@@ -2165,6 +2167,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations(true);
+	m_context.GetCommandScheduler().FlushIfDrained();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 	LiveTrace::MarkAfter gpu_mark {[&] { return m_context.GetCommandScheduler().Current().RawHandle(); },

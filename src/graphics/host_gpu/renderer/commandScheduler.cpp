@@ -8,6 +8,7 @@
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
+#include "live-counters.h"
 #include "live-trace-gpu.h"
 #include "local-platform.h"
 
@@ -22,6 +23,9 @@ extern "C" {
 volatile std::atomic_uint32_t kyty_local_dispatch_batch {32};
 // KYTY_BATCH_WHILE_BUSY=1 (chenxiao 0c29dbf9): a dispatch batch goes on while the GPU still runs work handed to it.
 volatile std::atomic_uint32_t kyty_local_batch_while_busy_mode {0};
+// KYTY_FLUSH_ON_DRAIN (live, opt-in): 1 submits the recorded work at a dispatch entry, or a draw entry outside a
+// render pass, once the GPU has finished every earlier submission; 2 also ends an open render pass for it.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_flush_on_drain_mode {0};
 // 0: refresh the master timeline before every drain attempt.
 // 1: prove the pending-operation queue empty before the timeline query and the
 //    operation lock. Draws and dispatches call this with nothing to retire.
@@ -216,6 +220,34 @@ void CommandScheduler::CompleteDispatch() {
 		return;
 	}
 	CheckActive();
+	m_command.EndRendering();
+	VulkanMemoryBarrier dependency {};
+	dependency.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	dependency.dstAccessMask = dependency.srcAccessMask;
+	m_command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                                   vk::PipelineStageFlagBits::eAllCommands, {}, 1, &dependency,
+	                                   0, nullptr, 0, nullptr);
+	Flush();
+}
+
+// N3 (new game, Boletaria): 12.7 of 16.4 ms a frame of GPU idle fell inside stretches where the render thread
+// recorded one guest submission for up to 7.9 ms without a flush point: the GPU waited for work already recorded.
+// At most one timeline query each 0.2 ms; the boundary is CompleteDispatch's (an all-commands dependency).
+void CommandScheduler::FlushIfDrained() {
+	const auto mode = kyty_local_flush_on_drain_mode.load(std::memory_order_relaxed);
+	if (mode == 0 || !Active() || m_command.IsInvalid() || m_drain_entries++ == 0) {
+		return;
+	}
+	const auto now = Common::Timer::QueryPerformanceCounter();
+	if (now - m_last_drain_check < Common::Timer::QueryPerformanceFrequency() / 5000) {
+		return;
+	}
+	m_last_drain_check = now;
+	const auto tick    = CurrentTick();
+	if (tick <= 1 || (m_command.IsRendering() && mode < 2) || !IsFree(tick - 1)) {
+		return;
+	}
+	LiveCounters::Add(LiveCounters::DrainFlushes);
 	m_command.EndRendering();
 	VulkanMemoryBarrier dependency {};
 	dependency.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
@@ -754,6 +786,7 @@ void CommandScheduler::StopSubmitThread() {
 
 void CommandScheduler::BeginNext() {
 	CheckActive();
+	m_drain_entries = 0;
 	BeginCommand();
 }
 

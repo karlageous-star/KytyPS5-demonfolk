@@ -3168,6 +3168,7 @@ bool RenderExecutor::NativeXprDraw(CommandBuffer& buffer, const NativeXprDrawArg
 		return false;
 	auto& cache = *m_native_xpr;
 	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().FlushIfDrained();
 	Common::LockGuard lock(m_context.GetMutex());
 
 	NativeXprKey(buffer, cache.key);
@@ -3216,6 +3217,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 	    index_base == 0 || index_bytes == 0)
 		return false;
 	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().FlushIfDrained();
 	Common::LockGuard lock(m_context.GetMutex());
 	NativeXprCollect();
 
