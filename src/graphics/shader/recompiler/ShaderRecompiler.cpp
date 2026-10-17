@@ -811,9 +811,26 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		return value != nullptr && value[0] == '1';
 	}();
 	if (translate_stats) {
-		std::printf("TRANSLATE_STATS stage=%s hash=0x%016" PRIx64 " instructions=%u movrels=%u movreld=%u spirv_words=%zu\n",
+		// The final IR: its size, the selects whose condition is not a constant (each vector register write merges with
+		// the old value under exec: Translator::WriteOperand), the phis and the ballots.
+		uint32_t ir_insts = 0, selects = 0, phis = 0, ballots = 0;
+		for (const auto* block: ir.blocks) {
+			for (const auto& inst: block->Instructions()) {
+				ir_insts++;
+				switch (inst.GetOpcode()) {
+					case IR::ValueOpcode::SelectU1:
+					case IR::ValueOpcode::SelectU32:
+					case IR::ValueOpcode::SelectF32: selects += inst.Arg(0).IsImmediate() ? 0u : 1u; break;
+					case IR::ValueOpcode::Phi: phis++; break;
+					case IR::ValueOpcode::Ballot: ballots++; break;
+					default: break;
+				}
+			}
+		}
+		std::printf("TRANSLATE_STATS stage=%s hash=0x%016" PRIx64 " instructions=%u movrels=%u movreld=%u spirv_words=%zu"
+		            " ir=%u selects=%u phis=%u ballots=%u\n",
 		            StageName(options.stage), options.shader_hash, translated.stat_instructions, translated.stat_movrels,
-		            translated.stat_movreld, spirv.size());
+		            translated.stat_movreld, spirv.size(), ir_insts, selects, phis, ballots);
 	}
 	CompileResult result;
 	result.spirv   = std::move(spirv);
