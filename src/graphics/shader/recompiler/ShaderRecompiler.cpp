@@ -10,6 +10,7 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/MaskedSelectForwarding.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -767,6 +768,20 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::ApplyResourceSpecialization(ir, specialization);
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
+	// KYTY_EXEC_SELECT_FORWARD=1: inside a divergent region every vector register write was a select on the region's
+	// exec value; values only observed where exec holds read the unmasked values instead, leaving one select per
+	// register where the region ends (IR::ForwardMaskedSelects). Demon's Souls' hottest compute shader had 2,359 such
+	// selects for 3,290 instructions (L4, 10-18). It changes the SPIR-V, so the driver compiles each pipeline once more.
+	static const bool exec_select_forward = [] {
+		const char* value = std::getenv("KYTY_EXEC_SELECT_FORWARD");
+		return value != nullptr && value[0] == '1';
+	}();
+	IR::MaskedSelectStats masked_selects;
+	if (exec_select_forward) {
+		masked_selects = IR::ForwardMaskedSelects(ir.blocks);
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
 
 	const ShaderVertexInputInfo*  vertex  = nullptr;
 	const ShaderPixelInputInfo*   pixel   = nullptr;
@@ -845,9 +860,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		for (size_t i = 0; i < std::min<size_t>(kinds.size(), 6); i++)
 			top += fmt::format("{}{}={}", i != 0 ? "," : "", kinds[i].second, kinds[i].first);
 		std::printf("TRANSLATE_STATS stage=%s hash=0x%016" PRIx64 " instructions=%u movrels=%u movreld=%u spirv_words=%zu"
-		            " ir=%u selects=%u phis=%u ballots=%u select_kinds=%s\n",
+		            " ir=%u selects=%u phis=%u ballots=%u select_kinds=%s forward=%u/%u/%u\n",
 		            StageName(options.stage), options.shader_hash, translated.stat_instructions, translated.stat_movrels,
-		            translated.stat_movreld, spirv.size(), ir_insts, selects, phis, ballots, top.c_str());
+		            translated.stat_movreld, spirv.size(), ir_insts, selects, phis, ballots, top.c_str(),
+		            masked_selects.collapsed, masked_selects.removed, masked_selects.forwarded);
 	}
 	CompileResult result;
 	result.spirv   = std::move(spirv);
