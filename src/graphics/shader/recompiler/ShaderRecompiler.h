@@ -31,6 +31,11 @@ struct TranslateResult {
 	IR::Program program;
 	std::string decoded_dump;
 	std::string cfg_dump;
+	// KYTY_TRANSLATE_STATS: the guest instructions, and the indexed register accesses among them (V_MOVRELS /
+	// V_MOVRELD: each becomes a select over every register from its base to the highest one the program uses).
+	uint32_t stat_instructions = 0;
+	uint32_t stat_movrels       = 0;
+	uint32_t stat_movreld       = 0;
 };
 
 struct CompileResult {

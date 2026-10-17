@@ -609,6 +609,11 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	}
 	DumpDecodedShader(options, joined_code.empty() ? code : std::span<const uint32_t> {joined_code},
 	                  decoded);
+	uint32_t stat_movrels = 0, stat_movreld = 0;
+	for (const auto& inst: decoded.instructions) {
+		stat_movrels += inst.opcode == Decoder::Opcode::V_MOVRELS_B32 ? 1u : 0u;
+		stat_movreld += inst.opcode == Decoder::Opcode::V_MOVRELD_B32 ? 1u : 0u;
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -742,7 +747,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	IR::TrackResources(ir);
 	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
-	result.program = std::move(ir);
+	result.program           = std::move(ir);
+	result.stat_instructions = static_cast<uint32_t>(decoded.instructions.size());
+	result.stat_movrels      = stat_movrels;
+	result.stat_movreld      = stat_movreld;
 	if (options.dump_ir) {
 		result.decoded_dump = std::move(decoded_dump);
 		result.cfg_dump     = CFG::GraphToString(cfg);
@@ -797,6 +805,16 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));
+	// KYTY_TRANSLATE_STATS=1: one line per compiled program (which hot shaders pay for indexed register access).
+	static const bool translate_stats = [] {
+		const char* value = std::getenv("KYTY_TRANSLATE_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (translate_stats) {
+		std::printf("TRANSLATE_STATS stage=%s hash=0x%016" PRIx64 " instructions=%u movrels=%u movreld=%u spirv_words=%zu\n",
+		            StageName(options.stage), options.shader_hash, translated.stat_instructions, translated.stat_movrels,
+		            translated.stat_movreld, spirv.size());
+	}
 	CompileResult result;
 	result.spirv   = std::move(spirv);
 	result.program = std::move(ir);
