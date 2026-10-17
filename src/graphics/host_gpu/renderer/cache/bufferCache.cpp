@@ -2287,20 +2287,51 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
-// KYTY_BUFFER_RETIRE (live; 0 never retires). Per flip, up to 64 buffers no binding used for 600 flips go, whatever
-// the memory use. The collector below waits for a frame without BDA shaders, which Demon's Souls never has, so every
-// buffer it registered stayed; those inside the BDA shaders' read windows had their CPU-written pages uploaded and
-// write-protected again at each BDA preparation. Passed over (moved to the back of the list): buffers with GPU-owned
-// bytes (their download stays the collector's) and buffers BDA shaders read with no buffer registered (bda_read: such
-// reads touch no LRU entry, and one after the buffer went would read zeros once).
+// KYTY_BUFFER_RETIRE (live; 0 never retires). Per flip, the buffers no binding used for 30 s go (up to 64 a flip).
+// With the video memory in use at the critical level or over it (read every 30 flips), after 10 s and up to 256 a
+// flip: only then ten seconds also retire what a turned camera left behind (re-registered when seen again at
+// Latria). Idleness is counted in time, not flips: the 1800 flips it was are 2 minutes at an 8 GB laptop's 14 fps,
+// where a 5-minute 1-1 tour left 0.5 GB of such buffers idle while the video memory in use went past the budget.
+// Never a buffer used in the last 120 flips (a long frame is no idle time), and never later than 1800 flips (at high
+// frame rates). Passed over (moved to the back of the list): buffers with GPU-owned bytes and buffers BDA shaders
+// read with no buffer registered (bda_read). The collector below waits for a frame without BDA shaders.
 void BufferCache::RetireStaleBuffers(uint64_t tick) {
-	constexpr uint64_t StaleTicks     = 600;
-	constexpr size_t   MaxRetirements = 64;
-	if (kyty_local_buffer_retire_mode.load(std::memory_order_relaxed) == 0 || tick <= StaleTicks) return;
+	constexpr auto     StaleTime           = std::chrono::seconds(30);
+	constexpr auto     PressureTime        = std::chrono::seconds(10);
+	constexpr size_t   MaxRetirements      = 64;
+	constexpr size_t   PressureRetirements = 256;
+	constexpr uint64_t MinTicks            = 120;
+	constexpr uint64_t StaleTicks          = 1800;
+	// The mode is read first: with 0 nothing is timed, read or retired.
+	if (kyty_local_buffer_retire_mode.load(std::memory_order_relaxed) == 0) return;
+	const auto now = std::chrono::steady_clock::now();
+	m_tick_times[tick % m_tick_times.size()] = now.time_since_epoch().count();
+	if (tick % 30 == 0) {
+		m_retire_pressure = m_graphics.CanReportMemoryUsage() &&
+							m_graphics.GetDeviceMemoryUsage() >= m_critical_gc_memory;
+	}
+	if (tick <= MinTicks) return;
+	const bool pressure = m_retire_pressure;
+	const auto horizon  = (now - (pressure ? PressureTime : StaleTime)).time_since_epoch().count();
+	// The newest tick that began by the horizon among the ticks the ring holds (their times only grow); when even the
+	// oldest held began after it, the ticks older than the ring.
+	uint64_t first = tick - std::min<uint64_t>(tick, m_tick_times.size() - 1), last = tick;
+	if (m_tick_times[first % m_tick_times.size()] > horizon) {
+		last = first;
+	} else {
+		while (first < last) {
+			const uint64_t middle = first + (last - first + 1) / 2;
+			if (m_tick_times[middle % m_tick_times.size()] <= horizon) first = middle;
+			else last = middle - 1;
+		}
+	}
+	// (Never later than the StaleTicks rule it replaced: at 120 fps, 1800 flips are 15 s.)
+	const uint64_t below = std::min(std::max(last, tick > StaleTicks ? tick - StaleTicks : 0), tick - MinTicks);
+	const size_t   limit = pressure ? PressureRetirements : MaxRetirements;
 	thread_local std::vector<BufferId> stale, kept;
 	stale.clear();
 	kept.clear();
-	m_lru_cache.ForEachItemBelow(tick - StaleTicks, [&](BufferId id) {
+	m_lru_cache.ForEachItemBelow(below, [&](BufferId id) {
 		const auto& buffer = m_slot_buffers[id];
 		if (buffer.is_deleted) return false;
 		// The guest readbacks over the buffer complete first (the collector drains each candidate the same way):
@@ -2311,7 +2342,7 @@ void BufferCache::RetireStaleBuffers(uint64_t tick) {
 			kept.push_back(id);
 		else
 			stale.push_back(id);
-		return stale.size() == MaxRetirements;
+		return stale.size() == limit;
 	});
 	// (The ones passed over go to the back of the list: the next flips' walks do not cross them again.)
 	for (const auto id: kept) TouchBuffer(m_slot_buffers[id]);
