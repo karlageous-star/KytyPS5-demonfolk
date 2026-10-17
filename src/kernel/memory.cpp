@@ -1177,7 +1177,8 @@ void TrimGuestWorkingSet(uint64_t vaddr, uint64_t size) {
 	// VirtualUnlock on pages that are not locked removes them from the working set (and reports
 	// ERROR_NOT_LOCKED). A physical page stays resident while any view of it is in the working set,
 	// so the backing view the emulator's own reads use is released too (floppa-ps5 texture_ram=trim).
-	(void)VirtualUnlock(reinterpret_cast<void*>(begin), end - begin);
+	// (The guest views: GuestAddressSpace::TrimWorkingSet, 16 MiB at a time, each busy meanwhile.)
+	g_guest_address_space->TrimWorkingSet(begin, end - begin);
 	std::vector<std::pair<const uint8_t*, uint64_t>> pieces;
 	if (const auto* backing = TryGetBackingPointer(begin, end - begin)) {
 		(void)VirtualUnlock(const_cast<uint8_t*>(backing), end - begin);

@@ -1666,12 +1666,48 @@ private:
 		return (value & (m_granularity - 1u)) == 0;
 	}
 
-	// Whether a backing map or unmap is changing a range that overlaps [vaddr, vaddr + size) outside the lock.
+	// Whether a backing map or unmap is changing a range that overlaps [vaddr, vaddr + size) outside the lock: its page-table
+	// pages (2 MiB of addresses each, and the next one where it ends on one's start) as a whole. Windows' memory manager
+	// bug-checked (0x1A/0x41202, issues #5 and #50, 16 GB PCs) in a protection change of a host thread from the first page
+	// of a 2 MiB-aligned range (a texture's) while another view was mapped or unmapped: busy ranges were per view, and a
+	// protection change of a neighbouring view in the same page-table page went on during the system calls. Protection
+	// changes in those pages wait for the map or unmap, or for a working-set trim (TrimWorkingSet), to finish.
 	[[nodiscard]] bool BusyUnlocked(uint64_t vaddr, uint64_t size) const {
-		for (const auto& [begin, end]: m_busy)
-			if (vaddr < end && begin < vaddr + size) return true;
+		constexpr uint64_t PageTablePage = uint64_t {2} << 20u;
+		for (const auto& [begin, end]: m_busy) {
+			const auto page_begin = begin & ~(PageTablePage - 1u);
+			const auto page_end   = (end + PageTablePage) & ~(PageTablePage - 1u);
+			if (vaddr < page_end && page_begin < vaddr + size) return true;
+		}
 		return false;
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+public:
+	// Memory::TrimGuestWorkingSet's VirtualUnlock of guest views (the working-set trim), 16 MiB at a time, each busy
+	// meanwhile: no map or unmap runs in its page-table pages then, nor it during theirs. It ran unlocked before, during a
+	// view's map or unmap too (one of the overlaps of the bug check above). No lock is held during the trim itself.
+	void TrimWorkingSet(uint64_t vaddr, uint64_t size) {
+		constexpr uint64_t Chunk = uint64_t {16} << 20u;
+		for (uint64_t at = vaddr, end = vaddr + size; at < end;) {
+			const uint64_t next = std::min(end, (at & ~(Chunk - 1u)) + Chunk);
+			{
+				ExclusiveLock lock(m_mutex);
+				m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(at, next - at); });
+				m_busy.emplace_back(at, next);
+			}
+			(void)VirtualUnlock(reinterpret_cast<void*>(at), next - at);
+			{
+				ExclusiveLock lock(m_mutex);
+				EraseBusyUnlocked(at, next);
+			}
+			m_busy_done.notify_all();
+			at = next;
+		}
+	}
+
+private:
+#endif
 
 	// (With m_mutex held shared.) Returns once no map or unmap is changing [vaddr, vaddr + size).
 	void WaitNotBusy(std::shared_lock<std::shared_mutex>& lock, uint64_t vaddr, uint64_t size) {
