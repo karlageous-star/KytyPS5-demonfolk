@@ -91,7 +91,7 @@ inline void InitializePerformanceSwitches() {
 	    // 1: buffer upload copies on the upload worker; 2: image staging copies as well.
 	    Switch {"KYTY_ASYNC_UPLOAD", &kyty_local_async_upload_mode, 0, 2},
 	    Switch {"KYTY_BUFFER_RECLAIM", &kyty_local_buffer_reclaim_mode},
-	    // Default 1; 0 for an A/B: the buffers no binding used for a while are never retired (RetireStaleBuffers).
+	    // Opt-in (default 0): 1 retires the buffers no binding used for a while (RetireStaleBuffers).
 	    Switch {"KYTY_BUFFER_RETIRE", &kyty_local_buffer_retire_mode},
 	    Switch {"KYTY_UNMAP_PROTECT_SKIP", &kyty_local_unmap_protect_skip_mode},
 	    Switch {"KYTY_BDA_DIRTY_REGIONS", &kyty_local_bda_dirty_regions_mode},

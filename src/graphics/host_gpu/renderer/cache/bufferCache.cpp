@@ -40,9 +40,10 @@ volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode {0};
 // 1: shader constants stream through a host-visible upload ring.
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_stream_upload_mode {0};
-// KYTY_BUFFER_RETIRE (performance-switches.h): 1 retires the buffers no binding used for a while
-// (RetireStaleBuffers); 0 never retires one.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_buffer_retire_mode {1};
+// KYTY_BUFFER_RETIRE (performance-switches.h, opt-in): 1 retires the buffers no binding used for a while
+// (RetireStaleBuffers); 0 (default) never retires one. Opt-in: a buffer read only through the BDA page table can be
+// retired, and its next read faults back and reads zeros once (chenxiao saw bda_fault_pages ~0).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_buffer_retire_mode {0};
 extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 }
 
