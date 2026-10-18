@@ -23,6 +23,7 @@ volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_slots_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_upload_mode {0};
 extern volatile std::atomic<uint32_t> kyty_local_target_ram_trim_mode; // (textureCache.cpp)
+extern volatile std::atomic<uint32_t> kyty_local_transfer_chain_mode; // (context.cpp)
 // 1: RangeSet fast paths (rangeSet.h) for the GPU-modified range set.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_range_set_fast_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_reprotect_mode {0};
@@ -1796,6 +1797,21 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			return;
 		}
 		command.EndRendering();
+		// KYTY_TRANSFER_CHAIN (live): the upload joins the run of transfers recorded back to back, which share one
+		// barrier ahead (everything before, at any stage, before the transfers) and one after (drained by the next
+		// Handle()): the same order as the pair below, without two full drains an upload. A heavy 1-1 scene recorded
+		// ~440 uploads a frame with 880 barriers, and ~570 more around buffer copies (census, OWNER3 10-19).
+		if (kyty_local_transfer_chain_mode.load(std::memory_order_relaxed) != 0) {
+			thread_local std::vector<CommandBuffer::TransferAccess> accesses;
+			accesses.clear();
+			for (const auto& copy: copies) {
+				accesses.push_back({static_cast<VkBuffer>(buffer.Handle()), copy.dstOffset, copy.dstOffset + copy.size,
+				                    true});
+			}
+			command.TransferHandle(accesses).copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+			                                            copies.data());
+			return;
+		}
 		const auto native = command.Handle();
 		vk::BufferMemoryBarrier before {};
 		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
