@@ -22,6 +22,7 @@ volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_write_readback_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_slots_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_upload_mode {0};
+extern volatile std::atomic<uint32_t> kyty_local_target_ram_trim_mode; // (textureCache.cpp)
 // 1: RangeSet fast paths (rangeSet.h) for the GPU-modified range set.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_range_set_fast_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_reprotect_mode {0};
@@ -2495,9 +2496,60 @@ bool BufferCache::MoveSpilledBufferBack(bool bda_frame) {
 	return true;
 }
 
+// KYTY_TARGET_RAM_TRIM: every 60 flips, the guest pages under GPU-written ranges of 1 MiB or more leave the working set
+// (TrimGuestWorkingSet, both views; on the upload worker). The GPU holds newer bytes there: the guest copy is read
+// back before the CPU sees it, and the buffer cache never uploads over GPU-written bytes, so once out the pages stay
+// out. Each part is asked once while it stays GPU-written. S32 (10-18): 470-480 MiB of such pages resident through
+// the backing view only.
+void BufferCache::TrimGpuWrittenRanges() {
+	constexpr uint64_t Page = 4096;
+	RangeSet           still;
+	std::vector<std::pair<uint64_t, uint64_t>> fresh;
+	m_gpu_modified_ranges.ForEach([&](uint64_t begin, uint64_t end) {
+		if (end - begin < (uint64_t {1} << 20u)) return;
+		const uint64_t first = (begin + Page - 1) & ~(Page - 1);
+		const uint64_t last  = end & ~(Page - 1);
+		if (last <= first) return;
+		uint64_t at = first;
+		m_trimmed_gpu_ranges.ForEachIntersection(first, last - first, [&](const RangeSet::Range& range) {
+			if (range.address > at) fresh.emplace_back(at, range.address);
+			still.Add(range.address, range.size);
+			at = std::max(at, range.address + range.size);
+		});
+		if (at < last) fresh.emplace_back(at, last);
+	});
+	uint64_t asked = 0;
+	const bool async = kyty_local_async_upload_mode.load(std::memory_order_relaxed) >= 2;
+	for (const auto& [begin, end]: fresh) {
+		still.Add(begin, end - begin);
+		asked += end - begin;
+		if (async) {
+			AsyncUpload::Get().PushCall(
+			    [](void*, uint64_t vaddr, uint64_t bytes) { LibKernel::Memory::TrimGuestWorkingSet(vaddr, bytes); },
+			    nullptr, begin, end - begin, begin, end - begin);
+		} else {
+			LibKernel::Memory::TrimGuestWorkingSet(begin, end - begin);
+		}
+	}
+	m_trimmed_gpu_ranges = std::move(still);
+	if (asked == 0) return;
+	if (async) AsyncUpload::Get().Kick();
+	static uint64_t next_report = 0;
+	m_trimmed_gpu_bytes += asked;
+	if (m_trimmed_gpu_bytes >= next_report) {
+		next_report = m_trimmed_gpu_bytes + (uint64_t {1} << 30u);
+		std::printf("Buffer RAM trim: %llu MiB of GPU-written buffer ranges' guest pages asked out of RAM so far\n",
+		            static_cast<unsigned long long>(m_trimmed_gpu_bytes >> 20u));
+		std::fflush(stdout);
+	}
+}
+
 void BufferCache::RunGarbageCollector(bool collect) {
 	const auto tick = m_gc_tick++;
 	RetireStaleBuffers(tick);
+	if (tick % 60 == 30 && kyty_local_target_ram_trim_mode.load(std::memory_order_relaxed) != 0) {
+		TrimGpuWrittenRanges();
+	}
 	// The game buffers in system memory are looked at every 60 flips, collection or not. collect is false in a
 	// frame whose shaders read guest memory through the BDA page table (GpuResourceManager::AdvanceFrame).
 	// Before the early return below.

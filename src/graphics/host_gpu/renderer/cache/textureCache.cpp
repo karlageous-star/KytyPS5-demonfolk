@@ -1538,6 +1538,7 @@ void TextureCache::TrimUploadedTexture(Image& image, bool cpu_written_only) {
 	const uint64_t frame        = m_frame.load(std::memory_order_relaxed);
 	const bool     recently     = image.frame_uploaded_last != UINT64_MAX && frame - image.frame_uploaded_last < 64;
 	image.frame_uploaded_last  = frame;
+	image.frame_target_trimmed = 0; // (the upload read its guest pages back in: a GPU-written target is trimmed again)
 	if (!enabled || !cpu_written_only || recently || image.info.data.size < (1u << 20) ||
 	    image.usage.render_target || image.usage.depth_target || image.usage.storage || image.IsGpuModified() ||
 	    image.depth_id) {
@@ -1563,14 +1564,16 @@ void TextureCache::TrimUploadedTexture(Image& image, bool cpu_written_only) {
 }
 
 void TextureCache::TrimGpuTargets() {
-	constexpr uint64_t Every     = 600;                   // frames between two trims of one image
+	// Once an image: only the emulator's own upload or download of it brings its pages back, and those re-arm it
+	// (frame_target_trimmed = 0). S32: re-asking every image each 600 frames asked 59 GB in 5 minutes (each ask holds
+	// its guest ranges busy) and moving got slower (27.8 vs 32.2 FPS, 100 frames over 50 ms).
 	constexpr uint64_t PassBytes = uint64_t {256} << 20u; // asked at most a pass
 	const uint64_t     frame     = m_frame.load(std::memory_order_relaxed) + 1;
 	uint64_t           asked     = 0;
 	m_slot_images.ForEach([&](ImageId /*id*/, Image& image) {
 		if (asked >= PassBytes || !image.registered || !image.IsGpuModified() || image.info.data.size < (1u << 20u) ||
 		    !(image.usage.render_target || image.usage.depth_target || image.usage.storage) ||
-		    (image.frame_target_trimmed != 0 && frame - image.frame_target_trimmed < Every)) {
+		    image.frame_target_trimmed != 0) {
 			return;
 		}
 		image.frame_target_trimmed = frame;
@@ -3981,6 +3984,7 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 	if (!plan.valid || !SafeToDownload(image)) {
 		return false;
 	}
+	image.frame_target_trimmed = 0; // (the download writes its guest pages: trimmed again at a later pass)
 	const auto range    = image.info.data;
 	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
 	// (Larger than the download buffer, it could not be mapped: not downloaded, and kept by the caller.)

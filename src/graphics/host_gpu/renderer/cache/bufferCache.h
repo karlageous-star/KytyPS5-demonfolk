@@ -280,6 +280,11 @@ private:
 	std::vector<SyncStamp>  m_old_sync_stamps;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	// KYTY_TARGET_RAM_TRIM: the page-aligned parts of GPU-written ranges whose guest pages were asked out of the
+	// working set, kept to what is still GPU-written (TrimGpuWrittenRanges).
+	RangeSet m_trimmed_gpu_ranges;
+	uint64_t m_trimmed_gpu_bytes = 0;
+	void     TrimGpuWrittenRanges();
 	// Moves whenever m_gpu_modified_ranges loses bytes (readbacks, copy feedback, downloads, forward copies: CPU
 	// writes and unmaps go through those first). GPU thread.
 	uint64_t m_gpu_coverage_epoch = 1;
