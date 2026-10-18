@@ -294,6 +294,8 @@ void GpuResourceManager::RefreshBdaRanges() {
 bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges) {
 	if (ranges.empty() || ranges.size() > 128 ||
 	    std::ranges::any_of(ranges, [](const auto& range) { return !range.Valid(); })) return false;
+	// (Before the lock: making buffers asks for it.)
+	m_buffer_cache.EnsureBdaReadable(ranges);
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	RefreshBdaRanges();
 	LiveCounters::Add(LiveCounters::BdaRangeCalls);

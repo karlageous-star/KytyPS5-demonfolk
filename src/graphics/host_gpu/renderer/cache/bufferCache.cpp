@@ -1924,6 +1924,40 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	return handle;
 }
 
+// A read through a pointer into memory no buffer holds misses the GPU's page table: it reads nothing (zeros) and leaves
+// a fault, which gets those pages a buffer only once the submission's faults are processed (FaultManager). A Bink video's
+// first decode read its blocks' flags that way, and the frames predicted from it kept the error until the video looped
+// (issue #52: the archstone preview's colours wrong for 10 s whenever the decoder's memory was new to the GPU). So the
+// start of each range a dispatch or a draw reads through pointers - 64 KiB from its base, its offsets known or not - is
+// given a buffer with the guest's bytes before the work is recorded (GpuResourceManager::PrepareBdaReadRanges).
+void BufferCache::EnsureBdaReadable(std::span<const GuestRange> ranges) {
+	constexpr uint64_t HeadBytes = uint64_t {64} << 10u;
+	const auto         held      = [this](uint64_t page) {
+		const auto* owner = m_page_table.Find(page);
+		return owner != nullptr && *owner;
+	};
+	for (const auto& range: ranges) {
+		const auto last = (range.address + std::min(range.size, HeadBytes) - 1) >> PageTable::kPageBits;
+		for (auto page = range.address >> PageTable::kPageBits; page <= last;) {
+			if (held(page)) {
+				++page;
+				continue;
+			}
+			// (One buffer for a run of such pages.)
+			auto end = page + 1;
+			while (end <= last && !held(end)) ++end;
+			const auto begin = page << PageTable::kPageBits, bytes = (end - page) << PageTable::kPageBits;
+			if (IsGpuMapped(begin, bytes) && LibKernel::Memory::IsFullyMapped(begin, bytes)) {
+				auto& buffer    = m_slot_buffers[FindBuffer(begin, bytes)];
+				buffer.bda_read = true;
+				TouchBuffer(buffer);
+				(void)SynchronizeBuffer(buffer, begin, bytes, false, false);
+			}
+			page = end;
+		}
+	}
+}
+
 BufferId BufferCache::EnsureBufferContents(uint64_t vaddr, uint64_t size) {
 	const auto id     = FindBuffer(vaddr, size);
 	auto&      buffer = m_slot_buffers[id];
