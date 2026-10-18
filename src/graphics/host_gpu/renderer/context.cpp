@@ -33,9 +33,10 @@
 #endif
 
 extern "C" {
-// KYTY_TRANSFER_CHAIN (default 0; live): independent buffer copies recorded back to back share one barrier ahead and one
-// after (CommandBuffer::TransferHandle).
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_transfer_chain_mode {0};
+// KYTY_TRANSFER_CHAIN (default 1 since S36, 10-19; live; 0: a barrier pair each): independent buffer copies and uploads
+// recorded back to back share one barrier ahead and one after (CommandBuffer::TransferHandle). S36 in-session: +0.31
+// FPS, render thread -0.3 ms a frame, barriers 2,405 -> 2,160 a frame with KYTY_DISPATCH_BARRIER_MERGE.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_transfer_chain_mode {1};
 // KYTY_COPY_BATCH (default 0; live): a run of independent small guest linear copies made by one compute dispatch
 // (CommandBuffer::BatchCopy).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_copy_batch_mode {0};
