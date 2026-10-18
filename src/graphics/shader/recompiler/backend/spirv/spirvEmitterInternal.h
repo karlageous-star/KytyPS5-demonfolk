@@ -83,6 +83,7 @@ enum : uint32_t {
 	DecorationNoPerspective = 13,
 	DecorationFlat          = 14,
 	DecorationAliased       = 20,
+	DecorationNonWritable   = 24,
 	DecorationLocation      = 30,
 	DecorationArrayStride   = 6,
 	DecorationBinding       = 33,
