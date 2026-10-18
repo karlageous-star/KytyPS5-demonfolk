@@ -549,12 +549,36 @@ struct PipelineCache::ProgramCache {
 		});
 	}
 
+	// While the PC has less physical memory left than KYTY_PREFETCH_MIN_AVAIL_MB (default 1024 MiB; free and standby,
+	// Linux MemAvailable), the prefetch makes none of the programs play has not met (they are for later): its
+	// translations, SPIR-V and plan file add to the paging the PC is doing then, the game loading beside it on 16 GB
+	// (issue #50: a bug check 0x1A in a protection change of the game's memory, while a level loaded with the prefetch
+	// translating 20,000 programs). Programs play meets are still translated by play (PrefetchedGroup). False once the
+	// prefetch stops.
+	static bool WaitForMemory(Prefetch& p) {
+		static const uint64_t minimum = [] {
+			const char* value = std::getenv("KYTY_PREFETCH_MIN_AVAIL_MB");
+			return (value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {1024}) << 20u;
+		}();
+		static std::atomic<uint32_t> reports {0};
+		bool                         waited = false;
+		while (!p.stop.load(std::memory_order_relaxed)) {
+			const uint64_t available = LocalPlatform::AvailablePhysicalMemory();
+			if (available == 0 || available >= minimum) return true;
+			if (!waited && reports.fetch_add(1, std::memory_order_relaxed) < 8)
+				PipelineCacheLog("Shader prefetch: waits, {} MiB of physical memory left (below {} MiB)", available >> 20u,
+				                 minimum >> 20u);
+			waited = true;
+			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+		}
+		return false;
+	}
+
 	void PrefetchWork() {
 		LocalPlatform::SetThreadName("Kyty.Prefetch");
 		LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
 		auto& p = *prefetch;
-		for (size_t n; !p.stop.load(std::memory_order_relaxed) &&
-		               (n = p.next.fetch_add(1, std::memory_order_relaxed)) < p.groups.size();) {
+		for (size_t n; WaitForMemory(p) && (n = p.next.fetch_add(1, std::memory_order_relaxed)) < p.groups.size();) {
 			auto& group    = *p.groups[n];
 			auto  expected = static_cast<uint8_t>(Prefetch::Pending);
 			if (group.state.compare_exchange_strong(expected, Prefetch::Running, std::memory_order_acq_rel)) {

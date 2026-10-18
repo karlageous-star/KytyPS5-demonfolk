@@ -58,6 +58,8 @@ void MakeCriticalThread();
 
 // The PC's physical memory in bytes; 0 when unknown.
 uint64_t PhysicalMemory();
+// The physical memory the system can still give without paging (free and standby; Linux: MemAvailable). 0: unknown.
+uint64_t AvailablePhysicalMemory();
 
 // This process's committed read-write private memory at or above `min_address` leaves its working set (Windows:
 // VirtualUnlock on pages that are not locked). The pages keep their contents: the pagefile holds them once Windows

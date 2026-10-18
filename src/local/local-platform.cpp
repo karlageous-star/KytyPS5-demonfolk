@@ -387,6 +387,12 @@ uint64_t PhysicalMemory() {
 	return GlobalMemoryStatusEx(&status) != 0 ? status.ullTotalPhys : 0;
 }
 
+uint64_t AvailablePhysicalMemory() {
+	MEMORYSTATUSEX status {};
+	status.dwLength = sizeof(status);
+	return GlobalMemoryStatusEx(&status) != 0 ? status.ullAvailPhys : 0;
+}
+
 uint64_t TrimPrivateWorkingSet(uint64_t min_address) {
 	uint64_t                 asked = 0;
 	MEMORY_BASIC_INFORMATION info {};
@@ -585,6 +591,22 @@ uint64_t PhysicalMemory() {
 	const long pages = sysconf(_SC_PHYS_PAGES);
 	const long size  = sysconf(_SC_PAGE_SIZE);
 	return pages > 0 && size > 0 ? static_cast<uint64_t>(pages) * static_cast<uint64_t>(size) : 0;
+}
+
+uint64_t AvailablePhysicalMemory() {
+	uint64_t available = 0;
+	if (FILE* file = std::fopen("/proc/meminfo", "r")) {
+		char line[256];
+		while (std::fgets(line, sizeof(line), file) != nullptr) {
+			unsigned long long kib = 0;
+			if (std::sscanf(line, "MemAvailable: %llu kB", &kib) == 1) {
+				available = static_cast<uint64_t>(kib) << 10u;
+				break;
+			}
+		}
+		std::fclose(file);
+	}
+	return available;
 }
 
 uint64_t TrimPrivateWorkingSet(uint64_t /*min_address*/) {
