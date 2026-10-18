@@ -1133,7 +1133,8 @@ const char* RenderExecutor::NativeXprBindResources(NativeXprRecord& record,
 						const auto aligned    = offset - offset % alignment;
 						const auto adjustment = offset - aligned;
 						if (adjustment < 256) {
-							prepared->buffers[i] = {resolved->Handle(), aligned, source.size + adjustment};
+							prepared->buffers[i] = {resolved->Handle(), aligned,
+							                        ShaderRecompiler::StorageBufferRange(source.size + adjustment)};
 							auto& word = prepared->shader_data[program.bindings.memory_offset_dword + i / 4u];
 							const auto shift = (i % 4u) * 8u;
 							word = (word & ~(0xffu << shift)) | (static_cast<uint32_t>(adjustment) << shift);
@@ -1472,7 +1473,7 @@ bool RenderExecutor::NativeXprRebindSlots(NativeXprRecord& record,
 		const auto aligned    = offset - offset % alignment;
 		const auto adjustment = offset - aligned;
 		if (adjustment >= 256 || size > max_range - adjustment) return false;
-		fresh_buffers[i] = {{owner->Handle(), aligned, size + adjustment},
+		fresh_buffers[i] = {{owner->Handle(), aligned, ShaderRecompiler::StorageBufferRange(size + adjustment)},
 		                    static_cast<uint32_t>(adjustment),
 		                    {address, size, id, owner->Handle(), resource.formatted, st, index}};
 	}

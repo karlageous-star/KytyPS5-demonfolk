@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -169,7 +170,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		     static_cast<uint64_t>(alignment), adjustment, static_cast<uint64_t>(max_range));
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
-	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
+	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset,
+	                                       ShaderRecompiler::StorageBufferRange(size + adjustment)};
 	if (resource.formatted && resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size, "storage-buffer");
 	}

@@ -836,11 +836,19 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		properties.pNext = &robustness2_properties;
 		physical_device.getProperties2(&properties);
 		const char* setting  = std::getenv("KYTY_ROBUST_BUFFERS");
-		device_buffer_bounds = robustness2_properties.robustStorageBufferAccessSizeAlignment == 1 &&
+		// KYTY_DWORD_BOUNDS=1: 4-byte device bounds stand for the shaders' checks too, with every guest storage
+		// buffer range bound in whole dwords (ShaderRecompiler::StorageBufferRange).
+		const char* dwords       = std::getenv("KYTY_DWORD_BOUNDS");
+		const bool  dword_bounds = robustness2_properties.robustStorageBufferAccessSizeAlignment == 4 &&
+		                          dwords != nullptr && std::string_view(dwords) == "1";
+		device_buffer_bounds = (robustness2_properties.robustStorageBufferAccessSizeAlignment == 1 || dword_bounds) &&
 		                       !(setting != nullptr && std::string_view(setting) == "0");
+		ShaderRecompiler::SetStorageRangeDwords(device_buffer_bounds && dword_bounds);
 	}
 	ShaderRecompiler::SetDeviceStorageBufferBounds(device_buffer_bounds);
 	LOGF("Vulkan storage buffer bounds: %s\n", device_buffer_bounds ? "device" : "shader");
+	std::printf("Vulkan storage buffer bounds: %s%s\n", device_buffer_bounds ? "device" : "shader",
+	            ShaderRecompiler::StorageRangeDwords() ? " (dword ranges)" : "");
 	// Shader bounds (AMD: 4-byte device alignment) without the branch around each load: robustBufferAccess
 	// (always enabled) keeps a load in memory, and a select applies the bounds. KYTY_BUFFER_LOAD_SELECT=0 branches
 	// (S1, tunnel at 1080p: GPU 36.2 -> 31.8 ms a frame, 24.5 -> 26.3 FPS).

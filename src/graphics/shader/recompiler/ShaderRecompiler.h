@@ -55,6 +55,18 @@ void SetDeviceStorageBufferBounds(bool enabled);
 // select gives zero outside the shader's own bounds check, the same value. Set with the device.
 void SetSpeculativeBufferLoads(bool enabled);
 
+// KYTY_DWORD_BOUNDS: the device's bounds are 4-byte (AMD: robustStorageBufferAccessSizeAlignment 4) and stand for the
+// shaders' own checks (SetDeviceStorageBufferBounds) because every guest storage buffer range is bound rounded down to
+// whole dwords (StorageBufferRange): the shaders' checks compare dword indices with OpArrayLength, floor(range / 4),
+// and the device then drops exactly the same accesses. Set with the device.
+void SetStorageRangeDwords(bool enabled);
+[[nodiscard]] bool StorageRangeDwords();
+// A guest storage buffer descriptor's range (bytes from the aligned offset), rounded down to whole dwords where the
+// device's bounds need it. (A range under 4 bytes stays: the device rounds it up to one dword.)
+[[nodiscard]] inline uint64_t StorageBufferRange(uint64_t range) {
+	return StorageRangeDwords() && range >= 4 ? range & ~uint64_t {3} : range;
+}
+
 [[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
                                                const CompileOptions& options);
 [[nodiscard]] CompileResult CompileProgram(TranslateResult translated,

@@ -196,6 +196,7 @@ uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess&
 namespace {
 std::atomic<bool> g_device_storage_buffer_bounds {false};
 std::atomic<bool> g_speculative_buffer_loads {false};
+std::atomic<bool> g_storage_range_dwords {false};
 } // namespace
 
 bool DeviceStorageBufferBounds(IR::ResourceKind kind) {
@@ -612,6 +613,14 @@ void SetDeviceStorageBufferBounds(bool enabled) {
 
 void SetSpeculativeBufferLoads(bool enabled) {
 	Spirv::Emitter::g_speculative_buffer_loads.store(enabled, std::memory_order_relaxed);
+}
+
+void SetStorageRangeDwords(bool enabled) {
+	Spirv::Emitter::g_storage_range_dwords.store(enabled, std::memory_order_relaxed);
+}
+
+bool StorageRangeDwords() {
+	return Spirv::Emitter::g_storage_range_dwords.load(std::memory_order_relaxed);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler
