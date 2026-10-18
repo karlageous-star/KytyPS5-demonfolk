@@ -39,6 +39,9 @@ extern "C" {
 // KYTY_COPY_BATCH (default 0; live): a run of independent small guest linear copies made by one compute dispatch
 // (CommandBuffer::BatchCopy).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_copy_batch_mode {0};
+// KYTY_UPLOAD_BATCH (default 0; live): a run of small buffer uploads (BufferCache::UploadDirtyRanges, up to 256 KiB each)
+// made by one compute dispatch from the staging ring (CommandBuffer::BatchCopies).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_upload_batch_mode {0};
 }
 
 namespace Libs::Graphics {
@@ -154,29 +157,49 @@ const CopyBatchPipeline& GetCopyBatchPipeline(vk::Device device) {
 	return created;
 }
 
-constexpr uint64_t CopyBatchMaxBytes  = 64 * 1024; // a workgroup's loop: 256 dwords a thread at most
+constexpr uint64_t CopyBatchPiece     = 4 * 1024; // a workgroup's copy: 16 dwords a thread
 constexpr size_t   CopyBatchMaxCopies = 1024;
 } // namespace
 
 bool CommandBuffer::BatchCopy(const Buffer& source, uint64_t source_offset, const Buffer& destination,
                               uint64_t destination_offset, uint64_t size) const {
-	if (kyty_local_copy_batch_mode.load(std::memory_order_relaxed) == 0 || IsInvalid() || size == 0 ||
-	    size > CopyBatchMaxBytes || ((source_offset | destination_offset | size) & 3u) != 0) {
+	if (kyty_local_copy_batch_mode.load(std::memory_order_relaxed) == 0 || size > 64 * 1024) return false;
+	const vk::BufferCopy region {source_offset, destination_offset, size};
+	return BatchCopies(source, destination, std::span {&region, 1});
+}
+
+bool CommandBuffer::BatchCopies(const Buffer& source, const Buffer& destination,
+                                std::span<const vk::BufferCopy> regions) const {
+	if (IsInvalid() || regions.empty() || !source.HasDeviceAddress() || !destination.HasDeviceAddress()) {
 		return false;
 	}
-	if (!source.HasDeviceAddress() || !destination.HasDeviceAddress()) return false;
+	size_t   pieces            = 0;
+	uint64_t source_begin      = UINT64_MAX;
+	uint64_t source_end        = 0;
+	uint64_t destination_begin = UINT64_MAX;
+	uint64_t destination_end   = 0;
+	for (const auto& region: regions) {
+		if (region.size == 0 || ((region.srcOffset | region.dstOffset | region.size) & 3u) != 0) return false;
+		pieces += (region.size + CopyBatchPiece - 1) / CopyBatchPiece;
+		source_begin      = std::min(source_begin, region.srcOffset);
+		source_end        = std::max(source_end, region.srcOffset + region.size);
+		destination_begin = std::min(destination_begin, region.dstOffset);
+		destination_end   = std::max(destination_end, region.dstOffset + region.size);
+	}
+	if (pieces > CopyBatchMaxCopies) return false;
 	const auto source_address      = source.BufferDeviceAddress();
 	const auto destination_address = destination.BufferDeviceAddress();
 	EndRendering(); // (a rendering's Handle() left no batch)
+	// The regions' extents (one pair, not one per region: a run's regions are disjoint).
 	const TransferAccess accesses[] = {
-	    {static_cast<VkBuffer>(source.Handle()), source_offset, source_offset + size, false},
-	    {static_cast<VkBuffer>(destination.Handle()), destination_offset, destination_offset + size, true},
+	    {static_cast<VkBuffer>(source.Handle()), source_begin, source_end, false},
+	    {static_cast<VkBuffer>(destination.Handle()), destination_begin, destination_end, true},
 	};
 	if (m_copy_batch.empty()) {
 		// Whatever else is pending (a compute chain's barrier, a transfer chain's) first, then the batch alone.
 		(void)Handle();
 	} else {
-		bool conflict = m_copy_batch.size() >= CopyBatchMaxCopies;
+		bool conflict = m_copy_batch.size() + pieces > CopyBatchMaxCopies;
 		for (const auto& pending: m_copy_batch_access) {
 			for (const auto& access: accesses) {
 				conflict = conflict || (pending.buffer == access.buffer && (pending.written || access.written) &&
@@ -186,11 +209,17 @@ bool CommandBuffer::BatchCopy(const Buffer& source, uint64_t source_offset, cons
 		// A copy touching what an earlier one writes (or writing what one reads) runs after them.
 		if (conflict) FlushCopyBatch();
 	}
-	m_copy_batch.push_back({source_address + source_offset, destination_address + destination_offset,
-	                        static_cast<uint32_t>(size / 4), 0});
-	m_copy_batch_buffers.push_back({accesses[0].buffer, accesses[1].buffer, source_offset, destination_offset, size});
+	for (const auto& region: regions) {
+		for (uint64_t at = 0; at < region.size; at += CopyBatchPiece) {
+			const auto size = std::min(CopyBatchPiece, region.size - at);
+			m_copy_batch.push_back({source_address + region.srcOffset + at, destination_address + region.dstOffset + at,
+			                        static_cast<uint32_t>(size / 4), 0});
+			m_copy_batch_buffers.push_back(
+			    {accesses[0].buffer, accesses[1].buffer, region.srcOffset + at, region.dstOffset + at, size});
+		}
+	}
 	m_copy_batch_access.insert(m_copy_batch_access.end(), std::begin(accesses), std::end(accesses));
-	LiveCounters::Add(LiveCounters::BatchedCopies);
+	LiveCounters::Add(LiveCounters::BatchedCopies, regions.size());
 	return true;
 }
 

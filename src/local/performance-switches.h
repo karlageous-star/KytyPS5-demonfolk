@@ -33,6 +33,7 @@ extern volatile std::atomic<uint32_t> kyty_local_flush_defer_mode;
 extern volatile std::atomic_uint32_t kyty_local_sync_watch_skip_mode;
 extern volatile std::atomic<uint32_t> kyty_local_transfer_chain_mode;
 extern volatile std::atomic<uint32_t> kyty_local_copy_batch_mode;
+extern volatile std::atomic<uint32_t> kyty_local_upload_batch_mode;
 extern volatile std::atomic<uint32_t> kyty_local_fault_scan_frame_mode;
 extern volatile std::atomic<uint32_t> kyty_local_precise_access_mode;
 extern volatile std::atomic_uint32_t kyty_local_chain_bda_reads_mode;
@@ -146,6 +147,7 @@ inline void InitializePerformanceSwitches() {
 	    // Opt-in (default 0): independent buffer copies recorded back to back share one barrier ahead and one after.
 	    Switch {"KYTY_TRANSFER_CHAIN", &kyty_local_transfer_chain_mode},
 	    Switch {"KYTY_COPY_BATCH", &kyty_local_copy_batch_mode},
+	    Switch {"KYTY_UPLOAD_BATCH", &kyty_local_upload_batch_mode},
 	    Switch {"KYTY_FAULT_SCAN_FRAME", &kyty_local_fault_scan_frame_mode},
 	    Switch {"KYTY_PRECISE_ACCESS", &kyty_local_precise_access_mode},
 	    // 1: a compute dispatch that reads memory only through pointers chains on its BDA read ranges.

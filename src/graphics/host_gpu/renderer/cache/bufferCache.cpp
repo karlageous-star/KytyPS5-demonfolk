@@ -48,6 +48,7 @@ volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode {0};
 // not for all GPU work; 0 (default) is the full drain. A live switch, for an in-session A/B.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_upload_barrier_mode {0};
 extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
+extern volatile std::atomic<uint32_t> kyty_local_upload_batch_mode; // context.cpp
 }
 
 #include "common/assert.h"
@@ -1350,7 +1351,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                              BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
-      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, UploadRingSize()),
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, UploadRingSize(),
+                       AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress), // KYTY_UPLOAD_BATCH
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_host_shader_upload(graphics, scheduler, MemoryUsage::Upload, 64 * MiB),
       m_table_upload(graphics, scheduler, MemoryUsage::Upload, 32 * MiB,
@@ -1785,6 +1787,12 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			NoteGpuWrite(buffer.CpuAddress() + copy.dstOffset, copy.size, GpuWriteOrigin::CpuUpload);
 		}
 		auto& command = m_scheduler.Current();
+		// KYTY_UPLOAD_BATCH: a small upload from the staging ring joins the run one compute dispatch makes (190 of the
+		// tunnel's 438 upload copies a frame came in runs of 32 and more, ~4 us each with a barrier between).
+		if (kyty_local_upload_batch_mode.load(std::memory_order_relaxed) != 0 && source == m_staging_buffer.Handle() &&
+		    total_size <= 256 * 1024 && command.BatchCopies(m_staging_buffer, buffer, copies)) {
+			return;
+		}
 		command.EndRendering();
 		const auto native = command.Handle();
 		vk::BufferMemoryBarrier before {};

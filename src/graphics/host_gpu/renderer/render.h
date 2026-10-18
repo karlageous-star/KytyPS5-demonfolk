@@ -170,6 +170,10 @@ public:
 	// False: not batched (the caller copies as before).
 	[[nodiscard]] bool BatchCopy(const Buffer& source, uint64_t source_offset, const Buffer& destination,
 	                             uint64_t destination_offset, uint64_t size) const;
+	// The same for disjoint regions between two buffers with device addresses (dword-aligned; split in 4 KiB pieces, at
+	// most 1,024): KYTY_UPLOAD_BATCH's uploads from the staging ring. False: not batched.
+	[[nodiscard]] bool BatchCopies(const Buffer& source, const Buffer& destination,
+	                               std::span<const vk::BufferCopy> regions) const;
 
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
