@@ -50,6 +50,11 @@ struct CompileResult {
 // zero out of bounds and drops the stores. Set with the device, before any program compiles.
 void SetDeviceStorageBufferBounds(bool enabled);
 
+// Storage buffer loads without a branch around them where the device's bounds are not byte-exact
+// (AMD: 4-byte) but robust buffer access keeps every load in memory: the load runs for every lane, and a
+// select gives zero outside the shader's own bounds check, the same value. Set with the device.
+void SetSpeculativeBufferLoads(bool enabled);
+
 [[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
                                                const CompileOptions& options);
 [[nodiscard]] CompileResult CompileProgram(TranslateResult translated,

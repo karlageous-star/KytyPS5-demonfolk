@@ -195,11 +195,17 @@ uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess&
 
 namespace {
 std::atomic<bool> g_device_storage_buffer_bounds {false};
+std::atomic<bool> g_speculative_buffer_loads {false};
 } // namespace
 
 bool DeviceStorageBufferBounds(IR::ResourceKind kind) {
 	return (kind == IR::ResourceKind::Buffer || kind == IR::ResourceKind::ScalarBuffer) &&
 	       g_device_storage_buffer_bounds.load(std::memory_order_relaxed);
+}
+
+bool SpeculativeBufferLoads(IR::ResourceKind kind) {
+	return (kind == IR::ResourceKind::Buffer || kind == IR::ResourceKind::ScalarBuffer) &&
+	       g_speculative_buffer_loads.load(std::memory_order_relaxed);
 }
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
@@ -602,6 +608,10 @@ namespace Libs::Graphics::ShaderRecompiler {
 
 void SetDeviceStorageBufferBounds(bool enabled) {
 	Spirv::Emitter::g_device_storage_buffer_bounds.store(enabled, std::memory_order_relaxed);
+}
+
+void SetSpeculativeBufferLoads(bool enabled) {
+	Spirv::Emitter::g_speculative_buffer_loads.store(enabled, std::memory_order_relaxed);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler

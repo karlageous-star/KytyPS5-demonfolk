@@ -735,6 +735,9 @@ uint32_t EmitMemoryElementInBoundsExplicit(EmitterState& state, const MemoryReso
                                            uint32_t index);
 // Storage buffer accesses of this kind are bounds-checked by the device (SetDeviceStorageBufferBounds).
 bool DeviceStorageBufferBounds(IR::ResourceKind kind);
+// Storage buffer loads of this kind run for every lane, unbranched (SetSpeculativeBufferLoads): robust
+// buffer access keeps them in memory, and a select drops the lanes outside the bounds.
+bool SpeculativeBufferLoads(IR::ResourceKind kind);
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index);
@@ -885,6 +888,18 @@ template <typename Fn>
 uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 	return EmitValueOrDefaultIfCondition(state, condition, TypeU32(state), ConstantU32(state, 0),
 	                                     std::forward<Fn>(fn));
+}
+
+// A storage buffer load's dword, zero where the condition fails. A speculative load
+// (SpeculativeBufferLoads) is not branched around, so loads issue together; a select applies the condition.
+template <typename Fn>
+uint32_t EmitLoadOrZeroIfCondition(EmitterState& state, IR::ResourceKind kind, uint32_t condition,
+                                   Fn&& fn) {
+	if (condition == ConstantBool(state, true) || !SpeculativeBufferLoads(kind)) {
+		return EmitValueOrZeroIfCondition(state, condition, std::forward<Fn>(fn));
+	}
+	const auto value = fn();
+	return Select(state, TypeU32(state), condition, value, ConstantU32(state, 0));
 }
 
 template <typename Fn>

@@ -338,7 +338,7 @@ uint32_t LoadNativeBytes(ValueEmitContext& ctx, const MemoryResourceAccess& reso
 	                             ConstantU32(state, 4u - bits / 8u));
 	const auto high = EmitValueOrZeroIfCondition(state, crosses, [&] {
 		const auto next = Binary(state, OpIAdd, TypeU32(state), index, ConstantU32(state, 1));
-		return EmitValueOrZeroIfCondition(state, EmitMemoryElementInBounds(state, resource, next),
+		return EmitLoadOrZeroIfCondition(state, resource.kind, EmitMemoryElementInBounds(state, resource, next),
 		                                 [&] { return LoadWordInBounds(ctx, resource, next); });
 	});
 	// Mask the count, including aligned effective addresses: no SPIR-V shift by 32.
@@ -363,20 +363,22 @@ uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 		const auto address = ByteAddress(ctx, inst, mem);
 		const auto index = EmitMemoryElementIndex(ctx.state, resource,
 		    Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), address, ConstantU32(ctx.state, 2)));
-		return EmitValueOrZeroIfCondition(ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
+		return EmitLoadOrZeroIfCondition(ctx.state, resource.kind, EmitMemoryElementInBounds(ctx.state, resource, index),
 		    [&] { return LoadNativeBytes(ctx, resource, address, index, 32, false); });
 	}
 	const auto index = EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, mem));
-	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
+	return EmitLoadOrZeroIfCondition(
+	    ctx.state, resource.kind, EmitMemoryElementInBounds(ctx.state, resource, index),
 	    [&]() { return LoadWordInBounds(ctx, resource, index); });
 }
 
-// A load runs for the lanes EXEC enables. A storage buffer load the device bounds needs no guard:
-// a disabled lane loads harmlessly, and its register write (a Select on EXEC) drops the result.
+// A load runs for the lanes EXEC enables. A storage buffer load the device bounds (or keeps in memory:
+// SpeculativeBufferLoads) needs no guard: a disabled lane loads harmlessly, and its register write (a
+// Select on EXEC) drops the result.
 static uint32_t LoadGuard(ValueEmitContext& ctx, const IR::Inst& inst, IR::ResourceKind kind) {
-	return DeviceStorageBufferBounds(kind) ? ConstantBool(ctx.state, true)
-	                                       : ctx.Arg(inst, inst.NumArgs() - 1);
+	return DeviceStorageBufferBounds(kind) || SpeculativeBufferLoads(kind)
+	           ? ConstantBool(ctx.state, true)
+	           : ctx.Arg(inst, inst.NumArgs() - 1);
 }
 
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
@@ -393,8 +395,8 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	const auto raw_index = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), address,
 	                              ConstantU32(ctx.state, 2));
 	const auto index     = EmitMemoryElementIndex(ctx.state, resource, raw_index);
-	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
+	return EmitLoadOrZeroIfCondition(
+	    ctx.state, resource.kind, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
 		    if (NativeByteExact(ctx, mem)) return LoadNativeBytes(ctx, resource, address, index, bits, sign_extend);
 		    return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend);
 	    });
@@ -770,8 +772,8 @@ uint32_t RuntimeFormattedLoadPrepared(ValueEmitContext& ctx, const IR::Inst& ins
 	auto&      state  = ctx.state;
 	const auto format = LoadRuntimeFormat(state, mem);
 	const auto load   = [&](uint32_t index) {
-		return EmitValueOrZeroIfCondition(state, EmitMemoryElementInBounds(state, resource, index),
-		                                  [&]() { return LoadWordInBounds(ctx, resource, index); });
+		return EmitLoadOrZeroIfCondition(state, resource.kind, EmitMemoryElementInBounds(state, resource, index),
+		                                 [&]() { return LoadWordInBounds(ctx, resource, index); });
 	};
 	return EmitSwitchValue(
 	    state, TypeU32(state), format.type,
@@ -1299,6 +1301,27 @@ uint32_t ConstructU32Composite(EmitterState& state, uint32_t components,
 	return result;
 }
 
+// A wide storage buffer load's components, default_value's where the condition fails. A speculative load
+// (SpeculativeBufferLoads) is not branched around: each component selects (no composite OpSelect before SPIR-V 1.4).
+template <typename Fn>
+uint32_t EmitWideLoadOrDefaultIfCondition(EmitterState& state, IR::ResourceKind kind, uint32_t condition,
+                                          uint32_t components, uint32_t default_value, Fn&& fn) {
+	if (condition == ConstantBool(state, true) || !SpeculativeBufferLoads(kind)) {
+		return EmitValueOrDefaultIfCondition(state, condition, TypeU32Composite(state, components),
+		                                     default_value, std::forward<Fn>(fn));
+	}
+	const auto              value = fn();
+	std::array<uint32_t, 4> values {};
+	for (uint32_t component = 0; component < components; component++) {
+		const auto loaded   = state.builder.AllocateId();
+		const auto fallback = state.builder.AllocateId();
+		state.builder.AddFunction({OpCompositeExtract, TypeU32(state), loaded, value, component});
+		state.builder.AddFunction({OpCompositeExtract, TypeU32(state), fallback, default_value, component});
+		values[component] = Select(state, TypeU32(state), condition, loaded, fallback);
+	}
+	return ConstructU32Composite(state, components, values);
+}
+
 uint32_t FormattedOutOfBoundsValue(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                                    const PreparedFormattedMemory& plan, uint32_t components) {
 	std::array<uint32_t, 4> values {};
@@ -1355,8 +1378,8 @@ uint32_t RuntimeWideFormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, c
                                       EmitMemoryElementInBounds(state, resource, located[output].index)));
 			    constants[output] = SelectRuntimeOutput(state, format, selectors[output], ConstantU32(state, 0));
 		    }
-		    return EmitValueOrDefaultIfCondition(
-		        state, in_bounds, composite, ConstructU32Composite(state, components, constants), [&]() {
+		    return EmitWideLoadOrDefaultIfCondition(
+		        state, resource.kind, in_bounds, components, ConstructU32Composite(state, components, constants), [&]() {
 			        std::array<uint32_t, 4> values {};
 			        for (uint32_t output = 0; output < components; output++) {
 				        const auto dword = EmitValueOrZeroIfCondition(state, memory[output], [&]() {
@@ -1382,8 +1405,8 @@ uint32_t LoadWideBufferPrepared(ValueEmitContext& ctx, const IR::Inst& inst, con
 	if (info.type != Format::ComponentType::Unknown) {
 		const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info, components,
 		                                         FormattedAccess::Load);
-		return EmitValueOrDefaultIfCondition(
-		    state, plan.in_bounds, TypeU32Composite(state, components),
+		return EmitWideLoadOrDefaultIfCondition(
+		    state, resource.kind, plan.in_bounds, components,
 		    FormattedOutOfBoundsValue(ctx, mem, plan, components), [&]() {
 			    std::array<uint32_t, 4> values {};
 			    for (uint32_t component = 0; component < components; component++) {
@@ -1648,8 +1671,8 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto access    = PrepareMemoryResourceAccess(state, mem);
 		const auto element   = EmitMemoryElementIndex(state, access, index);
 		const auto condition = EmitMemoryElementInBounds(state, access, element);
-		ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition,
-		                                            [&]() { return LoadWordInBounds(ctx, access, element); }));
+		ctx.Define(inst, EmitLoadOrZeroIfCondition(state, access.kind, condition,
+		                                           [&]() { return LoadWordInBounds(ctx, access, element); }));
 		return true;
 	}
 	const auto address_info = IR::AddressOpcodeInfoOf(op);

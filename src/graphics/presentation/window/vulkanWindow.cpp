@@ -831,6 +831,13 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	}
 	ShaderRecompiler::SetDeviceStorageBufferBounds(device_buffer_bounds);
 	LOGF("Vulkan storage buffer bounds: %s\n", device_buffer_bounds ? "device" : "shader");
+	// Shader bounds (AMD: 4-byte device alignment) without the branch around each load: robustBufferAccess
+	// (always enabled) keeps a load in memory, and a select applies the bounds. KYTY_BUFFER_LOAD_SELECT=1.
+	const char* load_select = std::getenv("KYTY_BUFFER_LOAD_SELECT");
+	const bool  speculative_loads =
+	    !device_buffer_bounds && load_select != nullptr && std::string_view(load_select) == "1";
+	ShaderRecompiler::SetSpeculativeBufferLoads(speculative_loads);
+	std::printf("Vulkan storage buffer loads: %s\n", speculative_loads ? "select" : "branch");
 
 	const bool subgroup_size_control_enabled =
 	    graphics.compute_subgroup_size_control_enabled &&
