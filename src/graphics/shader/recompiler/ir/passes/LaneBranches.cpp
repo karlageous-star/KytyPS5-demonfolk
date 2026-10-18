@@ -125,16 +125,35 @@ LaneBranchStats ConvertLaneBranches(Program& program) {
 			stats.refused_op++;
 			continue;
 		}
-		// What the region hands the merge: a value from before it, or a select on E (a vector register the
-		// region wrote under E). Anything else defined in it (a scalar register) the skipping lanes must see too.
+		// What the region hands the merge, per phi: a select on E whose old value is what the skipping edge carries
+		// (a vector register the region wrote under E), or the skipping edge's own value. Then a lane outside E gets
+		// at the merge what it got when the whole wave ran the region. Anything else (a scalar register the region
+		// wrote, which every lane sees) keeps the uniform branch.
 		for (const auto& inst: merge->Instructions()) {
 			if (inst.GetOpcode() != ValueOpcode::Phi) continue;
-			for (size_t operand = 0; operand < inst.NumArgs() && !refused; operand++) {
-				if (inst.PhiBlock(operand) != region) continue;
-				const Inst* value = InstOf(inst.Arg(operand));
-				refused = value != nullptr && value->Parent() == region &&
-				          !(IsSelect(value->GetOpcode()) && InstOf(value->Arg(0)) == exec_inst);
+			Value from_region, from_branch;
+			bool  have_region = false, have_branch = false;
+			for (size_t operand = 0; operand < inst.NumArgs(); operand++) {
+				if (inst.PhiBlock(operand) == region) {
+					from_region = inst.Arg(operand).Resolve();
+					have_region = true;
+				} else if (inst.PhiBlock(operand) == branch) {
+					from_branch = inst.Arg(operand).Resolve();
+					have_branch = true;
+				}
 			}
+			if (!have_region || !have_branch) {
+				refused = true;
+				break;
+			}
+			const Inst* value = from_region.TryInstruction();
+			if (value != nullptr && value->Parent() == region) {
+				refused = !(IsSelect(value->GetOpcode()) && InstOf(value->Arg(0)) == exec_inst &&
+				            value->Arg(2).Resolve() == from_branch);
+			} else {
+				refused = !(from_region == from_branch);
+			}
+			if (refused) break;
 		}
 		if (refused) {
 			stats.refused_phi++;
