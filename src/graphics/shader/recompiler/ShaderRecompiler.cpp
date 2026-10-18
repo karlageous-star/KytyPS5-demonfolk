@@ -10,6 +10,7 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/LaneBranches.h"
 #include "graphics/shader/recompiler/ir/passes/MaskedSelectForwarding.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -783,6 +784,21 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
+	// KYTY_LANE_BRANCHES=1 (opt-in): a region entered when any lane's exec holds branches on each lane's exec, its selects
+	// on it gone (IR::ConvertLaneBranches). Native wave64 compute only: in a halved wave the branch must stay uniform.
+	static const bool lane_branches = [] {
+		const char* value = std::getenv("KYTY_LANE_BRANCHES");
+		return value != nullptr && value[0] == '1';
+	}();
+	IR::LaneBranchStats lane_branch_stats;
+	if (lane_branches && options.stage == ShaderType::Compute && options.wave_size == 64u) {
+		const auto* workgroup = ShaderWorkgroupInput(options.stage, options.input_info);
+		if (workgroup != nullptr && workgroup->host_subgroup_size == 64u) {
+			lane_branch_stats = IR::ConvertLaneBranches(ir);
+			IR::RemoveIdentities(ir.blocks);
+			IR::EliminateDeadCode(ir.blocks);
+		}
+	}
 
 	const ShaderVertexInputInfo*  vertex  = nullptr;
 	const ShaderPixelInputInfo*   pixel   = nullptr;
@@ -861,10 +877,12 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		for (size_t i = 0; i < std::min<size_t>(kinds.size(), 6); i++)
 			top += fmt::format("{}{}={}", i != 0 ? "," : "", kinds[i].second, kinds[i].first);
 		std::printf("TRANSLATE_STATS stage=%s hash=0x%016" PRIx64 " instructions=%u movrels=%u movreld=%u spirv_words=%zu"
-		            " ir=%u selects=%u phis=%u ballots=%u select_kinds=%s forward=%u/%u/%u\n",
+		            " ir=%u selects=%u phis=%u ballots=%u select_kinds=%s forward=%u/%u/%u lanes=%u/%u/%u/%u/%u\n",
 		            StageName(options.stage), options.shader_hash, translated.stat_instructions, translated.stat_movrels,
 		            translated.stat_movreld, spirv.size(), ir_insts, selects, phis, ballots, top.c_str(),
-		            masked_selects.collapsed, masked_selects.removed, masked_selects.forwarded);
+		            masked_selects.collapsed, masked_selects.removed, masked_selects.forwarded,
+		            lane_branch_stats.converted, lane_branch_stats.candidates, lane_branch_stats.selects,
+		            lane_branch_stats.refused_op, lane_branch_stats.refused_phi);
 	}
 	CompileResult result;
 	result.spirv   = std::move(spirv);
