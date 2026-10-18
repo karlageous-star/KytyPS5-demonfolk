@@ -46,6 +46,28 @@ uint64_t OpenKeptReadFile(const std::string& path, uint64_t* size);
 // Up to `size` bytes at `offset` of a kept file; the bytes read (0 at the end or on an error).
 uint32_t ReadOpenFileAt(uint64_t file, uint64_t offset, void* buffer, uint32_t size);
 
+// Large reads of the game's read-only files that leave nothing in the system file cache (Windows: a second handle
+// kept open per file, FILE_FLAG_NO_BUFFERING). Buffered, each byte a level streams in stayed in the cache manager's
+// working set next to its copy in guest memory: S29 (10-18) peaked at 2.26 GB of file cache, not available to anything
+// else. Reads at or above UncachedReadThreshold() take it (KYTY_UNCACHED_READ_KB, default 1024; 0: off); small reads
+// (an audio stream's 16 KiB pieces) keep the cache manager's read-ahead.
+uint64_t UncachedReadThreshold();
+// The unbuffered handle of the read-only file at `path` (kept open, never closed, like OpenKeptReadFile: for the
+// game's own files); 0: none (read it buffered).
+uint64_t OpenKeptUncachedFile(const std::string& path);
+// An unbuffered handle of its own (a descriptor's: closed with it, so a file replaced under the same name is read
+// anew); 0: none.
+uint64_t OpenUncachedFile(const std::string& path);
+void     CloseUncachedFile(uint64_t file);
+// Up to `size` (<= UncachedReadChunk) bytes at `offset` of an unbuffered handle, read into the calling thread's
+// sector-aligned buffer: *data points at them until the thread's next call. The bytes read; 0 at the end or on an
+// error (the caller reads the rest buffered).
+constexpr uint32_t UncachedReadChunk = 4u << 20u;
+uint32_t           ReadUncachedAt(uint64_t file, uint64_t offset, uint32_t size, const uint8_t** data);
+// Counts a host file read into guest memory (`kernel`: sceKernelRead/Pread, else AMPR); every 1 GiB a line gives the
+// totals by path and how much went uncached.
+void CountGuestFileRead(bool kernel, bool uncached, uint64_t bytes);
+
 // Stack bounds of the calling thread; false when unknown.
 bool CurrentThreadStack(uint64_t* low, uint64_t* high);
 

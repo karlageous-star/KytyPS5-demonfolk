@@ -195,6 +195,8 @@ inline thread_local bool     g_single_writer = false; // set on the render threa
 inline std::atomic_bool g_dispatch_keys_on {std::getenv("KYTY_DISPATCH_KEYS") != nullptr};
 // Live `vma <path>`: writes the GPU allocator's detailed statistics (set by vma.cpp).
 inline void (*g_vma_report)(const char* path) = nullptr;
+// Live `dmap <path>`: the guest views of the direct-memory backing (set by kernel/memory.cpp).
+inline bool (*g_backing_maps)(const char* path) = nullptr;
 // Live `cachemap <path>`: the render thread writes every cached image and buffer at its next texture garbage-collector
 // pass (TextureCache::RunGarbageCollector), then clears the flag.
 inline std::atomic_bool g_cache_map_due {false};

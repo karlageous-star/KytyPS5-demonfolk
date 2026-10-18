@@ -15,6 +15,7 @@
 #include "libs/network.h"
 #include "loader/demonsSoulsWarp.h"
 #include "loader/gameArgs.h"
+#include "local/local-platform.h"
 
 #include <algorithm>
 #include <atomic>
@@ -79,6 +80,13 @@ struct File {
 	Common::Mutex                       mutex;
 	std::vector<uint8_t>                dirents;
 	uint64_t                            dents_offset;
+	std::string                         uncached_path;       // a file opened read-only: its large reads go uncached
+	uint64_t                            uncached_handle = 0; // (opened by the first, closed with the descriptor)
+	bool                                uncached_tried  = false;
+
+	File() = default;
+	~File() { LocalPlatform::CloseUncachedFile(uncached_handle); }
+	KYTY_CLASS_NO_COPY(File);
 };
 
 class FileDescriptors {
@@ -541,6 +549,8 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 				}
 			}
 			result = file->f.Open(open_name, rw_mode);
+			file->uncached_path.clear();
+			if (result && rw_mode == Common::File::Mode::Read) file->uncached_path = Common::PathToString(open_name);
 
 			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tOpen: %s, %s\n",
 			           Common::PathToString(file->real_name).c_str(), result ? "[ok]" : "[fail]");
@@ -601,10 +611,42 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 // fault path like any other. The kernel writes a guest buffer without it: a page the GPU trackers
 // protected again after the read invalidated it (a buffer or image sync on the render thread) made
 // ReadFile stop short, and the short count went to the game as the read's result.
-static uint32_t ReadIntoGuest(Common::File& f, void* buf, uint32_t nbytes) {
+static uint32_t ReadIntoGuest(File& file, void* buf, uint32_t nbytes) {
 	constexpr uint32_t                 Chunk = 4u << 20u;
 	thread_local std::vector<uint8_t> bounce;
 	uint32_t                          total = 0;
+	auto&                             f     = file.f;
+	// A large read of a file opened read-only leaves nothing in the file cache (LocalPlatform::ReadUncachedAt), from
+	// the file position, which it then moves on; buffered from where it stopped if it fails.
+	const uint64_t threshold = LocalPlatform::UncachedReadThreshold();
+	if (threshold != 0 && nbytes >= threshold && !file.uncached_path.empty()) {
+		if (!file.uncached_tried) {
+			file.uncached_tried  = true;
+			file.uncached_handle = LocalPlatform::OpenUncachedFile(file.uncached_path);
+		}
+		if (const auto handle = file.uncached_handle) {
+			const uint64_t start  = f.Tell();
+			bool           failed = false;
+			while (total < nbytes) {
+				const uint32_t want = std::min(nbytes - total, LocalPlatform::UncachedReadChunk);
+				const uint8_t* data = nullptr;
+				const uint32_t got  = LocalPlatform::ReadUncachedAt(handle, start + total, want, &data);
+				if (got == 0) {
+					failed = start + total < f.Size();
+					break;
+				}
+				const auto destination = reinterpret_cast<uint64_t>(buf) + total;
+				Memory::InvalidateMemory(destination, got);
+				std::memcpy(reinterpret_cast<void*>(destination), data, got);
+				total += got;
+				if (got < want) break;
+			}
+			if (total != 0) LocalPlatform::CountGuestFileRead(true, true, total);
+			f.Seek(start + total);
+			if (!failed) return total;
+		}
+	}
+	const uint32_t buffered_from = total;
 	while (total < nbytes) {
 		const uint32_t want = std::min(nbytes - total, Chunk);
 		if (bounce.size() < want) bounce.resize(want);
@@ -617,6 +659,7 @@ static uint32_t ReadIntoGuest(Common::File& f, void* buf, uint32_t nbytes) {
 		total += got;
 		if (got < want) break;
 	}
+	if (total > buffered_from) LocalPlatform::CountGuestFileRead(true, false, total - buffered_from);
 	return total;
 }
 
@@ -667,7 +710,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	file->mutex.Lock();
 
 	bool       is_invalid = file->f.IsInvalid();
-	const auto bytes_read = ReadIntoGuest(file->f, buf, static_cast<uint32_t>(nbytes));
+	const auto bytes_read = ReadIntoGuest(*file, buf, static_cast<uint32_t>(nbytes));
 
 	file->mutex.Unlock();
 
@@ -787,7 +830,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	bool       is_invalid = file->f.IsInvalid();
 	auto       pos        = file->f.Tell();
 	file->f.Seek(offset);
-	const auto bytes_read = ReadIntoGuest(file->f, buf, static_cast<uint32_t>(nbytes));
+	const auto bytes_read = ReadIntoGuest(*file, buf, static_cast<uint32_t>(nbytes));
 	file->f.Seek(pos);
 
 	file->mutex.Unlock();

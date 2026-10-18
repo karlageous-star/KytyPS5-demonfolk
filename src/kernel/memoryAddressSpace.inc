@@ -202,6 +202,25 @@ public:
 
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
 
+	// Live `dmap <path>`: "backing <base> <size>", then "<vaddr> <size> <backing offset>" for each guest view
+	// (tools/backing_overlap.py: which backing pages are resident only through the backing view).
+	bool WriteMaps(const char* path) {
+		std::FILE* file = std::fopen(path, "wb");
+		if (file == nullptr) return false;
+		{
+			auto lock = MapReadLock();
+			std::fprintf(file, "backing 0x%llx 0x%llx\n", static_cast<unsigned long long>(GetBackingBase()),
+			             static_cast<unsigned long long>(m_size));
+			for (const auto& [_, entry]: m_maps) {
+				std::fprintf(file, "0x%llx 0x%llx 0x%llx\n", static_cast<unsigned long long>(entry.vaddr),
+				             static_cast<unsigned long long>(entry.size),
+				             static_cast<unsigned long long>(entry.backing_offset));
+			}
+		}
+		std::fclose(file);
+		return true;
+	}
+
 	// Locking: m_mutex (shared) keeps the mappings stable; mapping changes take it exclusively.
 	// m_data_mutex serializes the copies into and out of the backing (the write fence below
 	// assumes one writer at a time), so mapping queries such as IsUniqueRange no longer wait
@@ -1275,6 +1294,7 @@ public:
 	[[nodiscard]] uint64_t GetGranularity() const { return m_granularity; }
 	[[nodiscard]] uint64_t GetBackingBase() const { return m_backing->GetBackingBase(); }
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_backing->GetBackingSize(); }
+	bool                   WriteBackingMaps(const char* path) { return m_backing->WriteMaps(path); }
 
 	bool ZeroBacking(uint64_t backing_offset, uint64_t size) {
 		return m_backing->ZeroRange(backing_offset, size);

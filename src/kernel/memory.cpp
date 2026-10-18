@@ -1555,9 +1555,13 @@ void Initialize() {
 	g_virtual_ranges      = std::make_unique<VirtualRanges>();
 	EXIT_IF(!g_guest_address_space->SelfTest());
 	EXIT_IF(!SelfTestSub64SharedPlaceholderAlias());
+	LiveCounters::g_backing_maps = [](const char* path) {
+		return g_guest_address_space != nullptr && g_guest_address_space->WriteBackingMaps(path);
+	};
 }
 
 void Shutdown() {
+	LiveCounters::g_backing_maps = nullptr;
 	g_pooled_memory.reset();
 	g_flexible_memory.reset();
 	g_physical_memory.reset();

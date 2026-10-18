@@ -635,6 +635,10 @@ inline void Run(uint64_t id, const std::string& line) {
 		// vma <path>: the GPU allocator's detailed statistics (JSON: every allocation's type and size).
 		if (LiveCounters::g_vma_report != nullptr) LiveCounters::g_vma_report(arg1);
 		std::printf("LIVE_VMA id=%" PRIu64 " path=%s written=%d\n", id, arg1, LiveCounters::g_vma_report != nullptr ? 1 : 0);
+	} else if (cmd == "dmap" && n >= 2) {
+		// dmap <path>: the backing view and each guest view of it (tools/backing_overlap.py).
+		const bool written = LiveCounters::g_backing_maps != nullptr && LiveCounters::g_backing_maps(arg1);
+		std::printf("LIVE_DMAP id=%" PRIu64 " path=%s written=%d\n", id, arg1, written ? 1 : 0);
 	} else if (cmd == "cachemap" && n >= 2) {
 		// cachemap <path>: every image of the texture cache and every buffer of the buffer cache (guest range, usage,
 		// state), written by the render thread; tools\cache_residency.py joins it with the resident pages.

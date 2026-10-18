@@ -312,6 +312,95 @@ uint32_t ReadOpenFileAt(uint64_t file, uint64_t offset, void* buffer, uint32_t s
 	return got;
 }
 
+namespace {
+std::unordered_map<std::string, HANDLE> g_uncached_files; // (under g_kept_files_mutex; INVALID_HANDLE_VALUE: none)
+// Unbuffered transfers start, end and land on sector boundaries: 4 KiB covers 512-byte and 4 KiB sector disks.
+constexpr uint64_t UncachedAlign = 4096;
+struct UncachedBuffer {
+	uint8_t* data = nullptr;
+	UncachedBuffer() {
+		data = static_cast<uint8_t*>(
+		    VirtualAlloc(nullptr, UncachedReadChunk + 2 * UncachedAlign, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+	}
+	~UncachedBuffer() {
+		if (data != nullptr) VirtualFree(data, 0, MEM_RELEASE);
+	}
+	UncachedBuffer(const UncachedBuffer&)            = delete;
+	UncachedBuffer& operator=(const UncachedBuffer&) = delete;
+};
+} // namespace
+
+uint64_t UncachedReadThreshold() {
+	static const uint64_t threshold = [] {
+		const char* value = std::getenv("KYTY_UNCACHED_READ_KB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {1024}) << 10u;
+	}();
+	return threshold;
+}
+
+uint64_t OpenUncachedFile(const std::string& path) {
+	const int wide_size = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+	if (wide_size <= 0) return 0;
+	std::wstring wide(static_cast<size_t>(wide_size), L' ');
+	MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wide.data(), wide_size);
+	HANDLE handle = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+	                            nullptr, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, nullptr);
+	return handle == INVALID_HANDLE_VALUE ? 0 : reinterpret_cast<uint64_t>(handle);
+}
+
+void CloseUncachedFile(uint64_t file) {
+	if (file != 0) CloseHandle(reinterpret_cast<HANDLE>(file));
+}
+
+uint64_t OpenKeptUncachedFile(const std::string& path) {
+	{
+		const std::lock_guard lock(g_kept_files_mutex);
+		if (const auto found = g_uncached_files.find(path); found != g_uncached_files.end())
+			return found->second == INVALID_HANDLE_VALUE ? 0 : reinterpret_cast<uint64_t>(found->second);
+	}
+	const uint64_t opened = OpenUncachedFile(path);
+	HANDLE         handle = opened != 0 ? reinterpret_cast<HANDLE>(opened) : INVALID_HANDLE_VALUE;
+	const std::lock_guard lock(g_kept_files_mutex);
+	const auto [kept, added] = g_uncached_files.try_emplace(path, handle);
+	if (!added && handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+	return kept->second == INVALID_HANDLE_VALUE ? 0 : reinterpret_cast<uint64_t>(kept->second);
+}
+
+uint32_t ReadUncachedAt(uint64_t file, uint64_t offset, uint32_t size, const uint8_t** data) {
+	thread_local UncachedBuffer buffer;
+	if (file == 0 || buffer.data == nullptr || size == 0 || size > UncachedReadChunk) return 0;
+	const uint64_t begin = offset & ~(UncachedAlign - 1);
+	const uint64_t end   = (offset + size + UncachedAlign - 1) & ~(UncachedAlign - 1);
+	OVERLAPPED     at {};
+	at.Offset     = static_cast<DWORD>(begin);
+	at.OffsetHigh = static_cast<DWORD>(begin >> 32u);
+	DWORD got     = 0;
+	// (Short at the end of the file: an unbuffered read may ask past it.)
+	if (ReadFile(reinterpret_cast<HANDLE>(file), buffer.data, static_cast<DWORD>(end - begin), &got, &at) == 0)
+		return 0;
+	const uint64_t skip = offset - begin;
+	if (got <= skip) return 0;
+	*data = buffer.data + skip;
+	return static_cast<uint32_t>(std::min<uint64_t>(got - skip, size));
+}
+
+void CountGuestFileRead(bool kernel, bool uncached, uint64_t bytes) {
+	static std::atomic<uint64_t> totals[4] {};
+	static std::atomic<uint64_t> next_report {uint64_t {1} << 30u};
+	totals[(kernel ? 2 : 0) + (uncached ? 1 : 0)].fetch_add(bytes, std::memory_order_relaxed);
+	const uint64_t all = totals[0].load() + totals[1].load() + totals[2].load() + totals[3].load();
+	uint64_t       due = next_report.load(std::memory_order_relaxed);
+	if (all >= due && next_report.compare_exchange_strong(due, all + (uint64_t {1} << 30u))) {
+		std::printf("File reads into guest memory: %llu MiB (AMPR %llu MiB, %llu uncached; kernel %llu MiB, %llu uncached)\n",
+		            static_cast<unsigned long long>(all >> 20u),
+		            static_cast<unsigned long long>((totals[0].load() + totals[1].load()) >> 20u),
+		            static_cast<unsigned long long>(totals[1].load() >> 20u),
+		            static_cast<unsigned long long>((totals[2].load() + totals[3].load()) >> 20u),
+		            static_cast<unsigned long long>(totals[3].load() >> 20u));
+		std::fflush(stdout);
+	}
+}
+
 double NamedThreadsCpuSeconds(const char* name) {
 	std::wstring wanted;
 	for (const char* p = name; *p != '\0'; ++p) wanted.push_back(static_cast<wchar_t>(*p));
@@ -524,6 +613,26 @@ uint64_t OpenKeptReadFile(const std::string& /*path*/, uint64_t* /*size*/) {
 uint32_t ReadOpenFileAt(uint64_t /*file*/, uint64_t /*offset*/, void* /*buffer*/, uint32_t /*size*/) {
 	return 0;
 }
+
+uint64_t UncachedReadThreshold() {
+	return 0;
+}
+
+uint64_t OpenKeptUncachedFile(const std::string& /*path*/) {
+	return 0;
+}
+
+uint64_t OpenUncachedFile(const std::string& /*path*/) {
+	return 0;
+}
+
+void CloseUncachedFile(uint64_t /*file*/) {}
+
+uint32_t ReadUncachedAt(uint64_t /*file*/, uint64_t /*offset*/, uint32_t /*size*/, const uint8_t** /*data*/) {
+	return 0;
+}
+
+void CountGuestFileRead(bool /*kernel*/, bool /*uncached*/, uint64_t /*bytes*/) {}
 
 std::vector<std::pair<uint32_t, std::string>> ProcessThreads() {
 	return {};

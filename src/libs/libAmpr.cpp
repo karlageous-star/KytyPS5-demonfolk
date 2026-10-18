@@ -1505,9 +1505,32 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 			return OK;
 		}
 		const auto readable = std::min<uint64_t>(size, kept_size - file_offset);
+		// A large read leaves nothing in the file cache (LocalPlatform::ReadUncachedAt; the rest buffered if it fails).
+		const uint64_t threshold      = LocalPlatform::UncachedReadThreshold();
+		uint64_t       uncached       = threshold != 0 && readable >= threshold
+		                                    ? LocalPlatform::OpenKeptUncachedFile(host_path)
+		                                    : 0;
+		uint64_t       uncached_bytes = 0;
 		thread_local std::vector<uint8_t> kept_buffer;
-		kept_buffer.resize(static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable)));
 		while (*bytes_read < readable) {
+			if (uncached != 0) {
+				const auto     request = static_cast<uint32_t>(
+				    std::min<uint64_t>(LocalPlatform::UncachedReadChunk, readable - *bytes_read));
+				const uint8_t* data    = nullptr;
+				const auto     before  = Clock::now();
+				const auto     read    = LocalPlatform::ReadUncachedAt(uncached, file_offset + *bytes_read, request, &data);
+				const auto     after   = Clock::now();
+				reading += after - before;
+				if (read != 0) {
+					std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), data, read);
+					copying += Clock::now() - after;
+					*bytes_read += read;
+					uncached_bytes += read;
+					continue;
+				}
+				uncached = 0;
+			}
+			kept_buffer.resize(static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable)));
 			const auto request = static_cast<uint32_t>(std::min<uint64_t>(kept_buffer.size(), readable - *bytes_read));
 			const auto before  = Clock::now();
 			const auto read    = LocalPlatform::ReadOpenFileAt(kept, file_offset + *bytes_read, kept_buffer.data(), request);
@@ -1520,6 +1543,8 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 			copying += Clock::now() - after;
 			*bytes_read += read;
 		}
+		if (uncached_bytes != 0) LocalPlatform::CountGuestFileRead(false, true, uncached_bytes);
+		if (*bytes_read > uncached_bytes) LocalPlatform::CountGuestFileRead(false, false, *bytes_read - uncached_bytes);
 		TrimAfterRead(destination, *bytes_read);
 		return OK;
 	}
@@ -1565,6 +1590,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 	}
 
 	file.Close();
+	LocalPlatform::CountGuestFileRead(false, false, *bytes_read);
 	TrimAfterRead(destination, *bytes_read);
 	return OK;
 }
