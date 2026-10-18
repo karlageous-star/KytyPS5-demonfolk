@@ -7,6 +7,9 @@
 #include <cstdlib>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -17,14 +20,13 @@ bool IsSelect(ValueOpcode opcode) {
 
 // An operation a region cannot keep under a per-lane branch: it reads other lanes, acts once for the wave, waits for
 // the workgroup, or changes memory a number of times the active lanes decide (atomics). Register accesses are gone
-// after SSA; refused all the same.
+// after SSA; refused all the same. (AnyLane and Ballot of a condition that implies E, phis below the region's entry
+// and the conditions of branches inside it are checked apart.)
 bool RefusedInRegion(ValueOpcode opcode, bool compute_derivatives) {
 	switch (opcode) {
 		case ValueOpcode::DppMoveU32:
 		case ValueOpcode::DppUpdateU32:
 		case ValueOpcode::WqmU64:
-		case ValueOpcode::Ballot:
-		case ValueOpcode::AnyLane:
 		case ValueOpcode::ReadFirstLane:
 		case ValueOpcode::ReadLane:
 		case ValueOpcode::WriteLane:
@@ -34,8 +36,6 @@ bool RefusedInRegion(ValueOpcode opcode, bool compute_derivatives) {
 		case ValueOpcode::Barrier:
 		case ValueOpcode::Sendmsg:
 		case ValueOpcode::ImageQueryLod:
-		case ValueOpcode::Phi:
-		case ValueOpcode::Reference:
 		case ValueOpcode::ReferenceU32:
 		case ValueOpcode::GetThreadBitScalarRegister:
 		case ValueOpcode::SetThreadBitScalarRegister:
@@ -78,6 +78,49 @@ int BlockIndex(const Program& program, uint32_t id) {
 	return -1;
 }
 
+// Whether a lane condition holds only where E holds: E itself, or a conjunction with such a conjunct (exec narrowed
+// inside the region: s_and_saveexec, v_cmpx).
+bool Implies(const Inst* condition, const Inst* exec, int depth = 0) {
+	if (condition == nullptr || depth > 32) return false;
+	if (condition == exec) return true;
+	if (condition->GetOpcode() != ValueOpcode::LogicalAnd) return false;
+	return Implies(InstOf(condition->Arg(0)), exec, depth + 1) || Implies(InstOf(condition->Arg(1)), exec, depth + 1);
+}
+
+// What a lane outside E read at the merge when the whole wave ran the region (the uniform branch): true when it is
+// `skip` on every path. A value is: skip itself; a select whose old value is (its condition implying E), or both of
+// whose values are; a phi inside the region all of whose values are (loop phis assumed so while their loop is checked).
+struct Region {
+	const Inst*                          exec = nullptr;
+	std::unordered_set<const Block*>     blocks;
+	std::unordered_map<const Inst*, int> memo; // 0 being checked (assumed true), 1 true, 2 false
+};
+
+bool SameWhenNotE(Region& region, const Value& value, const Value& skip, int depth = 0) {
+	const Value resolved = value.Resolve();
+	if (resolved == skip) return true;
+	const Inst* inst = resolved.TryInstruction();
+	// Lane conditions both false outside E (an exec narrowed inside the region against the exec at the branch).
+	if (Implies(inst, region.exec) && Implies(skip.TryInstruction(), region.exec)) return true;
+	if (inst == nullptr || depth > 256 || !region.blocks.contains(inst->Parent())) return false;
+	if (const auto found = region.memo.find(inst); found != region.memo.end()) return found->second != 2;
+	region.memo[inst] = 0;
+	bool result = false;
+	if (IsSelect(inst->GetOpcode())) {
+		result = (Implies(InstOf(inst->Arg(0)), region.exec) && SameWhenNotE(region, inst->Arg(2), skip, depth + 1)) ||
+		         (SameWhenNotE(region, inst->Arg(1), skip, depth + 1) &&
+		          SameWhenNotE(region, inst->Arg(2), skip, depth + 1));
+	} else if (inst->GetOpcode() == ValueOpcode::Phi) {
+		result = true;
+		for (size_t operand = 0; operand < inst->NumArgs() && result; operand++)
+			result = SameWhenNotE(region, inst->Arg(operand), skip, depth + 1);
+	}
+	region.memo[inst] = result ? 1 : 2;
+	return result;
+}
+
+constexpr size_t MaxRegionBlocks = 1024;
+
 } // namespace
 
 LaneBranchStats ConvertLaneBranches(Program& program) {
@@ -90,8 +133,10 @@ LaneBranchStats ConvertLaneBranches(Program& program) {
 	}();
 	const bool debug = debug_hash != 0 && program.shader_hash == debug_hash;
 	bool compute_derivatives = false;
-	for (const auto* block: program.blocks) {
-		for (const auto& inst: block->Instructions())
+	std::unordered_map<const Block*, size_t> block_index;
+	for (size_t i = 0; i < program.blocks.size(); i++) {
+		block_index[program.blocks[i]] = i;
+		for (const auto& inst: program.blocks[i]->Instructions())
 			compute_derivatives = compute_derivatives || inst.GetOpcode() == ValueOpcode::ImageQueryLod;
 	}
 	for (size_t p = 0; p < program.blocks.size(); p++) {
@@ -118,75 +163,102 @@ LaneBranchStats ConvertLaneBranches(Program& program) {
 		const int r = BlockIndex(program, region_id);
 		const int m = BlockIndex(program, term.merge_block);
 		if (r < 0 || m < 0 || static_cast<size_t>(r) == p) continue;
-		Block*      branch = program.blocks[p];
-		Block*      region = program.blocks[r];
-		Block*      merge  = program.blocks[m];
-		const auto& region_term = program.block_info[r].terminator;
-		if (region_term.kind != CFG::TerminatorKind::Branch || region_term.loop_header ||
-		    region_term.true_block != term.merge_block || region->ImmPredecessors().size() != 1 ||
-		    region->ImmPredecessors()[0] != branch || merge->ImmPredecessors().size() != 2) {
-			if (debug) {
-				std::printf("LANE_DEBUG block %u: region %u (terminator %d, true %u, loop %d, preds %zu) merge %u (preds %zu)\n",
-				            info.id, region_id, static_cast<int>(region_term.kind), region_term.true_block,
-				            region_term.loop_header ? 1 : 0, region->ImmPredecessors().size(), term.merge_block,
-				            merge->ImmPredecessors().size());
+		Block* branch = program.blocks[p];
+		Block* entry  = program.blocks[r];
+		Block* merge  = program.blocks[m];
+		// The region: every block reached from its entry before the merge. One entry (from the branch), no way back
+		// to the branch, no return (s_endpgm ends the whole wave), and the merge entered only from it or the branch.
+		Region             region {.exec = exec_inst};
+		std::vector<Block*> order {entry};
+		region.blocks.insert(entry);
+		const char* shape = nullptr;
+		for (size_t next = 0; next < order.size() && shape == nullptr; next++) {
+			const Block* block = order[next];
+			const auto&  block_term = program.block_info[block_index[block]].terminator;
+			if (block_term.kind != CFG::TerminatorKind::Branch &&
+			    block_term.kind != CFG::TerminatorKind::ConditionalBranch) {
+				shape = "a return or an indirect branch inside";
+				break;
 			}
+			for (Block* successor: block->ImmSuccessors()) {
+				if (successor == merge) continue;
+				if (successor == branch) {
+					shape = "a way back to the branch";
+					break;
+				}
+				if (region.blocks.insert(successor).second) order.push_back(successor);
+			}
+			if (order.size() > MaxRegionBlocks) shape = "too many blocks";
+		}
+		if (shape == nullptr) {
+			if (entry->ImmPredecessors().size() != 1 || entry->ImmPredecessors()[0] != branch) shape = "a second entry";
+			for (size_t i = 1; i < order.size() && shape == nullptr; i++) {
+				for (const Block* predecessor: order[i]->ImmPredecessors())
+					if (!region.blocks.contains(predecessor)) shape = "a block entered from outside";
+			}
+			bool from_branch = false, from_region = false;
+			for (const Block* predecessor: merge->ImmPredecessors()) {
+				from_branch = from_branch || predecessor == branch;
+				from_region = from_region || region.blocks.contains(predecessor);
+				if (predecessor != branch && !region.blocks.contains(predecessor) && shape == nullptr)
+					shape = "a merge entered from outside";
+			}
+			if (shape == nullptr && (!from_branch || !from_region)) shape = "a merge not entered from both";
+		}
+		if (shape != nullptr) {
+			if (debug) std::printf("LANE_DEBUG block %u: region %u: %s\n", info.id, region_id, shape);
 			continue;
 		}
 		stats.candidates++;
-		bool refused = false;
-		for (const auto& inst: region->Instructions()) {
-			if (RefusedInRegion(inst.GetOpcode(), compute_derivatives)) {
-				if (debug) {
-					std::printf("LANE_DEBUG block %u: region %u has %s\n", info.id, region_id,
-					            std::string(ValueOpcodeName(inst.GetOpcode())).c_str());
+		const char* refusal = nullptr;
+		for (const Block* block: order) {
+			for (const auto& inst: block->Instructions()) {
+				const auto opcode = inst.GetOpcode();
+				if (opcode == ValueOpcode::Phi) {
+					if (block == entry) refusal = "a phi at the entry";
+				} else if (opcode == ValueOpcode::AnyLane || opcode == ValueOpcode::Ballot) {
+					// Over the active lanes the same as over the wave, when the lanes outside E give false.
+					if (!Implies(InstOf(inst.Arg(0)), exec_inst)) refusal = "AnyLane or Ballot of a condition beyond E";
+				} else if (opcode == ValueOpcode::Reference) {
+					// A branch inside: on a scalar value or AnyLane (checked above): uniform over the active lanes.
+				} else if (RefusedInRegion(opcode, compute_derivatives)) {
+					refusal = ValueOpcodeName(opcode).data();
 				}
-				refused = true;
-				break;
+				if (refusal != nullptr) break;
 			}
+			if (refusal != nullptr) break;
 		}
-		if (refused) {
+		if (refusal != nullptr) {
+			if (debug) std::printf("LANE_DEBUG block %u: region %u (%zu blocks) has %s\n", info.id, region_id, order.size(),
+			                       refusal);
 			stats.refused_op++;
 			continue;
 		}
-		// What the region hands the merge, per phi: a select on E whose old value is what the skipping edge carries
-		// (a vector register the region wrote under E), or the skipping edge's own value. Then a lane outside E gets
-		// at the merge what it got when the whole wave ran the region. Anything else (a scalar register the region
-		// wrote, which every lane sees) keeps the uniform branch.
+		// What the region hands the merge, per phi: for a lane outside E what the skipping edge carries.
+		bool refused = false;
 		for (const auto& inst: merge->Instructions()) {
 			if (inst.GetOpcode() != ValueOpcode::Phi) continue;
-			Value from_region, from_branch;
-			bool  have_region = false, have_branch = false;
+			Value skip;
+			bool  have_skip = false;
 			for (size_t operand = 0; operand < inst.NumArgs(); operand++) {
-				if (inst.PhiBlock(operand) == region) {
-					from_region = inst.Arg(operand).Resolve();
-					have_region = true;
-				} else if (inst.PhiBlock(operand) == branch) {
-					from_branch = inst.Arg(operand).Resolve();
-					have_branch = true;
+				if (inst.PhiBlock(operand) == branch) {
+					skip      = inst.Arg(operand).Resolve();
+					have_skip = true;
 				}
 			}
-			if (!have_region || !have_branch) {
+			if (!have_skip) {
 				refused = true;
 				break;
 			}
-			const Inst* value = from_region.TryInstruction();
-			if (value != nullptr && value->Parent() == region) {
-				refused = !(IsSelect(value->GetOpcode()) && InstOf(value->Arg(0)) == exec_inst &&
-				            value->Arg(2).Resolve() == from_branch);
-			} else {
-				refused = !(from_region == from_branch);
-			}
-			if (refused && debug) {
-				const bool select = value != nullptr && IsSelect(value->GetOpcode());
-				std::printf("LANE_DEBUG block %u: phi %s from the region is %s%s (in region %d, select on E %d, old is "
-				            "the skip value %d)\n",
-				            info.id, std::string(ValueOpcodeName(inst.GetOpcode())).c_str(),
-				            value != nullptr ? std::string(ValueOpcodeName(value->GetOpcode())).c_str() : "a constant",
-				            inst.Flags<Type>() == Type::U1 ? " (U1)" : "",
-				            value != nullptr && value->Parent() == region ? 1 : 0,
-				            select && InstOf(value->Arg(0)) == exec_inst ? 1 : 0,
-				            select && value->Arg(2).Resolve() == from_branch ? 1 : 0);
+			for (size_t operand = 0; operand < inst.NumArgs() && !refused; operand++) {
+				if (inst.PhiBlock(operand) == branch) continue;
+				refused = !SameWhenNotE(region, inst.Arg(operand), skip);
+				if (refused && debug) {
+					const Inst* value = InstOf(inst.Arg(operand));
+					std::printf("LANE_DEBUG block %u: region %u (%zu blocks): a merge phi%s gets %s\n", info.id, region_id,
+					            order.size(), inst.Flags<Type>() == Type::U1 ? " (U1)" : "",
+					            value != nullptr ? std::string(ValueOpcodeName(value->GetOpcode())).c_str() : "a constant");
+				}
 			}
 			if (refused) break;
 		}
@@ -194,10 +266,12 @@ LaneBranchStats ConvertLaneBranches(Program& program) {
 			stats.refused_phi++;
 			continue;
 		}
-		for (auto& inst: region->Instructions()) {
-			if (IsSelect(inst.GetOpcode()) && InstOf(inst.Arg(0)) == exec_inst) {
-				inst.ReplaceUsesWith(inst.Arg(1).Resolve());
-				stats.selects++;
+		for (Block* block: order) {
+			for (auto& inst: block->Instructions()) {
+				if (IsSelect(inst.GetOpcode()) && InstOf(inst.Arg(0)) == exec_inst) {
+					inst.ReplaceUsesWith(inst.Arg(1).Resolve());
+					stats.selects++;
+				}
 			}
 		}
 		// The branch on each lane's E (or its negation for the execz form), the condition its Reference keeps.
@@ -213,7 +287,7 @@ LaneBranchStats ConvertLaneBranches(Program& program) {
 		if (reference != branch->end()) reference->SetArg(0, lane_condition);
 		info.condition = lane_condition;
 		stats.converted++;
-		if (debug) std::printf("LANE_DEBUG block %u: converted (region %u)\n", info.id, region_id);
+		if (debug) std::printf("LANE_DEBUG block %u: converted (region %u, %zu blocks)\n", info.id, region_id, order.size());
 	}
 	return stats;
 }
