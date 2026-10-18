@@ -35,6 +35,7 @@ struct DrawIndexBufferSource;
 struct DrawRenderState;
 class RenderContext;
 class CommandScheduler;
+class Buffer;
 struct RenderExecutorTestAccess;
 
 enum class CommandBufferDebugOp : uint32_t {
@@ -163,6 +164,12 @@ public:
 		bool     written = false;
 	};
 	[[nodiscard]] vk::CommandBuffer TransferHandle(std::span<const TransferAccess> accesses) const;
+	// KYTY_COPY_BATCH (kyty_local_copy_batch_mode): a guest linear copy (DemonsSouls::TryLinearCopy) joins a run of
+	// independent small copies that one compute dispatch makes (copy_batch.comp, a workgroup each), recorded by the next
+	// Handle(). As transfers each took ~4 us of GPU time with a barrier between (434 a frame in the tunnel, M1 10-18).
+	// False: not batched (the caller copies as before).
+	[[nodiscard]] bool BatchCopy(const Buffer& source, uint64_t source_offset, const Buffer& destination,
+	                             uint64_t destination_offset, uint64_t size) const;
 
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
@@ -190,6 +197,25 @@ private:
 	mutable bool                        m_transfer_pending = false;
 	mutable std::vector<TransferAccess> m_transfer_access;
 	void                                DrainTransferChain() const;
+	// KYTY_COPY_BATCH: the copies BatchCopy holds (copy_batch.comp's table entries), their ranges, and their buffers for
+	// transfers when the table finds no room.
+	struct BatchedCopy {
+		uint64_t source      = 0;
+		uint64_t destination = 0;
+		uint32_t dwords      = 0;
+		uint32_t unused      = 0;
+	};
+	struct BatchedCopyBuffers {
+		VkBuffer source             = VK_NULL_HANDLE;
+		VkBuffer destination        = VK_NULL_HANDLE;
+		uint64_t source_offset      = 0;
+		uint64_t destination_offset = 0;
+		uint64_t size               = 0;
+	};
+	mutable std::vector<BatchedCopy>        m_copy_batch;
+	mutable std::vector<BatchedCopyBuffers> m_copy_batch_buffers;
+	mutable std::vector<TransferAccess>     m_copy_batch_access;
+	void                                    FlushCopyBatch() const;
 	mutable uint64_t    m_graphics_generation    = 0;
 	vk::CommandBuffer   m_buffer          = nullptr;
 	uint32_t            m_timestamp_slot  = UINT32_MAX; // live trace GPU timestamps

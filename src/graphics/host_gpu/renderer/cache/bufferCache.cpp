@@ -2194,7 +2194,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
-                             bool src_gds) {
+                             bool src_gds, bool batch) {
 	const bool dst_memory = !dst_gds;
 	const bool src_memory = !src_gds;
 	if ((dst_memory && dst_vaddr == 0) || (src_memory && src_vaddr == 0) || size == 0 ||
@@ -2244,7 +2244,9 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	if (src == dst && src_offset < dst_offset + size && dst_offset < src_offset + size) {
 		EXIT("BufferCache: resolved Vulkan copy ranges overlap\n");
 	}
-	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
+	if (!(batch && src_memory && dst_memory && command.BatchCopy(*src, src_offset, *dst, dst_offset, size))) {
+		dst->CopyFrom(command, *src, src_offset, dst_offset, size);
+	}
 	if (src_memory && dst_memory) ForwardCopy(dst_vaddr, src_vaddr, size);
 }
 

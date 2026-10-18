@@ -364,6 +364,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${lod_stats_pack_header}")
 
+# Batched small buffer copies (KYTY_COPY_BATCH, CommandBuffer::BatchCopy).
+set(copy_batch_source "${gpu_tiler_shader_dir}/copy_batch.comp")
+set(copy_batch_spv "${gpu_tiler_generated_dir}/copy_batch.spv")
+set(copy_batch_header "${gpu_tiler_generated_dir}/copy_batch_spv.h")
+add_custom_command(
+	OUTPUT "${copy_batch_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${copy_batch_spv}" "${copy_batch_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${copy_batch_spv} -DOUTPUT=${copy_batch_header}
+	        -DSYMBOL=COPY_BATCH_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${copy_batch_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${copy_batch_header}")
+
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
 set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"

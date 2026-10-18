@@ -3,6 +3,8 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -17,10 +19,13 @@
 #include "vulkan-recording.h"
 #endif
 
+#include "gpu_tiler_shaders/copy_batch_spv.h"
+
 #include <algorithm>
 #include <atomic>
 #include <bit>
 #include <cstring>
+#include <mutex>
 
 // windows.h (through common/threads.h) defines MemoryBarrier as a function macro: vk::MemoryBarrier is the struct.
 #ifdef MemoryBarrier
@@ -31,6 +36,9 @@ extern "C" {
 // KYTY_TRANSFER_CHAIN (default 0; live): independent buffer copies recorded back to back share one barrier ahead and one
 // after (CommandBuffer::TransferHandle).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_transfer_chain_mode {0};
+// KYTY_COPY_BATCH (default 0; live): a run of independent small guest linear copies made by one compute dispatch
+// (CommandBuffer::BatchCopy).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_copy_batch_mode {0};
 }
 
 namespace Libs::Graphics {
@@ -44,6 +52,7 @@ bool CommandBuffer::IsInvalid() const {
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	FlushCopyBatch();
 	DrainTransferChain();
 	if (m_compute_access_pending) {
 		ShaderAccessBarrier(m_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -56,6 +65,7 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 
 vk::CommandBuffer CommandBuffer::ChainHandle() const {
 	EXIT_IF(IsInvalid() || m_rendering);
+	FlushCopyBatch();
 	DrainTransferChain();
 	return m_buffer;
 }
@@ -80,6 +90,7 @@ void CommandBuffer::DrainTransferChain() const {
 
 vk::CommandBuffer CommandBuffer::TransferHandle(std::span<const TransferAccess> accesses) const {
 	EXIT_IF(IsInvalid() || m_rendering);
+	FlushCopyBatch();
 	if (m_compute_access_pending) (void)Handle(); // the pending compute dependency first (no transfer chain then)
 	if (!m_transfer_pending) {
 		// The barrier ahead: everything recorded before, at any stage, before the transfers; its writes visible to them.
@@ -107,6 +118,129 @@ vk::CommandBuffer CommandBuffer::TransferHandle(std::span<const TransferAccess> 
 	m_transfer_access.insert(m_transfer_access.end(), accesses.begin(), accesses.end());
 	m_transfer_pending = true;
 	return m_buffer;
+}
+
+namespace {
+// copy_batch.comp's pipeline: no descriptors, the table's device address and the copy count as push constants.
+struct CopyBatchPipeline {
+	vk::PipelineLayout layout   = nullptr;
+	vk::Pipeline       pipeline = nullptr;
+};
+
+const CopyBatchPipeline& GetCopyBatchPipeline(vk::Device device) {
+	static CopyBatchPipeline created;
+	static std::once_flag    once;
+	std::call_once(once, [&] {
+		vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, 16};
+		vk::PipelineLayoutCreateInfo layout {};
+		layout.pushConstantRangeCount = 1;
+		layout.pPushConstantRanges    = &push;
+		RequireVulkanSuccess(device.createPipelineLayout(&layout, nullptr, &created.layout),
+		                     "create copy batch pipeline layout");
+		vk::ShaderModuleCreateInfo shader {};
+		shader.codeSize = sizeof(COPY_BATCH_SPV);
+		shader.pCode    = COPY_BATCH_SPV;
+		vk::ShaderModule module;
+		RequireVulkanSuccess(device.createShaderModule(&shader, nullptr, &module), "create copy batch shader");
+		vk::ComputePipelineCreateInfo pipeline {};
+		pipeline.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		pipeline.stage.module = module;
+		pipeline.stage.pName  = "main";
+		pipeline.layout       = created.layout;
+		RequireVulkanSuccess(device.createComputePipelines(nullptr, 1, &pipeline, nullptr, &created.pipeline),
+		                     "create copy batch pipeline");
+		device.destroyShaderModule(module, nullptr);
+	});
+	return created;
+}
+
+constexpr uint64_t CopyBatchMaxBytes  = 64 * 1024; // a workgroup's loop: 256 dwords a thread at most
+constexpr size_t   CopyBatchMaxCopies = 1024;
+} // namespace
+
+bool CommandBuffer::BatchCopy(const Buffer& source, uint64_t source_offset, const Buffer& destination,
+                              uint64_t destination_offset, uint64_t size) const {
+	if (kyty_local_copy_batch_mode.load(std::memory_order_relaxed) == 0 || IsInvalid() || size == 0 ||
+	    size > CopyBatchMaxBytes || ((source_offset | destination_offset | size) & 3u) != 0) {
+		return false;
+	}
+	const auto source_address      = source.BufferDeviceAddress();
+	const auto destination_address = destination.BufferDeviceAddress();
+	if (source_address == 0 || destination_address == 0) return false;
+	EndRendering(); // (a rendering's Handle() left no batch)
+	const TransferAccess accesses[] = {
+	    {static_cast<VkBuffer>(source.Handle()), source_offset, source_offset + size, false},
+	    {static_cast<VkBuffer>(destination.Handle()), destination_offset, destination_offset + size, true},
+	};
+	if (m_copy_batch.empty()) {
+		// Whatever else is pending (a compute chain's barrier, a transfer chain's) first, then the batch alone.
+		(void)Handle();
+	} else {
+		bool conflict = m_copy_batch.size() >= CopyBatchMaxCopies;
+		for (const auto& pending: m_copy_batch_access) {
+			for (const auto& access: accesses) {
+				conflict = conflict || (pending.buffer == access.buffer && (pending.written || access.written) &&
+				                        access.begin < pending.end && pending.begin < access.end);
+			}
+		}
+		// A copy touching what an earlier one writes (or writing what one reads) runs after them.
+		if (conflict) FlushCopyBatch();
+	}
+	m_copy_batch.push_back({source_address + source_offset, destination_address + destination_offset,
+	                        static_cast<uint32_t>(size / 4), 0});
+	m_copy_batch_buffers.push_back({accesses[0].buffer, accesses[1].buffer, source_offset, destination_offset, size});
+	m_copy_batch_access.insert(m_copy_batch_access.end(), std::begin(accesses), std::end(accesses));
+	LiveCounters::Add(LiveCounters::BatchedCopies);
+	return true;
+}
+
+// The batch: everything before it, at any stage, before its copies, and its copies before everything after.
+void CommandBuffer::FlushCopyBatch() const {
+	if (m_copy_batch.empty()) return;
+	const auto count = static_cast<uint32_t>(m_copy_batch.size());
+	const auto bytes = count * sizeof(BatchedCopy);
+	auto&      table = m_context.GetBufferCache().GetTableUploadBuffer();
+	// No wait for room: a wait could submit this very buffer. Without room the copies are transfers.
+	const auto [data, offset] = table.BufferDeviceAddress() != 0 ? table.Map(bytes, 16, false)
+	                                                              : std::pair<uint8_t*, uint64_t> {nullptr, 0};
+	if (data != nullptr) {
+		std::memcpy(data, m_copy_batch.data(), bytes);
+		table.Commit();
+		const auto& pipeline = GetCopyBatchPipeline(m_graphics.device);
+		const auto  before   = GlobalBarrier(vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		                                     vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+		m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eComputeShader,
+		                         {}, 1, &before, 0, nullptr, 0, nullptr);
+		m_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+		struct {
+			uint64_t table;
+			uint32_t count;
+			uint32_t unused;
+		} constants {table.BufferDeviceAddress() + offset, count, 0};
+		m_buffer.pushConstants(pipeline.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(constants), &constants);
+		m_buffer.dispatch(count, 1, 1);
+		const auto after = GlobalBarrier(vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
+		                                 vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
+		m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eAllCommands,
+		                         {}, 1, &after, 0, nullptr, 0, nullptr);
+		LiveCounters::Add(LiveCounters::CopyBatches);
+	} else {
+		const auto before = GlobalBarrier(vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		                                  vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite);
+		m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 1,
+		                         &before, 0, nullptr, 0, nullptr);
+		for (const auto& copy: m_copy_batch_buffers) {
+			const vk::BufferCopy region {copy.source_offset, copy.destination_offset, copy.size};
+			m_buffer.copyBuffer(copy.source, copy.destination, 1, &region);
+		}
+		const auto after = GlobalBarrier(vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite,
+		                                 vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
+		m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands, {}, 1,
+		                         &after, 0, nullptr, 0, nullptr);
+	}
+	m_copy_batch.clear();
+	m_copy_batch_buffers.clear();
+	m_copy_batch_access.clear();
 }
 
 void CommandBuffer::ContinueComputeChain() const {
@@ -139,6 +273,7 @@ void CommandBuffer::RecordChainAccess(std::span<const ChainAccess> accesses, boo
 
 vk::CommandBuffer CommandBuffer::HandleForFullBarrier() const {
 	EXIT_IF(IsInvalid());
+	FlushCopyBatch(); // its copies before the caller's barrier
 	// The caller records a full AllCommands memory dependency immediately.
 	m_transfer_pending = false;
 	m_transfer_access.clear();

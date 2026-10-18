@@ -101,8 +101,9 @@ public:
 	void RetainImageStaging() { m_staging_buffer.RetainLastUse(); }
 	[[nodiscard]] uint64_t ImageStagingCapacity() const noexcept { return m_staging_buffer.Size(); }
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// batch: the copy may join a run that one compute dispatch makes (KYTY_COPY_BATCH: CommandBuffer::BatchCopy).
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
-	                bool src_gds);
+	                bool src_gds, bool batch = false);
 	// Called after an identified small GPU copy; it never submits or publishes guest data.
 	void ScheduleCopyFeedback(uint64_t vaddr, uint64_t size);
 	// GPU thread: retire a pending guest read before touching overlapping backing.

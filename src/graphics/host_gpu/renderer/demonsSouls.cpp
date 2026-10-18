@@ -116,7 +116,7 @@ bool TryLinearCopy(const LinearCopyDispatch& dispatch, BufferCache& cache, uint3
 	                        : &LibKernel::Memory::IsUniqueGuestBackingRange;
 	if (!unique(src, bytes) || !unique(dst, bytes) || !unique(parameters.Base48(), 16))
 		return false;
-	cache.CopyBuffer(dst, src, bytes, false, false);
+	cache.CopyBuffer(dst, src, bytes, false, false, true);
 	cache.ScheduleCopyFeedback(dst, bytes);
 	if (FrameCapture::Active()) {
 		// Use the validated, executed extents, not the descriptor's whole allocation.
