@@ -1444,16 +1444,18 @@ static bool AdvanceCommandBuffer(uint64_t command_buffer, uint64_t record_size) 
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
 }
 
-// KYTY_READ_TRIM_MB=<n> (opt-in; 0 or unset: off): a read of n MiB or more leaves its guest pages out of the working
+// KYTY_READ_TRIM_MB=<n> (default 4; 0: off): a read of n MiB or more leaves its guest pages out of the working
 // set once it is copied in (LibKernel::Memory::TrimGuestWorkingSet: they keep their bytes and come back at the next
 // touch). Demon's Souls streams a level's textures and meshes into its direct memory before it draws them: a new
 // game's 1080p load had 7.3 GB of guest memory resident that no cache had seen yet (E4, 10-17), against ~3.5 GB once
-// played. The texture trim takes a texture's pages only after its first full upload. Opt-in: a large read the CPU then
-// parses faults its pages back (from standby while RAM is free, from the pagefile once Windows took them).
+// played. The texture trim takes a texture's pages only after its first full upload. A large read the CPU then parses
+// faults its pages back (from standby while RAM is free, from the pagefile once Windows took them). W1 -> W2 (walking
+// out of the new-game tunnel, 10-18): 1,166 MiB available instead of 617, guest resident 4.7 GB instead of 5.2, no frame
+// over 50 ms. The trims of guest views take GuestAddressSpace's busy ranges (ae868832).
 static void TrimAfterRead(uint64_t destination, uint64_t bytes) {
 	static const uint64_t threshold = [] {
 		const char* value = std::getenv("KYTY_READ_TRIM_MB");
-		return value != nullptr ? std::strtoull(value, nullptr, 10) << 20u : uint64_t {0};
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {4}) << 20u;
 	}();
 	if (threshold != 0 && bytes >= threshold) {
 		LibKernel::Memory::TrimGuestWorkingSet(destination, bytes);
