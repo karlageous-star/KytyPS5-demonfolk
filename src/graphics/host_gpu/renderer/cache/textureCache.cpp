@@ -3868,6 +3868,10 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 	}
 	const auto range    = image.info.data;
 	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	// (Larger than the download buffer, it could not be mapped: not downloaded, and kept by the caller.)
+	if (range.size > download.Size() / 2) {
+		return false;
+	}
 	auto [mapped, offset] =
 	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
 	if (mapped == nullptr) {
@@ -4371,6 +4375,14 @@ void TextureCache::RunGarbageCollector() {
 	if (m_total_used_memory < collect_above) {
 		return;
 	}
+	// For a while after the GPU could not make an image (InsertImage), images the GPU wrote, tiled and small
+	// enough for the download buffer, go too, their bytes downloaded to guest memory first (TryDownloadImage):
+	// a switch of the graphics mode leaves the old mode's targets bound by nothing, and kept they left no room
+	// for the new mode's (issue #53: a 16 GB RX 7800 XT switching to the cinematic mode, its images unable to
+	// go to system memory).
+	constexpr uint64_t FailingTicks = 600;
+	const bool         failing      = !m_failed_images.empty() && tick < m_failed_images.back().tick + FailingTicks;
+	const uint64_t     download_max = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download).Size() / 2;
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
@@ -4386,11 +4398,16 @@ void TextureCache::RunGarbageCollector() {
 		// passed over, not counted. Never used again, kept images stay at the front of the list, and
 		// counting them meant every flip examined the same ones and deleted nothing while video memory
 		// only grew (chenxiao 45beec32: 60 candidates, 58 tiled and 2 depth, 0 deletions).
+		// A GPU-written image is kept if tiled (unless the failing while is on and it fits the download buffer:
+		// issue #53), else if below the pressure mark.
+		const auto keeps_written = [&](const Image& owner) {
+			return owner.info.IsTiled() ? !(failing && owner.info.data.size <= download_max) : !pressured;
+		};
 		const auto keeps = [&](const Image* owner) {
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
 				return true;
 			}
-			if (owner->IsGpuModified() && SafeToDownload(*owner) && (owner->info.IsTiled() || !pressured)) {
+			if (owner->IsGpuModified() && SafeToDownload(*owner) && keeps_written(*owner)) {
 				return true;
 			}
 			return false;
@@ -4420,10 +4437,7 @@ void TextureCache::RunGarbageCollector() {
 			}
 			if (owner->IsGpuModified()) {
 				const bool safe = SafeToDownload(*owner);
-				if (safe && owner->info.IsTiled()) {
-					continue;
-				}
-				if (safe && !pressured) {
+				if (safe && keeps_written(*owner)) {
 					continue;
 				}
 				if (safe && !TryDownloadImage(id)) {

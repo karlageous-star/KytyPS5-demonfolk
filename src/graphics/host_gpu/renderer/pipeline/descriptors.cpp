@@ -706,14 +706,15 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	// invalid; a sampled view of it is bound as null like an unrepresentable one, a storage view
 	// (written back) still has to be exact.
 	// past_chain: a storage view whose mips all lie past the descriptor's last mip (and past what the
-	// stored layout holds) writes mips the image does not have; it binds a null storage image (logged).
+	// stored layout holds) writes mips the image does not have; it binds a null storage image (logged). The same
+	// for a storage image the GPU could not make (issue #53): its writes are lost until the collector made room.
 	const auto bind_null = [&](const std::string& report, bool past_chain = false) -> TextureBinding {
 		if (storage && !past_chain) {
 			EXIT("%s\n", report.c_str());
 		}
 		if (m_unrepresentable_textures.insert(address).second) {
 			if (storage) {
-				std::printf("TextureCache: %s, storage view past the mip chain bound as null\n", report.c_str());
+				std::printf("TextureCache: %s, storage view bound as null\n", report.c_str());
 				std::fflush(stdout);
 			}
 			LOGF("TextureCache: %s, bound as null\n", report.c_str());
@@ -912,13 +913,16 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	desc.allow_reduced = !storage && !resource.exact_texels && !resource.depth_compare &&
 	                     resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
 
-	const bool may_fail = !storage && kyty_local_pool_image_share_mode.load(std::memory_order_relaxed) != 0;
+	// (A storage image the GPU cannot make, its memory full, is a null image too: its writes are lost until the
+	// collector made room. Issue #53: a 320x180x61 storage image of the cinematic mode on a 16 GB RX 7800 XT whose
+	// video memory the 4K targets had filled. A sampled texture is one only with KYTY_POOL_IMAGE_SHARE.)
+	const bool may_fail = storage || kyty_local_pool_image_share_mode.load(std::memory_order_relaxed) != 0;
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion, may_fail);
 	if (!id) {
 		return bind_null(fmt::format("no image could be made for the texture: {}x{} layers={} levels={} format={} "
 		                             "addr=0x{:016x} size=0x{:x}",
 		                             width, height, desc.info.resources.layers, desc.info.resources.levels,
-		                             static_cast<uint32_t>(format), desc.info.data.address, desc.info.data.size));
+		                             static_cast<uint32_t>(format), desc.info.data.address, desc.info.data.size), true);
 	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
@@ -1185,12 +1189,15 @@ bool RenderExecutor::AcquireImages(PreparedBindings& prepared) {
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
+			// (A null image - bind_null: no image could be made, issue #53 - has one level, which stands for each level
+			// the shader picks.)
+			const bool null_image = binding.desc.info.data.Empty();
 			EXIT_IF(resource.mip_count == 0u ||
-			        resource.mip_count != binding.desc.view_info.level_count);
+			        (!null_image && resource.mip_count != binding.desc.view_info.level_count));
 			binding.mip_views.reserve(resource.mip_count);
 			for (uint32_t mip = 0; mip < resource.mip_count; mip++) {
 				auto desc = binding.desc;
-				desc.view_info.base_level += mip;
+				if (!null_image) desc.view_info.base_level += mip;
 				desc.view_info.level_count = 1;
 				binding.mip_views.push_back(texture_cache.FindTexture(binding.image_id, desc));
 			}
