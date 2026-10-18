@@ -47,9 +47,49 @@ extern "C" {
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_vram_first_mode {1};
 }
 
+#if defined(_WIN32)
+extern "C" __declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long frames_to_skip,
+                                                                                  unsigned long frames_to_capture,
+                                                                                  void** back_trace,
+                                                                                  unsigned long* back_trace_hash);
+#endif
+
 namespace Libs::Graphics {
 
 namespace {
+// The GPU memory blocks in system memory (heaps without DEVICE_LOCAL) the allocator holds, and which made them: a block
+// of 64 MiB or more, and every 256 MiB more of them, is logged with the return addresses that asked for it. A heavy
+// scene's walk put +1.2 GB of private memory on within a second outside the working set (S39, 10-19: the RAM watchdog
+// ended the run at 40 MiB free) with video memory not full.
+std::atomic<int64_t>                    g_system_block_bytes {0};
+std::atomic<int64_t>                    g_system_block_report {int64_t {256} << 20};
+VkPhysicalDeviceMemoryProperties        g_block_memory_properties {};
+bool                                    BlockInSystemMemory(uint32_t type) {
+    const auto heap = g_block_memory_properties.memoryTypes[type].heapIndex;
+    return (g_block_memory_properties.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0;
+}
+void VKAPI_PTR OnBlockAllocate(VmaAllocator, uint32_t type, VkDeviceMemory, VkDeviceSize size, void*) {
+	const bool    system = BlockInSystemMemory(type);
+	const int64_t total  = system ? (g_system_block_bytes += static_cast<int64_t>(size)) : g_system_block_bytes.load();
+	int64_t       due    = g_system_block_report.load();
+	const bool    large  = size >= (uint64_t {64} << 20u);
+	const bool    step   = system && total >= due && g_system_block_report.compare_exchange_strong(due, total + (int64_t {256} << 20));
+	if (!large && !step) return;
+	std::printf("VMA block: %llu MiB of type %u (%s); system-memory blocks %lld MiB; asked from",
+	            static_cast<unsigned long long>(size >> 20u), type, system ? "system memory" : "video memory",
+	            static_cast<long long>(total >> 20));
+#if defined(_WIN32)
+	void*      frames[12] {};
+	const auto count = RtlCaptureStackBackTrace(1, 12, frames, nullptr);
+	for (unsigned short i = 0; i < count; ++i) std::printf(" %p", frames[i]);
+#endif
+	std::printf("\n");
+	std::fflush(stdout);
+}
+void VKAPI_PTR OnBlockFree(VmaAllocator, uint32_t type, VkDeviceMemory, VkDeviceSize size, void*) {
+	if (BlockInSystemMemory(type)) g_system_block_bytes -= static_cast<int64_t>(size);
+}
+const VmaDeviceMemoryCallbacks g_block_callbacks {OnBlockAllocate, OnBlockFree, nullptr};
 std::atomic<int64_t>  g_system_fallback_bytes {0};
 std::atomic<uint64_t> g_over_budget_bytes {0};
 } // namespace
@@ -97,6 +137,8 @@ bool GraphicContext::CreateAllocator() {
 	info.pVulkanFunctions = &functions;
 	info.vulkanApiVersion = VULKAN_TARGET_API_VERSION;
 	info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+	g_block_memory_properties = static_cast<VkPhysicalDeviceMemoryProperties>(physical_device_memory_properties);
+	info.pDeviceMemoryCallbacks = &g_block_callbacks;
 	if (memory_budget_ext_enabled) {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
 	}
