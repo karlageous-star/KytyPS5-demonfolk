@@ -291,6 +291,18 @@ uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask) {
 	    EmitClassMaskBitMatch(state, mask, 9, EmitLogicalAndBool(state, inf, positive)));
 }
 
+// The guest reads constants with s_buffer_load into SGPRs. Through the one read-write view of the buffers, AMD's compiler
+// made each a vector buffer_load into VGPRs (hot compute shaders: no s_buffer_load at all, 10+ dwordx4 constant loads,
+// VGPRs twice the guest's; S10 ISA). A NonWritable view of the same binding lets it see those loads as invariant and
+// keep them scalar; a shader write through the other view is no more visible to them than to the guest's scalar cache.
+bool ConstReadOnlyView() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CONST_RO_VIEW");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 bool NativeFMinMax() {
 	static const bool enabled = [] {
 		// Default on (S9 with KYTY_DWORD_BOUNDS: GPU 29.9 -> 27.4 ms a frame, 29.7 FPS); =0 the bit-exact form.

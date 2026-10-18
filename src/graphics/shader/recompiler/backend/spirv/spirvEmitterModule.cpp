@@ -189,6 +189,10 @@ void DefineDescriptorVariables(EmitterState& state) {
 		const auto pointer_type = TypePointer(state, StorageClassStorageBuffer, array_type);
 		state.storage_buffer_variable =
 		    state.builder.DefineGlobalVariable(pointer_type, StorageClassStorageBuffer);
+		if (ConstReadOnlyView() && !state.program.table_mode) {
+			state.storage_buffer_ro_variable =
+			    state.builder.DefineGlobalVariable(pointer_type, StorageClassStorageBuffer);
+		}
 		if (state.requirements.buffer_int64_atomics) {
 			const auto u64_array_type =
 			    state.builder.Type(OpTypeArray, {StorageBufferU64Type(state), count});
@@ -607,6 +611,10 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 	};
 	if (state.storage_buffer_variable != 0) {
 		Decorate(state.storage_buffer_variable, "buffers", IR::DescriptorBindingKind::Buffers);
+	}
+	if (state.storage_buffer_ro_variable != 0) {
+		Decorate(state.storage_buffer_ro_variable, "buffers_ro", IR::DescriptorBindingKind::Buffers);
+		state.builder.AddAnnotation({OpDecorate, state.storage_buffer_ro_variable, DecorationNonWritable});
 	}
 	if (state.storage_buffer_u64_variable != 0) {
 		Decorate(state.storage_buffer_u64_variable, "buffers_u64",

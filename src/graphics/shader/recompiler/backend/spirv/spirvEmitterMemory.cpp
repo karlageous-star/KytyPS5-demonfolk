@@ -1668,7 +1668,15 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		    Binary(state, OpIAdd, TypeU32(state), ctx.Arg(inst, 1), ConstantU32(state, mem.offset));
 		const auto index =
 		    Binary(state, OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
-		const auto access    = PrepareMemoryResourceAccess(state, mem);
+		auto access = PrepareMemoryResourceAccess(state, mem);
+		if (state.storage_buffer_ro_variable != 0 && access.bda_base == 0) {
+			// (KYTY_CONST_RO_VIEW: the same element of the NonWritable view; its own length for the bounds.)
+			access = PrepareStorageBufferResourceAccess(state, mem, state.storage_buffer_ro_variable,
+			                                            TypeStorageBufferPointer(state));
+			access.index_offset =
+			    EmitBinaryU32(state, OpShiftRightLogical, access.byte_offset, ConstantU32(state, 2u));
+			access.add_index_offset = true;
+		}
 		const auto element   = EmitMemoryElementIndex(state, access, index);
 		const auto condition = EmitMemoryElementInBounds(state, access, element);
 		ctx.Define(inst, EmitLoadOrZeroIfCondition(state, access.kind, condition,

@@ -395,6 +395,8 @@ struct EmitterState {
 	uint32_t                                         lane_half               = 0;
 	uint32_t                                         storage_buffer_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
+	// KYTY_CONST_RO_VIEW: the same Buffers binding as storage_buffer_variable, NonWritable, for constant reads.
+	uint32_t                                         storage_buffer_ro_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> buffer_words {}; // IR::BufferWord, when used
 	std::array<RuntimeFormat, IR::ShaderInfo::MaxBuffers> runtime_formats {}; // by buffer word
@@ -827,6 +829,8 @@ bool NativeFMinMax();
 // (shader.cpp requires it of VS, GS and PS), instead of the host's default plus an explicit flush ahead of each
 // transcendental (EmitFlushF32DenormToSignedZero).
 bool Fp32Flush();
+// KYTY_CONST_RO_VIEW=1 (default 0; changes SPIR-V): ReadConstBuffer loads through a NonWritable view of the buffers.
+bool ConstReadOnlyView();
 
 uint32_t EmitTruncF32Value(EmitterState& state, uint32_t value);
 
