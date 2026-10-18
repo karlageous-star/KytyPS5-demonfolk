@@ -36,6 +36,7 @@ extern volatile std::atomic<uint32_t> kyty_local_copy_batch_mode;
 extern volatile std::atomic<uint32_t> kyty_local_upload_batch_mode;
 extern volatile std::atomic<uint32_t> kyty_local_fault_scan_frame_mode;
 extern volatile std::atomic<uint32_t> kyty_local_precise_access_mode;
+extern volatile std::atomic_uint32_t kyty_local_protect_serial_mode;
 extern volatile std::atomic_uint32_t kyty_local_chain_bda_reads_mode;
 extern volatile std::atomic<uint32_t> kyty_local_readback_page_runs_mode;
 extern volatile std::atomic<uint32_t> kyty_local_linear_copy_spans_mode;

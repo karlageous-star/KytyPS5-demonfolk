@@ -77,6 +77,9 @@ extern "C" {
 // page, before the search of the GPU-written ranges (chenxiao 31119bdf). It relies on GPU-written pages being
 // read-watched from the write on, which only debug validators check: opt-in until a run shows it holds here.
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_sync_watch_skip_mode {0};
+// KYTY_PROTECT_SERIAL (default 1, live; chenxiao 2eaefa27): a protection change waits for any guest map, unmap or trim
+// chunk in progress (BusyUnlocked); 0 only for those in its own page-table pages. Set from the variable at start-up.
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_protect_serial_mode {1};
 }
 
 namespace VirtualMemory = Common::VirtualMemory;

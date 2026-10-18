@@ -1677,11 +1677,13 @@ private:
 	// were per page-table page; no measurable cost (an RTX 5090 desktop and an RTX 3080 laptop, 1-1 routes A-B-A).
 	// KYTY_PROTECT_SERIAL=0: the per page-table page waits only.
 	[[nodiscard]] bool BusyUnlocked(uint64_t vaddr, uint64_t size) const {
-		static const bool serial = [] {
+		static const bool from_env = [] {
 			const char* value = std::getenv("KYTY_PROTECT_SERIAL");
-			return value == nullptr || *value != '0';
+			if (value != nullptr && *value == '0') kyty_local_protect_serial_mode.store(0, std::memory_order_relaxed);
+			return true;
 		}();
-		if (serial && !m_busy.empty()) return true;
+		(void)from_env;
+		if (kyty_local_protect_serial_mode.load(std::memory_order_relaxed) != 0 && !m_busy.empty()) return true;
 		constexpr uint64_t PageTablePage = uint64_t {2} << 20u;
 		for (const auto& [begin, end]: m_busy) {
 			const auto page_begin = begin & ~(PageTablePage - 1u);
