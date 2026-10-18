@@ -2518,9 +2518,13 @@ void BufferCache::TrimGpuWrittenRanges() {
 		});
 		if (at < last) fresh.emplace_back(at, last);
 	});
-	uint64_t asked = 0;
+	// 64 MiB a pass at most (the trimmed pages are dirty: the pagefile writer must keep up); the rest next time.
+	constexpr uint64_t PassBytes = uint64_t {64} << 20u;
+	uint64_t           asked     = 0;
 	const bool async = kyty_local_async_upload_mode.load(std::memory_order_relaxed) >= 2;
-	for (const auto& [begin, end]: fresh) {
+	for (auto [begin, end]: fresh) {
+		if (asked >= PassBytes) break;
+		end = std::min(end, begin + (PassBytes - asked));
 		still.Add(begin, end - begin);
 		asked += end - begin;
 		if (async) {

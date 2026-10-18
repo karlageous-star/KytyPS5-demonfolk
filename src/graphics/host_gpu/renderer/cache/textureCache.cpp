@@ -1564,16 +1564,21 @@ void TextureCache::TrimUploadedTexture(Image& image, bool cpu_written_only) {
 }
 
 void TextureCache::TrimGpuTargets() {
-	// Once an image: only the emulator's own upload or download of it brings its pages back, and those re-arm it
-	// (frame_target_trimmed = 0). S32: re-asking every image each 600 frames asked 59 GB in 5 minutes (each ask holds
-	// its guest ranges busy) and moving got slower (27.8 vs 32.2 FPS, 100 frames over 50 ms).
-	constexpr uint64_t PassBytes = uint64_t {256} << 20u; // asked at most a pass
+	// Once an image, and only an image whose guest pages the emulator read in: one uploaded from guest memory, at least
+	// MinAge frames after that upload (its own later upload or download re-arms it: frame_target_trimmed = 0). An image
+	// never uploaded never had its pages touched. S32: re-asking every image each 600 frames asked 59 GB in 5 minutes
+	// (each ask holds its guest ranges busy), walking got slower; S33: asking every new image object, with the load's
+	// transient targets re-made over and over, asked 291 GB, the trimmed pages queued for the pagefile (1.36 GB
+	// modified) and the free RAM fell to 18 MiB at the new-game load.
+	constexpr uint64_t MinAge    = 600;                  // frames after the upload
+	constexpr uint64_t PassBytes = uint64_t {64} << 20u; // asked at most a pass
 	const uint64_t     frame     = m_frame.load(std::memory_order_relaxed) + 1;
 	uint64_t           asked     = 0;
 	m_slot_images.ForEach([&](ImageId /*id*/, Image& image) {
 		if (asked >= PassBytes || !image.registered || !image.IsGpuModified() || image.info.data.size < (1u << 20u) ||
 		    !(image.usage.render_target || image.usage.depth_target || image.usage.storage) ||
-		    image.frame_target_trimmed != 0) {
+		    image.frame_target_trimmed != 0 || image.frame_uploaded_last == UINT64_MAX ||
+		    frame - 1 < image.frame_uploaded_last + MinAge) {
 			return;
 		}
 		image.frame_target_trimmed = frame;
@@ -4470,7 +4475,8 @@ void TextureCache::RunGarbageCollector() {
 		WriteCacheMap(LiveCounters::g_cache_map_path);
 		LiveCounters::g_cache_map_due.store(false, std::memory_order_release);
 	}
-	if (kyty_local_target_ram_trim_mode.load(std::memory_order_relaxed) != 0) {
+	// (Every 30th pass, 64 MiB at most: the trimmed pages are dirty, and the pagefile writer must keep up with them.)
+	if (tick % 30 == 0 && kyty_local_target_ram_trim_mode.load(std::memory_order_relaxed) != 0) {
 		TrimGpuTargets();
 	}
 	static const bool print_memory = std::getenv("KYTY_MEMORY_STATS") != nullptr;

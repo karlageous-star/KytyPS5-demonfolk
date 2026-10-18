@@ -635,6 +635,10 @@ inline void Run(uint64_t id, const std::string& line) {
 		// vma <path>: the GPU allocator's detailed statistics (JSON: every allocation's type and size).
 		if (LiveCounters::g_vma_report != nullptr) LiveCounters::g_vma_report(arg1);
 		std::printf("LIVE_VMA id=%" PRIu64 " path=%s written=%d\n", id, arg1, LiveCounters::g_vma_report != nullptr ? 1 : 0);
+	} else if (cmd == "heap" && n >= 2) {
+		// heap <path>: the process's heaps by block size (LocalPlatform::WriteHeapCensus; stalls allocating threads).
+		const bool written = LocalPlatform::WriteHeapCensus(arg1);
+		std::printf("LIVE_HEAP id=%" PRIu64 " path=%s written=%d\n", id, arg1, written ? 1 : 0);
 	} else if (cmd == "dmap" && n >= 2) {
 		// dmap <path>: the backing view and each guest view of it (tools/backing_overlap.py).
 		const bool written = LiveCounters::g_backing_maps != nullptr && LiveCounters::g_backing_maps(arg1);

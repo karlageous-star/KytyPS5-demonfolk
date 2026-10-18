@@ -98,6 +98,11 @@ void     CloseScratchFile(uint64_t file);
 // An existing file (a UTF-8 path) for ReadScratchFile and CloseScratchFile; 0 when it cannot be opened.
 uint64_t OpenFileForReading(const char* path);
 
+// Live `heap <path>`: every heap of the process walked (Windows HeapWalk; each heap locked while it is walked, so
+// threads that allocate wait): per heap, busy bytes and blocks by block size, committed and reserved region bytes.
+// A diagnostic for test runs. False when it cannot write the file (or, Linux, does nothing).
+bool WriteHeapCensus(const char* path);
+
 #if defined(_WIN32)
 // With its output in files (run-windows.ps1's logs), the console window a launcher gave the process
 // stays empty, and closing it would end the game: the process leaves it (it closes).

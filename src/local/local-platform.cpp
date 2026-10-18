@@ -552,6 +552,53 @@ void CloseScratchFile(uint64_t file) {
 	if (file != 0) CloseHandle(reinterpret_cast<HANDLE>(file));
 }
 
+bool WriteHeapCensus(const char* path) {
+	std::FILE* file = std::fopen(path, "wb");
+	if (file == nullptr) return false;
+	std::vector<HANDLE> heaps(64);
+	DWORD               count = GetProcessHeaps(static_cast<DWORD>(heaps.size()), heaps.data());
+	if (count > heaps.size()) {
+		heaps.resize(count + 16);
+		count = GetProcessHeaps(static_cast<DWORD>(heaps.size()), heaps.data());
+	}
+	// Block sizes: < 256 B, < 4 KiB, < 64 KiB, < 1 MiB, < 16 MiB, larger.
+	static constexpr const char* Names[6] = {"<256B", "<4K", "<64K", "<1M", "<16M", ">=16M"};
+	uint64_t all_busy = 0;
+	for (DWORD i = 0; i < count && i < heaps.size(); ++i) {
+		uint64_t busy[6] {}, blocks[6] {}, committed = 0, uncommitted = 0;
+		if (HeapLock(heaps[i]) == 0) continue;
+		PROCESS_HEAP_ENTRY entry {};
+		while (HeapWalk(heaps[i], &entry) != 0) {
+			if ((entry.wFlags & PROCESS_HEAP_ENTRY_BUSY) != 0) {
+				const uint64_t size   = entry.cbData;
+				const int      bucket = size < 256 ? 0 : size < 4096 ? 1 : size < 65536 ? 2 : size < (1u << 20u) ? 3
+				                      : size < (16u << 20u) ? 4 : 5;
+				busy[bucket] += size;
+				blocks[bucket]++;
+			} else if ((entry.wFlags & PROCESS_HEAP_REGION) != 0) {
+				committed += entry.Region.dwCommittedSize;
+				uncommitted += entry.Region.dwUnCommittedSize;
+			}
+		}
+		HeapUnlock(heaps[i]);
+		uint64_t total = 0;
+		for (const auto b: busy) total += b;
+		all_busy += total;
+		std::fprintf(file, "heap %lu %p busy %llu MiB, regions committed %llu MiB reserved %llu MiB:", i, heaps[i],
+		             static_cast<unsigned long long>(total >> 20u), static_cast<unsigned long long>(committed >> 20u),
+		             static_cast<unsigned long long>(uncommitted >> 20u));
+		for (int b = 0; b < 6; ++b) {
+			if (blocks[b] != 0)
+				std::fprintf(file, " %s %llu MiB/%llu", Names[b], static_cast<unsigned long long>(busy[b] >> 20u),
+				             static_cast<unsigned long long>(blocks[b]));
+		}
+		std::fprintf(file, "\n");
+	}
+	std::fprintf(file, "all heaps busy %llu MiB\n", static_cast<unsigned long long>(all_busy >> 20u));
+	std::fclose(file);
+	return true;
+}
+
 uint64_t OpenFileForReading(const char* path) {
 	wchar_t wide[MAX_PATH * 2] {};
 	if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, MAX_PATH * 2) == 0) return 0;
@@ -634,6 +681,10 @@ uint64_t OpenKeptUncachedFile(const std::string& /*path*/) {
 
 uint64_t OpenUncachedFile(const std::string& /*path*/) {
 	return 0;
+}
+
+bool WriteHeapCensus(const char* /*path*/) {
+	return false;
 }
 
 void CloseUncachedFile(uint64_t /*file*/) {}
