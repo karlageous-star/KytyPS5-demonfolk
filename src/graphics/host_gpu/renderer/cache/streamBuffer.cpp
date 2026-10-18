@@ -29,6 +29,14 @@ extern volatile std::atomic<uint32_t> kyty_local_transfer_chain_mode;
 
 namespace Libs::Graphics {
 
+bool UploadInVideoMemory() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_UPLOAD_VRAM");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 namespace {
 
 class BufferReclaimer {
@@ -109,7 +117,8 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 	switch (usage) {
 		case MemoryUsage::DeviceLocal:
 		case MemoryUsage::Stream: return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-		case MemoryUsage::Upload:
+		case MemoryUsage::Upload: return UploadInVideoMemory() ? VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+		                                                       : VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 		case MemoryUsage::Download: return VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 	}
 	return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;

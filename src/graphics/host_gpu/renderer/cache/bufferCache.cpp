@@ -104,7 +104,7 @@ uint64_t UploadRingSize() {
 		const auto mib = std::strtoull(value, nullptr, 10);
 		if (mib >= 64 && mib <= 512) return mib * MiB;
 	}
-	return SmallUploadRingEnabled() ? 128 * MiB : 512 * MiB;
+	return SmallUploadRingEnabled() || UploadInVideoMemory() ? 128 * MiB : 512 * MiB;
 }
 
 

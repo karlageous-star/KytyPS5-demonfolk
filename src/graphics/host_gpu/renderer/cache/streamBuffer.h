@@ -27,6 +27,11 @@ enum class MemoryUsage : uint8_t {
 	Stream,
 };
 
+// KYTY_UPLOAD_VRAM=1: upload buffers (the staging ring, shader data, table uploads) in video memory the CPU writes
+// through the BAR (resizable BAR: a device-local host-visible type over all of it), not in system memory the GPU reads
+// over PCIe. The staging ring is then 128 MiB (KYTY_UPLOAD_RING_MB still sizes it).
+bool UploadInVideoMemory();
+
 inline constexpr vk::BufferUsageFlags ReadFlags =
     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eUniformBuffer |
     vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eVertexBuffer |
