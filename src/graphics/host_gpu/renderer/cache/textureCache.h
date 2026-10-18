@@ -223,6 +223,7 @@ private:
 	[[nodiscard]] DownloadPlan BuildDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void TrimUploadedTexture(Image& image, bool cpu_written_only);
+	void TrimGpuTargets();
 	// Live `cachemap <path>` (caller holds m_lock): every image and every buffer of the buffer cache, one per line.
 	void WriteCacheMap(const char* path);
 	void UploadStencil(Image& image, Buffer& source, uint64_t source_offset);
@@ -312,6 +313,7 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	std::atomic<uint64_t> m_frame {0};
 	uint64_t              m_trimmed_bytes = 0; // KYTY_TEXTURE_RAM_TRIM total
+	uint64_t              m_target_trimmed_bytes = 0; // KYTY_TARGET_RAM_TRIM total
 	// Reduced texture quality: whether a new image for `desc` may leave out its top level, and the
 	// guest addresses a lookup needed at full quality (never reduced again).
 	[[nodiscard]] bool               MayReduce(const ImageDesc& desc);

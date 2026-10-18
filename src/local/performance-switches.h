@@ -49,6 +49,7 @@ extern volatile std::atomic<uint32_t> kyty_local_sync_readback_scoped_drain_mode
 extern volatile std::atomic<uint32_t> kyty_local_sync_readback_narrow_mode;
 extern volatile std::atomic<uint32_t> kyty_local_vblank_no_burst_mode;
 extern volatile std::atomic<uint32_t> kyty_local_htile_preserve_mode;
+extern volatile std::atomic<uint32_t> kyty_local_target_ram_trim_mode;
 extern volatile std::atomic<uint32_t> kyty_local_pool_image_share_mode;
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 extern volatile std::atomic_uint32_t kyty_local_vulkan_recording_mode;
@@ -127,6 +128,8 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_IMAGE_BARRIER_DEDUPE", &kyty_local_image_barrier_dedupe},
 	    // Opt-in (default 0): 1 keeps an HTile's metadata when its depth image is deleted (textureCache.cpp).
 	    Switch {"KYTY_HTILE_PRESERVE", &kyty_local_htile_preserve_mode},
+	    // Opt-in (default 0): 1 trims the guest pages of GPU-written targets from the working set (textureCache.cpp).
+	    Switch {"KYTY_TARGET_RAM_TRIM", &kyty_local_target_ram_trim_mode},
 	    // Opt-in (default 0): 1 binds a sampled texture the GPU cannot make as a null image, not the end of the emulator
 	    // (descriptors.cpp; the layer sharing of chenxiao c3a332ba is not in this switch).
 	    Switch {"KYTY_POOL_IMAGE_SHARE", &kyty_local_pool_image_share_mode},

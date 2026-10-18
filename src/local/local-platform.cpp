@@ -387,16 +387,26 @@ uint32_t ReadUncachedAt(uint64_t file, uint64_t offset, uint32_t size, const uin
 void CountGuestFileRead(bool kernel, bool uncached, uint64_t bytes) {
 	static std::atomic<uint64_t> totals[4] {};
 	static std::atomic<uint64_t> next_report {uint64_t {1} << 30u};
+	// The buffered ones by read size (bytes and reads): < 16 KiB, < 64 KiB, < 256 KiB, < 1 MiB, larger.
+	static std::atomic<uint64_t> sized_bytes[5] {}, sized_reads[5] {};
 	totals[(kernel ? 2 : 0) + (uncached ? 1 : 0)].fetch_add(bytes, std::memory_order_relaxed);
+	if (!uncached) {
+		const int bucket = bytes < (16u << 10u) ? 0 : bytes < (64u << 10u) ? 1 : bytes < (256u << 10u) ? 2 : bytes < (1u << 20u) ? 3 : 4;
+		sized_bytes[bucket].fetch_add(bytes, std::memory_order_relaxed);
+		sized_reads[bucket].fetch_add(1, std::memory_order_relaxed);
+	}
 	const uint64_t all = totals[0].load() + totals[1].load() + totals[2].load() + totals[3].load();
 	uint64_t       due = next_report.load(std::memory_order_relaxed);
 	if (all >= due && next_report.compare_exchange_strong(due, all + (uint64_t {1} << 30u))) {
-		std::printf("File reads into guest memory: %llu MiB (AMPR %llu MiB, %llu uncached; kernel %llu MiB, %llu uncached)\n",
+		const auto mib = [](const std::atomic<uint64_t>& v) { return static_cast<unsigned long long>(v.load() >> 20u); };
+		const auto num = [](const std::atomic<uint64_t>& v) { return static_cast<unsigned long long>(v.load()); };
+		std::printf("File reads into guest memory: %llu MiB (AMPR %llu MiB, %llu uncached; kernel %llu MiB, %llu uncached); "
+		            "buffered by size <16K %llu MiB/%llu, <64K %llu/%llu, <256K %llu/%llu, <1M %llu/%llu, larger %llu/%llu\n",
 		            static_cast<unsigned long long>(all >> 20u),
-		            static_cast<unsigned long long>((totals[0].load() + totals[1].load()) >> 20u),
-		            static_cast<unsigned long long>(totals[1].load() >> 20u),
-		            static_cast<unsigned long long>((totals[2].load() + totals[3].load()) >> 20u),
-		            static_cast<unsigned long long>(totals[3].load() >> 20u));
+		            static_cast<unsigned long long>((totals[0].load() + totals[1].load()) >> 20u), mib(totals[1]),
+		            static_cast<unsigned long long>((totals[2].load() + totals[3].load()) >> 20u), mib(totals[3]),
+		            mib(sized_bytes[0]), num(sized_reads[0]), mib(sized_bytes[1]), num(sized_reads[1]), mib(sized_bytes[2]),
+		            num(sized_reads[2]), mib(sized_bytes[3]), num(sized_reads[3]), mib(sized_bytes[4]), num(sized_reads[4]));
 		std::fflush(stdout);
 	}
 }

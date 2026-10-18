@@ -48,6 +48,15 @@
 extern "C" {
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_htile_preserve_mode {0};
 }
+// KYTY_TARGET_RAM_TRIM (live; default 0 until measured): 1 lets the guest pages of render, depth and storage images the
+// GPU wrote (1 MiB or more) leave the working set at the collector's pass, each image at most every 600 frames and
+// 256 MiB a pass (LibKernel::Memory::TrimGuestWorkingSet, both views; the bytes stay and a touch brings them back).
+// The GPU holds such an image; its guest pages stayed resident from its first upload (the buffer cache reads guest
+// memory through the backing view) or a download, and nothing read them: S31 (10-18) had 1,357 MiB of target pages
+// resident through the backing view only, of 2,347 MiB of targets in the cache.
+extern "C" {
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_target_ram_trim_mode {0};
+}
 // 1: an image the CPU and the GPU both wrote parts of uploads the changed subresources of those parts (InitializeImage,
 // UploadImageRanges); 0: the whole image, as before.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_partial_mixed_upload_mode {0};
@@ -1550,6 +1559,41 @@ void TextureCache::TrimUploadedTexture(Image& image, bool cpu_written_only) {
 		AsyncUpload::Get().Kick();
 	} else {
 		LibKernel::Memory::TrimGuestWorkingSet(address, size);
+	}
+}
+
+void TextureCache::TrimGpuTargets() {
+	constexpr uint64_t Every     = 600;                   // frames between two trims of one image
+	constexpr uint64_t PassBytes = uint64_t {256} << 20u; // asked at most a pass
+	const uint64_t     frame     = m_frame.load(std::memory_order_relaxed) + 1;
+	uint64_t           asked     = 0;
+	m_slot_images.ForEach([&](ImageId /*id*/, Image& image) {
+		if (asked >= PassBytes || !image.registered || !image.IsGpuModified() || image.info.data.size < (1u << 20u) ||
+		    !(image.usage.render_target || image.usage.depth_target || image.usage.storage) ||
+		    (image.frame_target_trimmed != 0 && frame - image.frame_target_trimmed < Every)) {
+			return;
+		}
+		image.frame_target_trimmed = frame;
+		const uint64_t address     = image.info.data.address;
+		const uint64_t size        = image.info.data.size;
+		asked += size;
+		if (kyty_local_async_upload_mode.load(std::memory_order_relaxed) >= 2) {
+			AsyncUpload::Get().PushCall(
+			    [](void*, uint64_t vaddr, uint64_t bytes) { LibKernel::Memory::TrimGuestWorkingSet(vaddr, bytes); },
+			    nullptr, address, size, address, size);
+		} else {
+			LibKernel::Memory::TrimGuestWorkingSet(address, size);
+		}
+	});
+	if (asked == 0) return;
+	if (kyty_local_async_upload_mode.load(std::memory_order_relaxed) >= 2) AsyncUpload::Get().Kick();
+	static uint64_t next_report = 0;
+	m_target_trimmed_bytes += asked;
+	if (m_target_trimmed_bytes >= next_report) {
+		next_report = m_target_trimmed_bytes + (uint64_t {4} << 30u);
+		std::printf("Target RAM trim: %llu MiB of GPU-written targets' guest pages asked out of RAM so far\n",
+		            static_cast<unsigned long long>(m_target_trimmed_bytes >> 20u));
+		std::fflush(stdout);
 	}
 }
 
@@ -4421,6 +4465,9 @@ void TextureCache::RunGarbageCollector() {
 	if (LiveCounters::g_cache_map_due.load(std::memory_order_acquire)) {
 		WriteCacheMap(LiveCounters::g_cache_map_path);
 		LiveCounters::g_cache_map_due.store(false, std::memory_order_release);
+	}
+	if (kyty_local_target_ram_trim_mode.load(std::memory_order_relaxed) != 0) {
+		TrimGpuTargets();
 	}
 	static const bool print_memory = std::getenv("KYTY_MEMORY_STATS") != nullptr;
 	if (print_memory) {
