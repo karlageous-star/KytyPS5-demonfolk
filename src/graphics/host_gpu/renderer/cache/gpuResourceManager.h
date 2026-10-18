@@ -95,6 +95,7 @@ private:
 	GuestGpu*                 m_gpu = nullptr;
 	std::atomic<uint64_t> m_preparation_alias_epoch {uint64_t{1} << 32};
 	bool                      m_fault_process_pending = false;
+	uint32_t                  m_fault_process_skips   = 0; // KYTY_FAULT_SCAN_FRAME: submissions since the last scan
 	bool                      m_bda_used              = false;
 	bool                      m_gpu_flip_pending      = false;
 };

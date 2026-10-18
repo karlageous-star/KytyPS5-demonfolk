@@ -25,6 +25,10 @@ extern "C" {
 // 0 (default) keeps the 16 KiB window. Opt-in because it invalidates 4x the pages (uploads +9%, on the upload worker).
 // Measured by chenxiao 87280083 (1-1 route, 120 cap, A-B-A over 29 points): window faults -13.6%, fps +0.7%, 1% low +3.8%.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_window_stream_mode {0};
+// KYTY_FAULT_SCAN_FRAME (live): 1 scans the BDA fault bitmap (FaultManager::ProcessFaultBuffer: 8 MiB read and cleared,
+// ~170 us of GPU time) once a frame (at the GPU flip, else every 32 submissions) instead of after every submission
+// that ran a BDA shader (7 a frame in the tunnel). Its records only mark buffers for the per-frame retirement.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_fault_scan_frame_mode {0};
 }
 
 namespace Libs::Graphics {
@@ -354,8 +358,11 @@ void GpuResourceManager::PrepareBda() {
 }
 
 void GpuResourceManager::EndSubmission() {
-	if (m_fault_process_pending) {
+	if (m_fault_process_pending &&
+	    (kyty_local_fault_scan_frame_mode.load(std::memory_order_relaxed) == 0 || m_gpu_flip_pending ||
+	     ++m_fault_process_skips >= 32)) {
 		m_fault_process_pending = false;
+		m_fault_process_skips   = 0;
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
