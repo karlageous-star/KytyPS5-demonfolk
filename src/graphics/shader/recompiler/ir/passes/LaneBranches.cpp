@@ -2,6 +2,10 @@
 
 #include "graphics/shader/recompiler/ir/Value.h"
 
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <string_view>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -79,6 +83,12 @@ int BlockIndex(const Program& program, uint32_t id) {
 LaneBranchStats ConvertLaneBranches(Program& program) {
 	LaneBranchStats stats;
 	if (program.blocks.size() != program.block_info.size()) return stats;
+	// KYTY_LANE_DEBUG=<hash>: why each exec branch of that program converts or not.
+	static const uint64_t debug_hash = [] {
+		const char* value = std::getenv("KYTY_LANE_DEBUG");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : uint64_t {0};
+	}();
+	const bool debug = debug_hash != 0 && program.shader_hash == debug_hash;
 	bool compute_derivatives = false;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: block->Instructions())
@@ -101,7 +111,10 @@ LaneBranchStats ConvertLaneBranches(Program& program) {
 		if (exec_inst == nullptr) continue;
 		const uint32_t region_id = negated ? term.false_block : term.true_block;
 		const uint32_t skip_id   = negated ? term.true_block : term.false_block;
-		if (skip_id != term.merge_block || region_id == term.merge_block) continue;
+		if (skip_id != term.merge_block || region_id == term.merge_block) {
+			if (debug) std::printf("LANE_DEBUG block %u: the skip edge is not the merge\n", info.id);
+			continue;
+		}
 		const int r = BlockIndex(program, region_id);
 		const int m = BlockIndex(program, term.merge_block);
 		if (r < 0 || m < 0 || static_cast<size_t>(r) == p) continue;
@@ -111,12 +124,23 @@ LaneBranchStats ConvertLaneBranches(Program& program) {
 		const auto& region_term = program.block_info[r].terminator;
 		if (region_term.kind != CFG::TerminatorKind::Branch || region_term.loop_header ||
 		    region_term.true_block != term.merge_block || region->ImmPredecessors().size() != 1 ||
-		    region->ImmPredecessors()[0] != branch || merge->ImmPredecessors().size() != 2)
+		    region->ImmPredecessors()[0] != branch || merge->ImmPredecessors().size() != 2) {
+			if (debug) {
+				std::printf("LANE_DEBUG block %u: region %u (terminator %d, true %u, loop %d, preds %zu) merge %u (preds %zu)\n",
+				            info.id, region_id, static_cast<int>(region_term.kind), region_term.true_block,
+				            region_term.loop_header ? 1 : 0, region->ImmPredecessors().size(), term.merge_block,
+				            merge->ImmPredecessors().size());
+			}
 			continue;
+		}
 		stats.candidates++;
 		bool refused = false;
 		for (const auto& inst: region->Instructions()) {
 			if (RefusedInRegion(inst.GetOpcode(), compute_derivatives)) {
+				if (debug) {
+					std::printf("LANE_DEBUG block %u: region %u has %s\n", info.id, region_id,
+					            std::string(ValueOpcodeName(inst.GetOpcode())).c_str());
+				}
 				refused = true;
 				break;
 			}
@@ -153,6 +177,17 @@ LaneBranchStats ConvertLaneBranches(Program& program) {
 			} else {
 				refused = !(from_region == from_branch);
 			}
+			if (refused && debug) {
+				const bool select = value != nullptr && IsSelect(value->GetOpcode());
+				std::printf("LANE_DEBUG block %u: phi %s from the region is %s%s (in region %d, select on E %d, old is "
+				            "the skip value %d)\n",
+				            info.id, std::string(ValueOpcodeName(inst.GetOpcode())).c_str(),
+				            value != nullptr ? std::string(ValueOpcodeName(value->GetOpcode())).c_str() : "a constant",
+				            inst.Flags<Type>() == Type::U1 ? " (U1)" : "",
+				            value != nullptr && value->Parent() == region ? 1 : 0,
+				            select && InstOf(value->Arg(0)) == exec_inst ? 1 : 0,
+				            select && value->Arg(2).Resolve() == from_branch ? 1 : 0);
+			}
 			if (refused) break;
 		}
 		if (refused) {
@@ -178,6 +213,7 @@ LaneBranchStats ConvertLaneBranches(Program& program) {
 		if (reference != branch->end()) reference->SetArg(0, lane_condition);
 		info.condition = lane_condition;
 		stats.converted++;
+		if (debug) std::printf("LANE_DEBUG block %u: converted (region %u)\n", info.id, region_id);
 	}
 	return stats;
 }
