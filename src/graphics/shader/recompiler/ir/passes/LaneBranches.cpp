@@ -2,6 +2,7 @@
 
 #include "graphics/shader/recompiler/ir/Value.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -80,11 +81,28 @@ int BlockIndex(const Program& program, uint32_t id) {
 
 // Whether a lane condition holds only where E holds: E itself, or a conjunction with such a conjunct (exec narrowed
 // inside the region: s_and_saveexec, v_cmpx).
-bool Implies(const Inst* condition, const Inst* exec, int depth = 0) {
-	if (condition == nullptr || depth > 32) return false;
+// The leaves of a conjunction (LogicalAnd trees), a non-instruction leaf as null.
+void Conjuncts(const Inst* condition, std::vector<const Inst*>& leaves, int depth = 0) {
+	if (condition != nullptr && condition->GetOpcode() == ValueOpcode::LogicalAnd && depth < 32 && leaves.size() < 64) {
+		Conjuncts(InstOf(condition->Arg(0)), leaves, depth + 1);
+		Conjuncts(InstOf(condition->Arg(1)), leaves, depth + 1);
+		return;
+	}
+	leaves.push_back(condition);
+}
+
+// ... a condition implies E when every conjunct of E is one of its conjuncts (whatever the order or nesting).
+bool Implies(const Inst* condition, const Inst* exec) {
+	if (condition == nullptr || exec == nullptr) return false;
 	if (condition == exec) return true;
 	if (condition->GetOpcode() != ValueOpcode::LogicalAnd) return false;
-	return Implies(InstOf(condition->Arg(0)), exec, depth + 1) || Implies(InstOf(condition->Arg(1)), exec, depth + 1);
+	std::vector<const Inst*> have, need;
+	Conjuncts(condition, have);
+	Conjuncts(exec, need);
+	for (const Inst* leaf: need) {
+		if (leaf == nullptr || std::find(have.begin(), have.end(), leaf) == have.end()) return false;
+	}
+	return true;
 }
 
 // What a lane outside E read at the merge when the whole wave ran the region (the uniform branch): true when it is
