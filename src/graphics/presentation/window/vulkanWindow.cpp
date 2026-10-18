@@ -114,6 +114,16 @@ static void AddPipelineBinaryExtensions(const std::vector<vk::ExtensionPropertie
 	}
 }
 
+// KYTY_PIPELINE_STATS=<hash,...> (diagnostic): the selected programs' pipelines report their statistics and ISA.
+static void AddPipelineStatsExtension(const std::vector<vk::ExtensionProperties>& available,
+                                      std::vector<const char*>&                   extensions) {
+	const char* setting = std::getenv("KYTY_PIPELINE_STATS");
+	if (setting != nullptr && *setting != '\0' &&
+	    HasExtension(available, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+		extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+	}
+}
+
 static bool HasLayer(const std::vector<vk::LayerProperties>& layers, const char* name) {
 	return std::any_of(layers.begin(), layers.end(),
 	                   [name](const auto& layer) { return strcmp(layer.layerName, name) == 0; });
@@ -901,6 +911,13 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 			create_info.pNext                   = &internal_cache;
 		}
 	}
+	vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable_properties {};
+	if (HasExtension(device_extensions, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+		executable_properties.pipelineExecutableInfo = VK_TRUE;
+		executable_properties.pNext                  = const_cast<void*>(create_info.pNext);
+		create_info.pNext                            = &executable_properties;
+		graphics.pipeline_stats_enabled              = true;
+	}
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = queue_create_count;
@@ -1316,6 +1333,7 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
 		}
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
+		AddPipelineStatsExtension(available_extensions, device_extensions);
 	}
 
 	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);
@@ -1459,6 +1477,7 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 		}
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
+		AddPipelineStatsExtension(available_extensions, device_extensions);
 	}
 	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);
 	const VulkanExtensions no_layers {};

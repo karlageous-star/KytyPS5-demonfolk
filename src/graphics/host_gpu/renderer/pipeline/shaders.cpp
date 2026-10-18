@@ -28,7 +28,9 @@
 #include <cstdarg>
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <limits>
+#include <string>
 #include <span>
 #include <vector>
 
@@ -277,6 +279,78 @@ uint64_t PipelineCreations() {
 }
 int64_t PipelineLastCreation() {
 	return g_pipeline_last_creation.load(std::memory_order_acquire);
+}
+
+// KYTY_PIPELINE_STATS=<hash,...>: whether this program's pipeline reports its statistics and ISA.
+static bool PipelineStatsSelected(const GraphicContext& graphics, uint64_t hash) {
+	if (!graphics.pipeline_stats_enabled) return false;
+	static const std::string selected = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_STATS");
+		return value != nullptr ? std::string(value) : std::string();
+	}();
+	char text[24];
+	std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
+	return selected.find(text) != std::string::npos;
+}
+
+// _PipelineStats/<stage>_<hash>.txt: each executable's statistics (registers, spills, LDS) and the driver's text
+// representations (the ISA).
+static void WritePipelineStats(GraphicContext& graphics, vk::Pipeline handle, const char* stage, uint64_t hash) {
+	const char* dir = std::getenv("KYTY_PIPELINE_STATS_DIR");
+	std::string path = dir != nullptr && *dir != '\0' ? dir : "_PipelineStats";
+	std::filesystem::create_directories(path);
+	char name[64];
+	std::snprintf(name, sizeof(name), "/%s_%016llx.txt", stage, static_cast<unsigned long long>(hash));
+	FILE* file = std::fopen((path + name).c_str(), "w");
+	if (file == nullptr) return;
+	vk::PipelineInfoKHR pipeline_info {};
+	pipeline_info.pipeline = handle;
+	uint32_t count         = 0;
+	(void)graphics.device.getPipelineExecutablePropertiesKHR(&pipeline_info, &count, nullptr);
+	std::vector<vk::PipelineExecutablePropertiesKHR> executables(count);
+	(void)graphics.device.getPipelineExecutablePropertiesKHR(&pipeline_info, &count, executables.data());
+	for (uint32_t index = 0; index < count; ++index) {
+		std::fprintf(file, "== executable %u: %s (%s) subgroup %u\n", index, executables[index].name.data(),
+		             executables[index].description.data(), executables[index].subgroupSize);
+		vk::PipelineExecutableInfoKHR executable {};
+		executable.pipeline        = handle;
+		executable.executableIndex = index;
+		uint32_t stat_count        = 0;
+		(void)graphics.device.getPipelineExecutableStatisticsKHR(&executable, &stat_count, nullptr);
+		std::vector<vk::PipelineExecutableStatisticKHR> statistics(stat_count);
+		(void)graphics.device.getPipelineExecutableStatisticsKHR(&executable, &stat_count, statistics.data());
+		for (const auto& statistic: statistics) {
+			std::fprintf(file, "  %s = ", statistic.name.data());
+			switch (statistic.format) {
+				case vk::PipelineExecutableStatisticFormatKHR::eBool32:
+					std::fprintf(file, "%u", static_cast<unsigned>(statistic.value.b32));
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eInt64:
+					std::fprintf(file, "%lld", static_cast<long long>(statistic.value.i64));
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eUint64:
+					std::fprintf(file, "%llu", static_cast<unsigned long long>(statistic.value.u64));
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eFloat64: std::fprintf(file, "%g", statistic.value.f64); break;
+			}
+			std::fprintf(file, "  (%s)\n", statistic.description.data());
+		}
+		uint32_t text_count = 0;
+		(void)graphics.device.getPipelineExecutableInternalRepresentationsKHR(&executable, &text_count, nullptr);
+		std::vector<vk::PipelineExecutableInternalRepresentationKHR> texts(text_count);
+		(void)graphics.device.getPipelineExecutableInternalRepresentationsKHR(&executable, &text_count, texts.data());
+		std::vector<std::vector<char>> storage(text_count);
+		for (uint32_t i = 0; i < text_count; ++i) {
+			storage[i].resize(texts[i].dataSize + 1);
+			texts[i].pData = storage[i].data();
+		}
+		(void)graphics.device.getPipelineExecutableInternalRepresentationsKHR(&executable, &text_count, texts.data());
+		for (uint32_t i = 0; i < text_count; ++i) {
+			std::fprintf(file, "-- %s (%s)\n", texts[i].name.data(), texts[i].description.data());
+			if (texts[i].isText) std::fprintf(file, "%s\n", storage[i].data());
+		}
+	}
+	std::fclose(file);
 }
 
 // The static precompile's pipeline when it holds this one (no compilation), else built as `build` says.
@@ -781,6 +855,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;
+	const bool stats = PipelineStatsSelected(graphics, input_info.stage.program->shader_hash);
+	if (stats) {
+		info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR |
+		              vk::PipelineCreateFlagBits::eCaptureInternalRepresentationsKHR;
+	}
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
@@ -797,6 +876,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	                         });
 	CompileTrace("end CS hash=%016llx result=%d",
 	             static_cast<unsigned long long>(input_info.stage.program->shader_hash), static_cast<int>(result));
+	if (stats && result == vk::Result::eSuccess && pipeline.pipeline != nullptr) {
+		WritePipelineStats(graphics, pipeline.pipeline, "CS", input_info.stage.program->shader_hash);
+	}
 	NotePipelineCreated();
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));

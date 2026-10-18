@@ -49,6 +49,9 @@ struct GraphicContext {
 	// VK_KHR_pipeline_binary (and maintenance5's create flags) is enabled: the static precompile's
 	// pipelines are its binaries instead (pipelineBinaries.h); in the precompile, its output.
 	bool                               pipeline_binaries_enabled             = false;
+	// KYTY_PIPELINE_STATS=<hash,...>: VK_KHR_pipeline_executable_properties for those programs' pipelines (register
+	// counts and the driver's ISA, written to _PipelineStats).
+	bool                               pipeline_stats_enabled                = false;
 	// False (the emulator): the driver keeps no copy of its own of the pipelines it makes (the
 	// precompile's captures of static cache hits come from that copy).
 	bool                               pipeline_binary_internal_cache        = true;
