@@ -31,8 +31,9 @@ namespace Libs::Graphics {
 
 bool UploadInVideoMemory() {
 	static const bool enabled = [] {
+		// Default on (S13: 30.8 FPS, private memory -250 MB, GPU busy 25.8 ms); =0 keeps the ring in system memory.
 		const char* value = std::getenv("KYTY_UPLOAD_VRAM");
-		return value != nullptr && value[0] == '1';
+		return !(value != nullptr && value[0] == '0');
 	}();
 	return enabled;
 }

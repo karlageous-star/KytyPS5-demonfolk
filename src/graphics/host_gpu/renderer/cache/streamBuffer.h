@@ -27,7 +27,7 @@ enum class MemoryUsage : uint8_t {
 	Stream,
 };
 
-// KYTY_UPLOAD_VRAM=1: the staging ring in video memory the CPU writes through the BAR (resizable BAR: a device-local
+// KYTY_UPLOAD_VRAM (default on, =0 off): the staging ring in video memory the CPU writes through the BAR (resizable BAR: a device-local
 // host-visible type over all of it), not in system memory the GPU reads over PCIe; 128 MiB then (KYTY_UPLOAD_RING_MB
 // still sizes it). Only the ring, which the CPU only writes: the shader data and table rings are read back (S12: with
 // them there the frame was CPU-bound, 27.8 FPS).
