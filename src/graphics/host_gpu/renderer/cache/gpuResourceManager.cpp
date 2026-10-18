@@ -28,7 +28,8 @@ extern "C" {
 // KYTY_FAULT_SCAN_FRAME (live): 1 scans the BDA fault bitmap (FaultManager::ProcessFaultBuffer: 8 MiB read and cleared,
 // ~170 us of GPU time) once a frame (at the GPU flip, else every 32 submissions) instead of after every submission
 // that ran a BDA shader (7 a frame in the tunnel). Its records only mark buffers for the per-frame retirement.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_fault_scan_frame_mode {0};
+// Default 1 (S3, in-session: +0.35 FPS, ahead in all five rounds); 0 scans after every such submission.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_fault_scan_frame_mode {1};
 }
 
 namespace Libs::Graphics {
