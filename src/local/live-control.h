@@ -74,8 +74,16 @@ inline std::atomic<uint32_t> g_render_tid {0};
 // Render-thread stack bounds for the frame-pointer walk.
 inline uint64_t             g_stack_low = 0, g_stack_high = 0;
 constexpr size_t             SampleWords = 16;
-inline uint64_t              g_samples[1u << 23];
-inline uint64_t              g_sample_tsc[(1u << 23) / SampleWords]; // Windows: each sample's TSC
+// The profile's sample buffers, made by the first `prof` (EnsureSamples): 68 MiB of static arrays held in RAM in
+// every run before (S27).
+constexpr size_t             SampleCapacity = size_t {1} << 23u; // words
+inline uint64_t*             g_samples    = nullptr;
+inline uint64_t*             g_sample_tsc = nullptr; // Windows: each sample's TSC
+inline void                  EnsureSamples() {
+	if (g_samples == nullptr) g_samples = static_cast<uint64_t*>(std::calloc(SampleCapacity, sizeof(uint64_t)));
+	if (g_sample_tsc == nullptr)
+		g_sample_tsc = static_cast<uint64_t*>(std::calloc(SampleCapacity / SampleWords, sizeof(uint64_t)));
+}
 inline std::atomic<uint32_t> g_sample_count {0};
 inline std::atomic_bool      g_process {false};
 
@@ -260,7 +268,7 @@ inline void ProfSignal(int /*signal*/, siginfo_t* /*info*/, void* context) {
 	const auto  pc  = static_cast<uint64_t>(uc->uc_mcontext.gregs[REG_RIP]);
 	const auto  rsp = static_cast<uint64_t>(uc->uc_mcontext.gregs[REG_RSP]);
 	const auto  idx = g_sample_count.fetch_add(1, std::memory_order_relaxed);
-	if (SampleWords * (size_t(idx) + 1) <= std::size(g_samples)) {
+	if (SampleWords * (size_t(idx) + 1) <= SampleCapacity) {
 		auto* record = g_samples + SampleWords * size_t(idx);
 		record[0]    = pc;
 		if (g_process.load(std::memory_order_relaxed)) {
@@ -310,6 +318,7 @@ inline void Profile(uint64_t id, double seconds, const char* path, bool process,
 	}
 	timer_t timer {};
 	if (timer_create(clock, &event, &timer) != 0) return;
+	EnsureSamples();
 	g_sample_count.store(0);
 	itimerspec spec {};
 	spec.it_interval.tv_nsec = 1000000000L / 4000;
@@ -318,7 +327,7 @@ inline void Profile(uint64_t id, double seconds, const char* path, bool process,
 	std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
 	timer_delete(timer);
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
-	const auto count = std::min<uint32_t>(g_sample_count.load(), std::size(g_samples) / SampleWords);
+	const auto count = std::min<uint32_t>(g_sample_count.load(), SampleCapacity / SampleWords);
 	if (auto* out = std::fopen(path, "wb")) {
 		std::fwrite(g_samples, sizeof(uint64_t), SampleWords * size_t(count), out);
 		std::fclose(out);
@@ -354,6 +363,7 @@ inline void Profile(uint64_t id, double seconds, const char* path, bool process,
 			return;
 		}
 	}
+	EnsureSamples();
 	g_sample_count.store(0);
 	LocalPlatform::PrepareSampling();
 	// KYTY_PROF_HZ (default 4000): fewer suspensions distort lock and page-fault timing less.
@@ -369,7 +379,7 @@ inline void Profile(uint64_t id, double seconds, const char* path, bool process,
 	auto       next   = begin;
 	while (next < end) {
 		const auto idx = g_sample_count.load(std::memory_order_relaxed);
-		if (SampleWords * (size_t(idx) + 1) > std::size(g_samples)) break;
+		if (SampleWords * (size_t(idx) + 1) > SampleCapacity) break;
 		if (LocalPlatform::SampleThread(thread, stack_low, stack_high, g_samples + SampleWords * size_t(idx),
 		                                SampleWords)) {
 			g_sample_tsc[idx] = __rdtsc();
@@ -381,7 +391,7 @@ inline void Profile(uint64_t id, double seconds, const char* path, bool process,
 	const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
 	const double tsc_hz  = static_cast<double>(__rdtsc() - tsc0) / elapsed;
 	if (tid != 0) LocalPlatform::CloseThreadForSampling(thread);
-	const auto count = std::min<uint32_t>(g_sample_count.load(), std::size(g_samples) / SampleWords);
+	const auto count = std::min<uint32_t>(g_sample_count.load(), SampleCapacity / SampleWords);
 	if (auto* out = std::fopen(path, "wb")) {
 		std::fwrite(g_samples, sizeof(uint64_t), SampleWords * size_t(count), out);
 		std::fclose(out);
@@ -477,6 +487,7 @@ inline void Run(uint64_t id, const std::string& line) {
 			Profile(id, std::strtod(arg2, nullptr), path, false, false, static_cast<uint32_t>(std::strtoul(arg1, nullptr, 10)));
 #endif
 	} else if ((cmd == "trace" || cmd == "tracew" || cmd == "tracem") && n == 3) {
+		LiveTrace::EnsureRecords();
 		LiveTrace::g_count.store(0);
 		LiveTrace::g_writes_on.store(cmd == "tracew");
 		LiveTrace::g_mark_next.store(0);

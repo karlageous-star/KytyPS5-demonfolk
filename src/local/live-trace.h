@@ -64,7 +64,12 @@ struct Record {
 constexpr size_t           Capacity = 1u << 22;
 inline std::atomic_bool     g_on {false};
 inline std::atomic<uint64_t> g_count {0};
-inline Record               g_records[Capacity];
+// The ring, made by the first trace (EnsureRecords): 128 MiB a static array held in RAM in every run (S27: ~61 MiB of
+// it resident with no trace taken).
+inline Record*              g_records = nullptr;
+inline void                 EnsureRecords() {
+	if (g_records == nullptr) g_records = static_cast<Record*>(std::calloc(Capacity, sizeof(Record)));
+}
 
 // GPU buffer writes and readback ranges as events (live `tracew`): producers are matched offline.
 inline std::atomic_bool g_writes_on {false};
@@ -92,7 +97,7 @@ inline void (*g_read_marks)(uint32_t count) = nullptr;
 
 inline void Append(uint32_t type, uint64_t a, uint64_t b) {
 	const auto index = g_count.fetch_add(1, std::memory_order_relaxed);
-	if (index < Capacity) g_records[index] = {__rdtsc(), 0, type, a, b};
+	if (index < Capacity && g_records != nullptr) g_records[index] = {__rdtsc(), 0, type, a, b};
 }
 
 inline uint32_t ThreadId() {
@@ -103,7 +108,7 @@ inline uint32_t ThreadId() {
 inline void Event(uint32_t type, uint64_t a = 0, uint64_t b = 0) {
 	if (!g_on.load(std::memory_order_relaxed)) return;
 	const auto index = g_count.fetch_add(1, std::memory_order_relaxed);
-	if (index >= Capacity) return;
+	if (index >= Capacity || g_records == nullptr) return;
 	g_records[index] = {__rdtsc(), ThreadId(), type, a, b};
 }
 
@@ -121,7 +126,7 @@ struct SlowOsCallScope {
 
 // Called by the live thread.
 inline void Dump(const char* path) {
-	const auto count = std::min<uint64_t>(g_count.load(), Capacity);
+	const auto count = g_records != nullptr ? std::min<uint64_t>(g_count.load(), Capacity) : 0;
 	if (auto* out = std::fopen(path, "wb")) {
 		std::fwrite(g_records, sizeof(Record), count, out);
 		std::fclose(out);
