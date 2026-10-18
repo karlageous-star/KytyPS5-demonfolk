@@ -287,8 +287,17 @@ uint64_t OpenKeptReadFile(const std::string& path, uint64_t* size) {
 	if (wide_size <= 0) return 0;
 	std::wstring wide(static_cast<size_t>(wide_size), L' ');
 	MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wide.data(), wide_size);
+	// KYTY_KEPT_READ_SEQUENTIAL (default 1; 0: no hint): FILE_FLAG_SEQUENTIAL_SCAN, so the cache manager unmaps the
+	// views behind a read and its pages go to the standby list (available memory) instead of staying in the system
+	// cache's working set. In play the file cache held 2.0-2.2 GB of the game's buffered reads (under 1 MiB) while
+	// available RAM was 370-450 MiB (OWNER3, 10-19); uncached reads from 64 KiB lost FPS (S35). Same bytes, read-ahead
+	// kept.
+	static const bool sequential = [] {
+		const char* value = std::getenv("KYTY_KEPT_READ_SEQUENTIAL");
+		return value == nullptr || value[0] != '0';
+	}();
 	HANDLE handle = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-	                            FILE_ATTRIBUTE_NORMAL, nullptr);
+	                            sequential ? FILE_FLAG_SEQUENTIAL_SCAN : FILE_ATTRIBUTE_NORMAL, nullptr);
 	if (handle == INVALID_HANDLE_VALUE) return 0;
 	LARGE_INTEGER length {};
 	if (GetFileSizeEx(handle, &length) == 0) {
