@@ -293,8 +293,9 @@ uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask) {
 
 bool NativeFMinMax() {
 	static const bool enabled = [] {
+		// Default on (S9 with KYTY_DWORD_BOUNDS: GPU 29.9 -> 27.4 ms a frame, 29.7 FPS); =0 the bit-exact form.
 		const char* value = std::getenv("KYTY_NATIVE_FMINMAX");
-		return value != nullptr && value[0] == '1';
+		return !(value != nullptr && value[0] == '0');
 	}();
 	return enabled;
 }

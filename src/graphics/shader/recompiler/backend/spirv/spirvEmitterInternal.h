@@ -818,7 +818,7 @@ uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
 uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask);
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
-// KYTY_NATIVE_FMINMAX=1: float min/max/med3 as GLSL NMin/NMax, the host's own v_min/v_max (RDNA2 like the guest:
+// KYTY_NATIVE_FMINMAX (default on, =0 off): float min/max/med3 as GLSL NMin/NMax, the host's own v_min/v_max (RDNA2 like the guest:
 // the non-NaN operand, -0 below +0) instead of the bit-exact classification (~15 instructions each).
 bool NativeFMinMax();
 

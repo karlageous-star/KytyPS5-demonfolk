@@ -836,11 +836,11 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		properties.pNext = &robustness2_properties;
 		physical_device.getProperties2(&properties);
 		const char* setting  = std::getenv("KYTY_ROBUST_BUFFERS");
-		// KYTY_DWORD_BOUNDS=1: 4-byte device bounds stand for the shaders' checks too, with every guest storage
-		// buffer range bound in whole dwords (ShaderRecompiler::StorageBufferRange).
+		// KYTY_DWORD_BOUNDS (default on, =0 off): 4-byte device bounds stand for the shaders' checks too, with every
+		// guest storage buffer range bound in whole dwords (ShaderRecompiler::StorageBufferRange).
 		const char* dwords       = std::getenv("KYTY_DWORD_BOUNDS");
 		const bool  dword_bounds = robustness2_properties.robustStorageBufferAccessSizeAlignment == 4 &&
-		                          dwords != nullptr && std::string_view(dwords) == "1";
+		                          !(dwords != nullptr && std::string_view(dwords) == "0");
 		device_buffer_bounds = (robustness2_properties.robustStorageBufferAccessSizeAlignment == 1 || dword_bounds) &&
 		                       !(setting != nullptr && std::string_view(setting) == "0");
 		ShaderRecompiler::SetStorageRangeDwords(device_buffer_bounds && dword_bounds);
