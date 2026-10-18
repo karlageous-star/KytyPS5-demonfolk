@@ -164,9 +164,9 @@ bool CommandBuffer::BatchCopy(const Buffer& source, uint64_t source_offset, cons
 	    size > CopyBatchMaxBytes || ((source_offset | destination_offset | size) & 3u) != 0) {
 		return false;
 	}
+	if (!source.HasDeviceAddress() || !destination.HasDeviceAddress()) return false;
 	const auto source_address      = source.BufferDeviceAddress();
 	const auto destination_address = destination.BufferDeviceAddress();
-	if (source_address == 0 || destination_address == 0) return false;
 	EndRendering(); // (a rendering's Handle() left no batch)
 	const TransferAccess accesses[] = {
 	    {static_cast<VkBuffer>(source.Handle()), source_offset, source_offset + size, false},
@@ -201,8 +201,8 @@ void CommandBuffer::FlushCopyBatch() const {
 	const auto bytes = count * sizeof(BatchedCopy);
 	auto&      table = m_context.GetBufferCache().GetTableUploadBuffer();
 	// No wait for room: a wait could submit this very buffer. Without room the copies are transfers.
-	const auto [data, offset] = table.BufferDeviceAddress() != 0 ? table.Map(bytes, 16, false)
-	                                                              : std::pair<uint8_t*, uint64_t> {nullptr, 0};
+	const auto [data, offset] = table.HasDeviceAddress() ? table.Map(bytes, 16, false)
+	                                                      : std::pair<uint8_t*, uint64_t> {nullptr, 0};
 	if (data != nullptr) {
 		std::memcpy(data, m_copy_batch.data(), bytes);
 		table.Commit();
