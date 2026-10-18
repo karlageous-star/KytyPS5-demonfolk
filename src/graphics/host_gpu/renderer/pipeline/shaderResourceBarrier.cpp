@@ -4,7 +4,13 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <atomic>
 #include <cstring>
+
+extern "C" {
+// KYTY_PRECISE_ACCESS (default 0; live): MakeShaderAccessDependency, MakeShaderWriteHazardDependency.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_precise_access_mode {0};
+}
 
 namespace Libs::Graphics {
 
@@ -38,16 +44,38 @@ VulkanMemoryBarrier MakeShaderWriteDependency() {
 	return barrier;
 }
 
+// KYTY_PRECISE_ACCESS (live): 1 names the device accesses a shader dependency covers instead of MEMORY_READ/WRITE (which
+// a driver may also treat as non-cached clients': L2 written back and invalidated at every dispatch barrier). Host
+// access was never covered (no HOST stage), so the dependency is the same.
+static vk::AccessFlags DeviceReadAccess() {
+	return vk::AccessFlagBits::eIndirectCommandRead | vk::AccessFlagBits::eIndexRead |
+	       vk::AccessFlagBits::eVertexAttributeRead | vk::AccessFlagBits::eUniformRead |
+	       vk::AccessFlagBits::eInputAttachmentRead | vk::AccessFlagBits::eShaderRead |
+	       vk::AccessFlagBits::eColorAttachmentRead | vk::AccessFlagBits::eDepthStencilAttachmentRead |
+	       vk::AccessFlagBits::eTransferRead;
+}
+
+static vk::AccessFlags DeviceWriteAccess() {
+	return vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eColorAttachmentWrite |
+	       vk::AccessFlagBits::eDepthStencilAttachmentWrite | vk::AccessFlagBits::eTransferWrite;
+}
+
+static bool PreciseAccess() {
+	return kyty_local_precise_access_mode.load(std::memory_order_relaxed) != 0;
+}
+
 VulkanMemoryBarrier MakeShaderAccessDependency() {
 	VulkanMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	barrier.dstAccessMask = PreciseAccess() ? DeviceReadAccess() | DeviceWriteAccess()
+	                                        : vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 	return barrier;
 }
 
 VulkanMemoryBarrier MakeShaderWriteHazardDependency() {
 	VulkanMemoryBarrier barrier {};
-	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	barrier.srcAccessMask = PreciseAccess() ? DeviceReadAccess() | DeviceWriteAccess()
+	                                        : vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
 	return barrier;
 }

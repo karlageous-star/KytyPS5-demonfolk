@@ -2036,6 +2036,18 @@ void CommandProcessor::EmitGlobalBarrier() {
 	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
 	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	if (kyty_local_precise_access_mode.load(std::memory_order_relaxed) != 0) {
+		// KYTY_PRECISE_ACCESS: the device's accesses by name (no HOST stage either way: the same dependency).
+		constexpr auto writes = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eColorAttachmentWrite |
+		                        vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite;
+		constexpr auto reads  = vk::AccessFlagBits2::eIndirectCommandRead | vk::AccessFlagBits2::eIndexRead |
+		                       vk::AccessFlagBits2::eVertexAttributeRead | vk::AccessFlagBits2::eUniformRead |
+		                       vk::AccessFlagBits2::eInputAttachmentRead | vk::AccessFlagBits2::eShaderRead |
+		                       vk::AccessFlagBits2::eColorAttachmentRead |
+		                       vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eTransferRead;
+		barrier.srcAccessMask = writes;
+		barrier.dstAccessMask = reads | writes;
+	}
 
 	vk::DependencyInfo dependency {};
 	dependency.memoryBarrierCount = 1;
