@@ -310,6 +310,8 @@ enum : uint32_t {
 	GlslUMin            = 38,
 	GlslFMax            = 40,
 	GlslFClamp          = 43,
+	GlslNMin            = 79,
+	GlslNMax            = 80,
 	GlslSClamp          = 45,
 	GlslLdexp           = 53,
 	GlslFma             = 50,
@@ -816,6 +818,9 @@ uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
 uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask);
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
+// KYTY_NATIVE_FMINMAX=1: float min/max/med3 as GLSL NMin/NMax, the host's own v_min/v_max (RDNA2 like the guest:
+// the non-NaN operand, -0 below +0) instead of the bit-exact classification (~15 instructions each).
+bool NativeFMinMax();
 
 uint32_t EmitTruncF32Value(EmitterState& state, uint32_t value);
 

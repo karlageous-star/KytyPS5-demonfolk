@@ -291,7 +291,21 @@ uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask) {
 	    EmitClassMaskBitMatch(state, mask, 9, EmitLogicalAndBool(state, inf, positive)));
 }
 
+bool NativeFMinMax() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NATIVE_FMINMAX");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	if (NativeFMinMax()) {
+		const auto ret = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpExtInst, TypeF32(state), ret, GlslStd450(state), max_value ? GlslNMax : GlslNMin, lhs, rhs});
+		return ret;
+	}
 	const auto lhs_class = EmitClassifyF32(state, lhs);
 	const auto rhs_class = EmitClassifyF32(state, rhs);
 
