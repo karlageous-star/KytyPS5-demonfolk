@@ -2,6 +2,7 @@
 
 #include "graphics/shader/recompiler/ir/Value.h"
 
+#include <cstdlib>
 #include <unordered_map>
 #include <vector>
 
@@ -212,6 +213,28 @@ MaskedSelectStats ForwardMaskedSelects(const BlockList& blocks) {
 		}
 	}
 	// 3. A select on E masked by E is its true operand; a value masked by E reads a for an operand select(E, a, b).
+	// KYTY_FORWARD_DEAD_ONLY=1: only when every use of that select reads a so (it then goes): a select kept for other uses
+	// saves nothing, and its consumers reading a instead keep a and the select both live (two registers for one).
+	static const bool dead_only = [] {
+		const char* value = std::getenv("KYTY_FORWARD_DEAD_ONLY");
+		return value != nullptr && value[0] == '1';
+	}();
+	std::unordered_map<const Inst*, bool> all_forwarded;
+	const auto forwardable = [&](const Inst* select, const Inst* condition) {
+		if (!dead_only) return true;
+		const auto [found, inserted] = all_forwarded.try_emplace(select, true);
+		if (inserted) {
+			for (const auto& use: select->Uses()) {
+				const auto by = masked.find(use.user);
+				if (by == masked.end() || by->second != condition ||
+				    (use.operand == 0 && ConditionOf(*use.user) == condition)) {
+					found->second = false;
+					break;
+				}
+			}
+		}
+		return found->second;
+	};
 	for (auto* inst: order) {
 		const auto found = masked.find(inst);
 		if (found == masked.end()) continue;
@@ -223,7 +246,7 @@ MaskedSelectStats ForwardMaskedSelects(const BlockList& blocks) {
 		}
 		for (size_t operand = 0; operand < inst->NumArgs(); operand++) {
 			const auto* source = inst->Arg(operand).Resolve().TryInstruction();
-			if (source != nullptr && ConditionOf(*source) == condition) {
+			if (source != nullptr && ConditionOf(*source) == condition && forwardable(source, condition)) {
 				inst->SetArg(operand, source->Arg(1).Resolve());
 				stats.forwarded++;
 			}
