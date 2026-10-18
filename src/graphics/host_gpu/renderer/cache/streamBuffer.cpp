@@ -117,8 +117,7 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 	switch (usage) {
 		case MemoryUsage::DeviceLocal:
 		case MemoryUsage::Stream: return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-		case MemoryUsage::Upload: return UploadInVideoMemory() ? VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-		                                                       : VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		case MemoryUsage::Upload:
 		case MemoryUsage::Download: return VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 	}
 	return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
@@ -145,7 +144,7 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 } // namespace
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, bool video_memory)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
 	KYTY_PROFILER_FUNCTION();
@@ -173,7 +172,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
-	allocation_info.usage = AllocationUsage(usage);
+	allocation_info.usage = video_memory ? VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE : AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
 	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -378,8 +377,8 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 }
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-                           uint64_t size, vk::BufferUsageFlags flags)
-    : Buffer(graphics, scheduler, usage, 0, flags, size),
+                           uint64_t size, vk::BufferUsageFlags flags, bool video_memory)
+    : Buffer(graphics, scheduler, usage, 0, flags, size, video_memory),
       m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,

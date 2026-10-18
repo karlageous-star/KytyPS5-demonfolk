@@ -27,9 +27,10 @@ enum class MemoryUsage : uint8_t {
 	Stream,
 };
 
-// KYTY_UPLOAD_VRAM=1: upload buffers (the staging ring, shader data, table uploads) in video memory the CPU writes
-// through the BAR (resizable BAR: a device-local host-visible type over all of it), not in system memory the GPU reads
-// over PCIe. The staging ring is then 128 MiB (KYTY_UPLOAD_RING_MB still sizes it).
+// KYTY_UPLOAD_VRAM=1: the staging ring in video memory the CPU writes through the BAR (resizable BAR: a device-local
+// host-visible type over all of it), not in system memory the GPU reads over PCIe; 128 MiB then (KYTY_UPLOAD_RING_MB
+// still sizes it). Only the ring, which the CPU only writes: the shader data and table rings are read back (S12: with
+// them there the frame was CPU-bound, 27.8 FPS).
 bool UploadInVideoMemory();
 
 inline constexpr vk::BufferUsageFlags ReadFlags =
@@ -42,8 +43,9 @@ inline constexpr vk::BufferUsageFlags AllFlags =
 
 class Buffer {
 public:
+	// video_memory: an Upload buffer placed in device-local host-visible memory (KYTY_UPLOAD_VRAM), still Upload.
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, bool video_memory = false);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -111,7 +113,7 @@ private:
 class StreamBuffer final: public Buffer {
 public:
 	StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	             uint64_t size, vk::BufferUsageFlags flags = AllFlags);
+	             uint64_t size, vk::BufferUsageFlags flags = AllFlags, bool video_memory = false);
 
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
 	                                                bool allow_wait = true);

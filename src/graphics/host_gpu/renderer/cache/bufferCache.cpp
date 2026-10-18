@@ -1352,7 +1352,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                              BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, UploadRingSize(),
-                       AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress), // KYTY_UPLOAD_BATCH
+                       AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, // KYTY_UPLOAD_BATCH
+                       UploadInVideoMemory()),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_host_shader_upload(graphics, scheduler, MemoryUsage::Upload, 64 * MiB),
       m_table_upload(graphics, scheduler, MemoryUsage::Upload, 32 * MiB,
