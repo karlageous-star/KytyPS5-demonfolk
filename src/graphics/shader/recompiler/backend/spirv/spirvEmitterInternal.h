@@ -830,7 +830,7 @@ bool NativeFMinMax();
 // (shader.cpp requires it of VS, GS and PS), instead of the host's default plus an explicit flush ahead of each
 // transcendental (EmitFlushF32DenormToSignedZero).
 bool Fp32Flush();
-// KYTY_CONST_RO_VIEW=1 (default 0; changes SPIR-V): ReadConstBuffer loads through a NonWritable view of the buffers.
+// KYTY_CONST_RO_VIEW (default 1; 0 changes SPIR-V back): ReadConstBuffer loads through a NonWritable view of the buffers.
 bool ConstReadOnlyView();
 
 uint32_t EmitTruncF32Value(EmitterState& state, uint32_t value);

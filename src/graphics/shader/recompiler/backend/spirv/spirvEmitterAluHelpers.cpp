@@ -295,10 +295,13 @@ uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask) {
 // made each a vector buffer_load into VGPRs (hot compute shaders: no s_buffer_load at all, 10+ dwordx4 constant loads,
 // VGPRs twice the guest's; S10 ISA). A NonWritable view of the same binding lets it see those loads as invariant and
 // keep them scalar; a shader write through the other view is no more visible to them than to the guest's scalar cache.
+// Default on since S37 (10-19): bee5e036 128 -> 96 VGPRs (98 s_buffer_load), 245af133 168 -> 128, de349f75 124 -> 96;
+// tunnel dispatch GPU time 14.5 -> 13.3 ms a frame, GPU busy 28.3 -> 26.7 ms; 29.2 FPS standing, walking 40.1 FPS with
+// no frame over 50 ms. KYTY_CONST_RO_VIEW=0: the read-write view (a different SPIR-V: pre-warm).
 bool ConstReadOnlyView() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_CONST_RO_VIEW");
-		return value != nullptr && value[0] == '1';
+		return !(value != nullptr && value[0] == '0');
 	}();
 	return enabled;
 }
