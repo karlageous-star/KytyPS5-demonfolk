@@ -48,14 +48,15 @@
 extern "C" {
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_htile_preserve_mode {0};
 }
-// KYTY_TARGET_RAM_TRIM (live; default 0 until measured): 1 lets the guest pages of render, depth and storage images the
+// KYTY_TARGET_RAM_TRIM (live; default 1 since S34, 10-19: working set 6.7 GB instead of 8.5-10, direct memory held
+// ~4.0 GB instead of 6.9-7.7, walking 30.4 / 39.1 FPS with 2 and 1 frames over 50 ms; 0: off): 1 lets the guest pages of render, depth and storage images the
 // GPU wrote (1 MiB or more) leave the working set at the collector's pass, each image at most every 600 frames and
 // 256 MiB a pass (LibKernel::Memory::TrimGuestWorkingSet, both views; the bytes stay and a touch brings them back).
 // The GPU holds such an image; its guest pages stayed resident from its first upload (the buffer cache reads guest
 // memory through the backing view) or a download, and nothing read them: S31 (10-18) had 1,357 MiB of target pages
 // resident through the backing view only, of 2,347 MiB of targets in the cache.
 extern "C" {
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_target_ram_trim_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_target_ram_trim_mode {1};
 }
 // 1: an image the CPU and the GPU both wrote parts of uploads the changed subresources of those parts (InitializeImage,
 // UploadImageRanges); 0: the whole image, as before.

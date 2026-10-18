@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -283,6 +284,8 @@ private:
 	// KYTY_TARGET_RAM_TRIM: the page-aligned parts of GPU-written ranges whose guest pages were asked out of the
 	// working set, kept to what is still GPU-written (TrimGpuWrittenRanges).
 	RangeSet m_trimmed_gpu_ranges;
+	// System-memory temporary upload buffers in flight (UploadCopies; KYTY_UPLOAD_TEMP_BOUND).
+	std::atomic<uint64_t> m_temp_upload_bytes {0};
 	uint64_t m_trimmed_gpu_bytes = 0;
 	void     TrimGpuWrittenRanges();
 	// Moves whenever m_gpu_modified_ranges loses bytes (readbacks, copy feedback, downloads, forward copies: CPU

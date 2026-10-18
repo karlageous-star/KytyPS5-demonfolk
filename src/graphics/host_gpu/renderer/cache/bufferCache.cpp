@@ -1914,14 +1914,55 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		return m_staging_buffer.Handle();
 	}
 
+	// Past the ring's free room: a temporary upload buffer of the copies' size, freed when its submission completes.
+	// A level load uploads texture arrays of 135-352 MiB this way, several close together: at a load after the
+	// Nexus 1.3 GB of system memory went on within a second and the RAM watchdog ended the game at 21 MiB free (S35,
+	// 10-19). KYTY_UPLOAD_TEMP_BOUND (default 1; 0: as before): the buffer goes to video memory (resizable BAR)
+	// while the budget has room for it and 512 MiB more; one in system memory first waits, while 256 MiB or more of
+	// them are in flight, for the GPU to finish the submitted work (their buffers are freed as their ticks complete).
+	static const bool bound = [] {
+		const char* value = std::getenv("KYTY_UPLOAD_TEMP_BOUND");
+		return value == nullptr || value[0] != '0';
+	}();
+	constexpr uint64_t TempLimit = uint64_t {256} << 20u;
+	const bool         video     = bound && m_graphics.GetVideoMemoryRoom() > total_size + (uint64_t {512} << 20u);
+	if (bound && !video) {
+		const auto start = std::chrono::steady_clock::now();
+		bool       waited = false;
+		for (int round = 0; round < 8 && m_temp_upload_bytes.load() != 0 &&
+		                    m_temp_upload_bytes.load() + total_size > TempLimit && m_scheduler.CurrentTick() > 0;
+		     ++round) {
+			const uint64_t before = m_temp_upload_bytes.load();
+			m_scheduler.Wait(m_scheduler.CurrentTick() - 1);
+			m_scheduler.PopPendingOperations();
+			waited = true;
+			// (What is left belongs to the commands being recorded: no wait frees it.)
+			if (m_temp_upload_bytes.load() == before) break;
+		}
+		if (waited) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+				std::printf("Upload temporaries: waited %.1f ms before a %llu MiB one (%llu MiB still in flight)\n",
+				            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
+				            static_cast<unsigned long long>(total_size >> 20u),
+				            static_cast<unsigned long long>(m_temp_upload_bytes.load() >> 20u));
+				std::fflush(stdout);
+			}
+		}
+	}
 	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
-	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
+	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size, video);
 	for (const auto& copy: copies) {
 		ReadUploadSource(temporary->Mapped().data() + copy.srcOffset, buffer.CpuAddress() + copy.dstOffset, copy.size);
 	}
 	temporary->Flush(0, total_size);
-	const auto handle = temporary->Handle();
-	m_scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+	const auto     handle = temporary->Handle();
+	const uint64_t held   = bound && !video ? total_size : 0;
+	m_temp_upload_bytes += held;
+	m_scheduler.DeferOperation([this, held, owner = std::move(temporary)]() mutable {
+		owner.reset();
+		m_temp_upload_bytes -= held;
+	});
 	return handle;
 }
 

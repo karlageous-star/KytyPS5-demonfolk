@@ -128,7 +128,7 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_IMAGE_BARRIER_DEDUPE", &kyty_local_image_barrier_dedupe},
 	    // Opt-in (default 0): 1 keeps an HTile's metadata when its depth image is deleted (textureCache.cpp).
 	    Switch {"KYTY_HTILE_PRESERVE", &kyty_local_htile_preserve_mode},
-	    // Opt-in (default 0): 1 trims the guest pages of GPU-written targets and buffer ranges from the working set, once each
+	    // Default 1 (S34): trims the guest pages of GPU-written targets and buffer ranges from the working set, once each
 	    // (textureCache.cpp TrimGpuTargets, bufferCache.cpp TrimGpuWrittenRanges).
 	    Switch {"KYTY_TARGET_RAM_TRIM", &kyty_local_target_ram_trim_mode},
 	    // Opt-in (default 0): 1 binds a sampled texture the GPU cannot make as a null image, not the end of the emulator
