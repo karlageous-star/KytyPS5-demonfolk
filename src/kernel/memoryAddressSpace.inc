@@ -1672,12 +1672,14 @@ private:
 	// of a 2 MiB-aligned range (a texture's) while another view was mapped or unmapped: busy ranges were per view, and a
 	// protection change of a neighbouring view in the same page-table page went on during the system calls. Protection
 	// changes in those pages wait for the map or unmap, or for a working-set trim (TrimWorkingSet), to finish.
-	// KYTY_PROTECT_SERIAL=1 (a test of the bug check above): any map or unmap anywhere makes a protection change wait, not
-	// only one in its page-table pages (the views are all of one section: their prototype PTEs are shared).
+	// Any map or unmap anywhere makes a protection change wait, not only one in its page-table pages (the views are all of
+	// one section: their prototype PTEs are shared): two reporters of #5 still bug-checked with v20261018, whose waits
+	// were per page-table page; no measurable cost (an RTX 5090 desktop and an RTX 3080 laptop, 1-1 routes A-B-A).
+	// KYTY_PROTECT_SERIAL=0: the per page-table page waits only.
 	[[nodiscard]] bool BusyUnlocked(uint64_t vaddr, uint64_t size) const {
 		static const bool serial = [] {
 			const char* value = std::getenv("KYTY_PROTECT_SERIAL");
-			return value != nullptr && *value == '1';
+			return value == nullptr || *value != '0';
 		}();
 		if (serial && !m_busy.empty()) return true;
 		constexpr uint64_t PageTablePage = uint64_t {2} << 20u;
