@@ -46,6 +46,12 @@
 extern "C" {
 // KYTY_CHAIN_BDA_READS=1: a dispatch that reaches memory through pointers only to read it chains on its read ranges.
 volatile std::atomic_uint32_t kyty_local_chain_bda_reads_mode {0};
+// KYTY_DISPATCH_BARRIER_MERGE (live; default 0 until measured): 1 leaves out the write hazard barrier of a dispatch
+// that just drained its chain for a range conflict (the drain, compute work before all later commands, and the chain's
+// starting barrier, everything before it before compute, already order it), and makes the hazard barrier and the
+// indirect argument barrier of a dispatch that starts a chain one barrier (both destination stages). The owner's heavy
+// 1-1 scene (OWNER3, 10-19): ~1,000 hazard barriers, ~800 chain drains and ~550 argument barriers a frame.
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_dispatch_barrier_merge_mode {0};
 }
 #include <cmath>
 #include <cstring>
@@ -782,11 +788,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 	bool continues_chain = chain && buffer.ComputeChainPending();
+	bool drained_chain   = false; // (for a range conflict: the hazard barrier is redundant after it)
 	static const bool chain_stats = std::getenv("KYTY_CHAIN_STATS") != nullptr;
 	static uint64_t   stat_dispatches = 0, stat_elided = 0, stat_hazard = 0, stat_unknown = 0;
 	if (continues_chain && chain_mode == 1 && buffer.ChainConflicts(chain_accesses, chain_unknown)) {
 		(void)buffer.Handle(); // records the pending compute barrier
 		continues_chain = false;
+		drained_chain   = true;
 		(chain_unknown ? stat_unknown : stat_hazard)++;
 	} else if (continues_chain) {
 		stat_elided++;
@@ -806,10 +814,21 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
-	if (has_storage_writes && !continues_chain) {
+	const bool merge_barriers = kyty_local_dispatch_barrier_merge_mode.load(std::memory_order_relaxed) != 0;
+	bool       args_ordered   = false; // the merged barrier below took the indirect argument read too
+	if (has_storage_writes && !continues_chain && !(merge_barriers && drained_chain)) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (merge_barriers && indirect_args != 0) {
+			auto barrier = MakeShaderWriteHazardDependency();
+			barrier.dstAccessMask |= vk::AccessFlagBits::eIndirectCommandRead;
+			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+			                          vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eDrawIndirect,
+			                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
+			args_ordered = true;
+		} else {
+			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	if (indirect_args != 0) {
@@ -824,7 +843,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		args_barrier.buffer              = indirect_buffer;
 		args_barrier.offset              = indirect_offset;
 		args_barrier.size                = 3u * sizeof(uint32_t);
-		if (!continues_chain) {
+		if (!continues_chain && !args_ordered) {
 			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 			                          vk::PipelineStageFlagBits::eDrawIndirect,
 			                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0,

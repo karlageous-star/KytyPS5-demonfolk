@@ -38,6 +38,7 @@ extern volatile std::atomic<uint32_t> kyty_local_fault_scan_frame_mode;
 extern volatile std::atomic<uint32_t> kyty_local_precise_access_mode;
 extern volatile std::atomic_uint32_t kyty_local_protect_serial_mode;
 extern volatile std::atomic_uint32_t kyty_local_chain_bda_reads_mode;
+extern volatile std::atomic_uint32_t kyty_local_dispatch_barrier_merge_mode;
 extern volatile std::atomic<uint32_t> kyty_local_readback_page_runs_mode;
 extern volatile std::atomic<uint32_t> kyty_local_linear_copy_spans_mode;
 extern volatile std::atomic_uint32_t kyty_local_async_lod_stats_mode;
@@ -157,6 +158,8 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_PRECISE_ACCESS", &kyty_local_precise_access_mode},
 	    // 1: a compute dispatch that reads memory only through pointers chains on its BDA read ranges.
 	    Switch {"KYTY_CHAIN_BDA_READS", &kyty_local_chain_bda_reads_mode},
+	    // Opt-in (default 0, live): fewer dispatch barriers, same order (renderCompute.cpp).
+	    Switch {"KYTY_DISPATCH_BARRIER_MERGE", &kyty_local_dispatch_barrier_merge_mode},
 	    // Default 1; 0 for an A/B: readback readiness over the written page runs; the linear copy over mappings.
 	    Switch {"KYTY_READBACK_PAGE_RUNS", &kyty_local_readback_page_runs_mode},
 	    Switch {"KYTY_LINEAR_COPY_SPANS", &kyty_local_linear_copy_spans_mode},
