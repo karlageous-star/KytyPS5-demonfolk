@@ -32,6 +32,7 @@ enum : uint32_t {
 	ExecutionModeEarlyFragmentTests          = 9,
 	ExecutionModeDepthReplacing              = 12,
 	ExecutionModeLocalSize                   = 17,
+	ExecutionModeDenormFlushToZero           = 4460,
 	ExecutionModeSignedZeroInfNanPreserve    = 4461,
 	ExecutionModeDerivativeGroupQuadsKHR     = 5289,
 	AddressingModelLogical                   = 0,
@@ -56,6 +57,7 @@ enum : uint32_t {
 	CapabilityShaderLayer                    = 69,
 	CapabilityShaderViewportIndex            = 70,
 	CapabilityDrawParameters                 = 4427,
+	CapabilityDenormFlushToZero              = 4465,
 	CapabilitySignedZeroInfNanPreserve       = 4466,
 	CapabilityFragmentBarycentricKHR         = 5284,
 	CapabilityComputeDerivativeGroupQuadsKHR = 5288,
@@ -821,6 +823,10 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 // KYTY_NATIVE_FMINMAX (default on, =0 off): float min/max/med3 as GLSL NMin/NMax, the host's own v_min/v_max (RDNA2 like the guest:
 // the non-NaN operand, -0 below +0) instead of the bit-exact classification (~15 instructions each).
 bool NativeFMinMax();
+// KYTY_FP32_FLUSH=1: the shader runs with 32-bit denormals flushed (DenormFlushToZero), the guest's FLOAT_MODE 0xC0
+// (shader.cpp requires it of VS, GS and PS), instead of the host's default plus an explicit flush ahead of each
+// transcendental (EmitFlushF32DenormToSignedZero).
+bool Fp32Flush();
 
 uint32_t EmitTruncF32Value(EmitterState& state, uint32_t value);
 

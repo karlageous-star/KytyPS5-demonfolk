@@ -752,6 +752,10 @@ void DefineModule(EmitterState& state) {
 	// GCN/RDNA arithmetic preserves 32-bit signed zero, infinity, and NaN. Declaring that
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
 	state.builder.AddExecutionMode({state.main_func, ExecutionModeSignedZeroInfNanPreserve, 32u});
+	if (Fp32Flush()) {
+		state.builder.RequireCapability(CapabilityDenormFlushToZero);
+		state.builder.AddExecutionMode({state.main_func, ExecutionModeDenormFlushToZero, 32u});
+	}
 	if (const auto* cs = ShaderWorkgroupInput(state.stage, state.input_info)) {
 		uint32_t    local_x = state.requirements.compute_derivatives ? 2u : 1u;
 		uint32_t    local_y = state.requirements.compute_derivatives ? 2u : 1u;

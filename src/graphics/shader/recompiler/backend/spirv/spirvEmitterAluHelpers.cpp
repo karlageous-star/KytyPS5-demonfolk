@@ -334,7 +334,16 @@ uint32_t EmitTruncF32Value(EmitterState& state, uint32_t value) {
 	return ret;
 }
 
+bool Fp32Flush() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FP32_FLUSH");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
+	if (Fp32Flush()) return value; // the shader's denormal mode flushes the transcendental's input
 	const auto bits      = state.builder.AllocateId();
 	const auto abs_bits  = state.builder.AllocateId();
 	const auto sign_bits = state.builder.AllocateId();
