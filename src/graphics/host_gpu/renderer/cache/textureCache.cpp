@@ -343,15 +343,46 @@ bool TextureCache::SafeToDownload(const Image& image) {
 // Collector runs (flips) before memory an image could not be made for is asked for again.
 constexpr uint64_t FailedRetryTicks = 30;
 
+// KYTY_TEST_RECLAIM=<n>: the first n images that must exist, of 1 MiB and more, asked for from the 600th flip on, are
+// taken as not made once (ReclaimImageMemory, then made again).
+[[gnu::noinline]] static bool TestReclaim(const ImageInfo& info, uint64_t tick) {
+	static std::atomic<int64_t> left {[] {
+		const char* value = std::getenv("KYTY_TEST_RECLAIM");
+		return value != nullptr ? std::strtoll(value, nullptr, 10) : int64_t {0};
+	}()};
+	return tick >= 600 && info.data.size >= (uint64_t {1} << 20u) && left.load(std::memory_order_relaxed) > 0 &&
+	       left.fetch_sub(1, std::memory_order_relaxed) > 0;
+}
+
 ImageId TextureCache::InsertImage(const ImageInfo& info, bool may_fail) {
-	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info, may_fail);
-	if (may_fail && m_slot_images[id].CreateFailed()) {
-		// (Never registered: the slot goes, and the image is not asked for again for a while.)
+	auto id = m_slot_images.insert(m_graphics, m_scheduler, info, may_fail);
+	// An image that must exist (a render target, a depth image, a copy's) the GPU could not make: room is made at once
+	// (the second time all there is) and it is made again; failing still ends the emulator, as it did at once before.
+	// Issue #53: a 16 GB RX 7800 XT whose video memory another program had taken switched to the cinematic mode (AMD
+	// gives these images no system memory).
+	// (Never registered: the slot goes, deferred while recording as DeleteImage's.)
+	const auto erase_unregistered = [this](ImageId unregistered) {
 		if (m_scheduler.Active()) {
-			m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
+			m_scheduler.DeferOperation([this, unregistered] { m_slot_images.erase(unregistered); });
 		} else {
-			m_slot_images.erase(id);
+			m_slot_images.erase(unregistered);
 		}
+	};
+	if (!may_fail && (m_slot_images[id].CreateFailed() || TestReclaim(info, m_gc_tick))) {
+		for (uint32_t round = 0;; ++round) {
+			erase_unregistered(id);
+			const size_t freed = ReclaimImageMemory(info.data.size, round != 0);
+			id                 = m_slot_images.insert(m_graphics, m_scheduler, info, false);
+			if (!m_slot_images[id].CreateFailed()) break;
+			if (round != 0 || freed == 0) {
+				EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u: no memory for it\n",
+				     info.extent.width, info.extent.height, info.extent.depth, static_cast<int>(info.pixel_format),
+				     info.resources.layers, info.resources.levels);
+			}
+		}
+	}
+	if (m_slot_images[id].CreateFailed()) {
+		erase_unregistered(id);
 		if (m_failed_images.size() >= 16) m_failed_images.erase(m_failed_images.begin());
 		m_failed_images.push_back({info.data.address, info.data.size, m_gc_tick});
 		return {};
@@ -360,6 +391,45 @@ ImageId TextureCache::InsertImage(const ImageInfo& info, bool may_fail) {
 		RegisterImage(id);
 	}
 	return id;
+}
+
+// The images no draw or dispatch used for 16 flips whose bytes guest memory holds (none the GPU wrote: one used again is
+// made again from them) go at once, least recently used first, until twice the room asked for (at least 256 MiB) is
+// freed (`all`: every one); the GPU finishes the work in flight first (it may read them still). (The collector takes
+// images unused for 10 to 30 s, and a mode switch needs the room in the flip it makes its targets.)
+size_t TextureCache::ReclaimImageMemory(uint64_t bytes, bool all) {
+	constexpr uint64_t UnusedTicks = 16;
+	const auto           start = std::chrono::steady_clock::now();
+	const uint64_t       goal  = all ? UINT64_MAX : std::max(bytes * 2, uint64_t {256} << 20u);
+	uint64_t             freed = 0;
+	std::vector<ImageId> victims;
+	if (m_gc_tick >= UnusedTicks) {
+		m_lru_cache.ForEachItemBelow(m_gc_tick - UnusedTicks, [&](ImageId id) {
+			const auto* owner = m_slot_images.try_get(id);
+			if (owner == nullptr || !owner->registered || owner->depth_id || owner->IsGpuModified()) return false;
+			victims.push_back(id);
+			freed += owner->AccountedSize();
+			return freed >= goal;
+		});
+	}
+	if (!victims.empty()) {
+		m_scheduler.Wait(m_scheduler.CurrentTick());
+		// (Destroyed now, not after DeleteImage's deferred erase: the GPU is done with them. A pooled image's memory
+		// goes back to the device too, else the pool would keep the room it is asked for.)
+		for (const auto id: victims) DeleteImage(id, true);
+		m_graphics.TrimImagePool();
+		LiveCounters::Add(LiveCounters::GcImageDeletes, victims.size());
+	}
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::printf("Texture cache: no memory for a %llu MiB image, %zu images unused for %llu flips freed (%llu MiB) "
+		            "in %.1f ms\n",
+		            static_cast<unsigned long long>(bytes >> 20u), victims.size(),
+		            static_cast<unsigned long long>(UnusedTicks), static_cast<unsigned long long>(freed >> 20u),
+		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+		std::fflush(stdout);
+	}
+	return victims.size();
 }
 
 bool TextureCache::RecentlyFailed(const ImageInfo& info) const {
@@ -448,7 +518,8 @@ void TextureCache::UnregisterImage(ImageId id) {
 	image.registered = false;
 }
 
-void TextureCache::DeleteImage(ImageId id) {
+// `now`: the slot goes at once, not after the work in flight (the caller waited for the GPU: ReclaimImageMemory).
+void TextureCache::DeleteImage(ImageId id, bool now) {
 	auto* image = m_slot_images.try_get(id);
 	if (image == nullptr || !image->registered) {
 		return;
@@ -467,7 +538,7 @@ void TextureCache::DeleteImage(ImageId id) {
 			if (associated.IsGpuModified()) {
 				associated.ClearGpuModified();
 			}
-			DeleteImage(association);
+			DeleteImage(association, now);
 		}
 	} else {
 		std::erase(m_stencil_associations, id);
@@ -490,7 +561,7 @@ void TextureCache::DeleteImage(ImageId id) {
 		}
 	}
 	UnregisterImage(id);
-	if (m_scheduler.Active()) {
+	if (!now && m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
 	} else {
 		m_slot_images.erase(id);

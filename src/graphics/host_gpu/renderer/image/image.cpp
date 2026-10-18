@@ -773,22 +773,17 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	}();
 	const bool test_fail = test_fail_above != 0 && info.data.size > test_fail_above;
 	if ((may_fail && (!within_limits || test_fail)) || !graphics.CreateImage(create, backing)) {
-		if (may_fail) {
-			m_create_failed = true;
-			static std::atomic<uint32_t> reports {0};
-			if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
-				std::printf("Image: could not create %ux%ux%u format=%d layers=%u levels=%u (%llu MiB)%s\n",
-				            create.extent.width, create.extent.height, create.extent.depth,
-				            static_cast<int>(create.format), create.arrayLayers, create.mipLevels,
-				            static_cast<unsigned long long>(info.data.size >> 20u),
-				            within_limits ? "" : ": past the format's limits");
-				std::fflush(stdout);
-			}
-			return;
+		m_create_failed = true;
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::printf("Image: could not create %ux%ux%u format=%d layers=%u levels=%u (%llu MiB)%s\n",
+			            create.extent.width, create.extent.height, create.extent.depth,
+			            static_cast<int>(create.format), create.arrayLayers, create.mipLevels,
+			            static_cast<unsigned long long>(info.data.size >> 20u),
+			            within_limits ? "" : ": past the format's limits");
+			std::fflush(stdout);
 		}
-		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
-		     create.extent.width, create.extent.height, create.extent.depth,
-		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
+		return;
 	}
 }
 

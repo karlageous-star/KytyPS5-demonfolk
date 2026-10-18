@@ -161,6 +161,8 @@ private:
 	using ImageEpochTable = MultiLevelPageTable<uint64_t, 20, 40, 10>;
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info, bool may_fail = false);
+	// Frees room for an image that must exist, which the GPU could not make (InsertImage). Caller holds m_lock.
+	size_t                    ReclaimImageMemory(uint64_t bytes, bool all);
 	// Images the GPU could not make (InsertImage's `may_fail`): their memory is not asked for again for a while.
 	struct FailedImage {
 		uint64_t address = 0, size = 0, tick = 0;
@@ -170,7 +172,7 @@ private:
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
-	void                      DeleteImage(ImageId id);
+	void                      DeleteImage(ImageId id, bool now = false);
 	void                      FreeImage(ImageId id, const char* site = "");
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);

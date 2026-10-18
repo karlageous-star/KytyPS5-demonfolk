@@ -70,6 +70,8 @@ class Image final {
 public:
 	// `may_fail`: an image the GPU cannot make (its memory full, more layers or bytes than the format allows) is left
 	// without one (CreateFailed) instead of ending the emulator: a sampled texture's lookup binds a null image instead.
+	// One that must exist is tried past those limits, and left without one only when its memory could not be had
+	// (TextureCache::InsertImage makes room and tries again).
 	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info, bool may_fail = false);
 	~Image();
 	KYTY_CLASS_NO_COPY(Image);
