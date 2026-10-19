@@ -1702,6 +1702,51 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 			     info.extent.height, info.extent.depth, info.pitch, info.resources.levels,
 			     info.resources.layers, info.samples);
 		}
+		// KYTY_WHOLE_IMAGE_BATCHES (default 1; 0: one detile of the whole image): an image whose linear form is past
+		// 128 MiB is detiled a batch of subresources at a time into one leased scratch, each batch copied to the image
+		// before the next (as UploadImageChunked's batches). One scratch of the whole size came on top of the source
+		// buffer over the image: the Gates of Boletaria re-uploaded an 80-layer 320 MiB array whole 59 times in one
+		// walk (FULL-IMAGE-WHOLE, S52), 256 MiB scratches in a 1.4 GB burst of video memory (S51).
+		static const bool whole_batches = [] {
+			const char* value = std::getenv("KYTY_WHOLE_IMAGE_BATCHES");
+			return value == nullptr || value[0] != '0';
+		}();
+		constexpr uint64_t BatchLinear = uint64_t {128} << 20u;
+		if (whole_batches && !plan.tiles.empty() && !plan.swap_bgra16 && plan.LinearSize() > BatchLinear &&
+		    plan.tiles.size() == plan.regions.size() &&
+		    std::ranges::all_of(plan.tiles, [&](const GpuTileInfo& tile) { return tile.linear_size <= BatchLinear; }) &&
+		    std::ranges::is_sorted(plan.tiles, {}, &GpuTileInfo::linear_offset) && [&] {
+			    for (size_t i = 0; i < plan.tiles.size(); ++i) {
+				    if (plan.regions[i].bufferOffset < plan.tiles[i].linear_offset) return false;
+			    }
+			    return true;
+		    }()) {
+			m_tiler.UseScratch(BatchLinear, [&](TileManager::Result scratch) {
+				for (size_t first = 0; first < plan.tiles.size();) {
+					const uint64_t                   base = plan.tiles[first].linear_offset;
+					uint64_t                         end  = base;
+					std::vector<GpuTileInfo>         tiles;
+					std::vector<vk::BufferImageCopy> copies;
+					size_t                           last = first;
+					for (; last < plan.tiles.size(); ++last) {
+						const auto&    tile     = plan.tiles[last];
+						const uint64_t tile_end = tile.linear_offset + tile.linear_size;
+						if (tile_end - base > BatchLinear) break;
+						auto batch_tile          = tile;
+						batch_tile.linear_offset = tile.linear_offset - base;
+						tiles.push_back(batch_tile);
+						auto copy         = plan.regions[last];
+						copy.bufferOffset = copy.bufferOffset - base;
+						copies.push_back(copy);
+						end = std::max(end, tile_end);
+					}
+					m_tiler.DetileInto(source.Handle(), source_offset, info.data.size, end - base, tiles, scratch);
+					upload(copies, {scratch.buffer, scratch.offset, end - base});
+					first = last;
+				}
+			});
+			return;
+		}
 		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
 		if (!plan.tiles.empty()) {
 			linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size,
