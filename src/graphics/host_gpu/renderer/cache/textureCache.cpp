@@ -1747,6 +1747,25 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 			});
 			return;
 		}
+		if (whole_batches && !plan.tiles.empty() && plan.LinearSize() > BatchLinear) {
+			static std::atomic<uint32_t> refused {0};
+			if (refused.fetch_add(1, std::memory_order_relaxed) < 8) {
+				uint64_t largest = 0;
+				size_t   below   = 0;
+				for (size_t i = 0; i < plan.tiles.size(); ++i) {
+					largest = std::max(largest, plan.tiles[i].linear_size);
+					if (i < plan.regions.size() && plan.regions[i].bufferOffset < plan.tiles[i].linear_offset) ++below;
+				}
+				std::printf("WHOLE-BATCH-REFUSED addr=0x%llx linear=0x%llx tiles=%zu regions=%zu swap=%d sorted=%d "
+				            "largest_tile=0x%llx regions_below_tile=%zu\n",
+				            static_cast<unsigned long long>(info.data.address),
+				            static_cast<unsigned long long>(plan.LinearSize()), plan.tiles.size(), plan.regions.size(),
+				            plan.swap_bgra16 ? 1 : 0,
+				            std::ranges::is_sorted(plan.tiles, {}, &GpuTileInfo::linear_offset) ? 1 : 0,
+				            static_cast<unsigned long long>(largest), below);
+				std::fflush(stdout);
+			}
+		}
 		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
 		if (!plan.tiles.empty()) {
 			linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size,
