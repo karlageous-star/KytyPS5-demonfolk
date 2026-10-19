@@ -7,11 +7,8 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 
-#include <algorithm>
-#include <array>
 #include <atomic>
 #include <immintrin.h>
-#include <memory>
 #include <mutex>
 #include <utility>
 
@@ -31,24 +28,7 @@
 #include <unistd.h>
 #endif
 
-extern "C" {
-// KYTY_HOT_PAGES (live; default 0 until measured): memoryTracker.cpp.
-extern volatile std::atomic<uint32_t> kyty_local_hot_pages_mode;
-}
-
 namespace Libs::Graphics {
-
-// KYTY_HOT_PAGES: a page the guest CPU writes again FaultsInFrame times within one guest frame (each a write fault, a
-// protection change back and a re-protection at the next upload) stays writable and CPU-dirty: every upload over it
-// copies it, no fault or protection change. Demon's Souls rewrites its constant rings several times a frame (Gates of
-// Boletaria: ~900 write faults and 2,000-2,900 protection changes a frame, S47). Pages written once a frame never qualify
-// (they would be uploaded at every use instead of once). Hot pages go back to tracking when the decay epoch moves, when
-// the switch is off, and when the GPU writes them.
-namespace HotPages {
-inline std::atomic<uint32_t> g_frame {1}; // guest frames (TextureCache::RunGarbageCollector)
-inline std::atomic<uint32_t> g_epoch {1}; // decay
-constexpr uint32_t           FaultsInFrame = 3;
-} // namespace HotPages
 
 class TrackingSpinLock final {
 public:
@@ -191,21 +171,6 @@ public:
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
 		}
-		if constexpr (source == DirtySource::Gpu && enable) {
-			// Hot pages the GPU now writes: tracked again (their bytes went up with the upload before this).
-			if (m_hot.AnyInRange(start, end)) {
-				for (size_t page = start; page < end; ++page) {
-					if (m_hot.Get(page)) {
-						m_hot.Unset(page);
-						m_cpu_dirty.Unset(page);
-					}
-				}
-				UpdateCpuProtection<true>();
-			}
-		}
-		if constexpr (source == DirtySource::Cpu && enable) {
-			NoteCpuWrites(start, end);
-		}
 		auto& bits = GetBits<source>();
 		if constexpr (enable) {
 			bits.SetRange(start, end);
@@ -234,15 +199,6 @@ public:
 			GetBits<source>().UnsetRange(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu && clear) {
-			// Hot pages stay dirty (and writable): uploaded again at the next use. Their writes are not seen, so the
-			// clean proofs and the BDA dirty regions take them as written again.
-			if (m_hot.Any() && RefreshHot() && m_hot.AnyInRange(start, end)) {
-				for (size_t page = start; page < end; ++page) {
-					if (m_hot.Get(page)) m_cpu_dirty.Set(page);
-				}
-				m_cpu_epoch.fetch_add(1, std::memory_order_release);
-				BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
-			}
 			UpdateCpuProtection<true>();
 			ForEachRange(mask, std::forward<Func>(func));
 			return;
@@ -289,38 +245,6 @@ private:
 		}
 	}
 
-	// Whether hot pages are still kept (false: the switch is off or the decay epoch moved, and they were dropped).
-	bool RefreshHot() {
-		const uint32_t epoch = HotPages::g_epoch.load(std::memory_order_relaxed);
-		if (kyty_local_hot_pages_mode.load(std::memory_order_relaxed) == 0 || m_hot_epoch != epoch) {
-			m_hot.Clear();
-			m_hot_epoch = epoch;
-			return false;
-		}
-		return true;
-	}
-
-	// Pages going from clean to CPU-dirty (a write fault or an invalidation): counted per guest frame.
-	void NoteCpuWrites(size_t start, size_t end) {
-		if (kyty_local_hot_pages_mode.load(std::memory_order_relaxed) == 0) {
-			if (m_hot.Any()) m_hot.Clear();
-			return;
-		}
-		(void)RefreshHot();
-		if (!m_fault_log) m_fault_log = std::make_unique<std::array<uint16_t, TRACKER_REGION_PAGES>>();
-		const auto frame = static_cast<uint16_t>(HotPages::g_frame.load(std::memory_order_relaxed) & 0x0fffu);
-		for (size_t page = start; page < end; ++page) {
-			if (m_cpu_dirty.Get(page)) continue;
-			auto&          entry = (*m_fault_log)[page];
-			const uint32_t count = (entry & 0x0fffu) == frame ? (entry >> 12u) + 1u : 1u;
-			entry                = static_cast<uint16_t>((std::min<uint32_t>(count, 15u) << 12u) | frame);
-			if (count >= HotPages::FaultsInFrame && !m_hot.Get(page)) {
-				m_hot.Set(page);
-				LiveCounters::Add(LiveCounters::HotPages);
-			}
-		}
-	}
-
 	template <DirtySource source>
 	RegionBits& GetBits() {
 		if constexpr (source == DirtySource::Cpu) {
@@ -364,10 +288,6 @@ private:
 	RegionBits            m_gpu_dirty;
 	RegionBits            m_writable;
 	RegionBits            m_readable;
-	RegionBits            m_hot; // KYTY_HOT_PAGES
-	uint32_t              m_hot_epoch = 0;
-	// Per page: the guest frame (low 12 bits) and its clean-to-dirty count (high 4); made at the first counted write.
-	std::unique_ptr<std::array<uint16_t, TRACKER_REGION_PAGES>> m_fault_log;
 };
 
 } // namespace Libs::Graphics
