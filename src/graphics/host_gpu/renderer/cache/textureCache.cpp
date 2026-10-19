@@ -2059,6 +2059,26 @@ void TextureCache::InitializeImage(ImageId id) {
 			marks[2] = Clock::now();
 		}
 		if (!uploaded) {
+			// A whole upload of 64 MiB or more: a buffer over the image's range and a tiler scratch of its size, both in
+			// video memory at once (S51, Gates of Boletaria: 2 x 256 MiB scratch from here in a 1.4 GB burst). Why the
+			// chunked upload refused it, the first 64 times.
+			if (image.info.data.size >= (uint64_t {64} << 20u)) {
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+					std::printf("FULL-IMAGE-WHOLE addr=0x%llx size=0x%llx %ux%u layers=%u levels=%u kind=%s cpu=%d partial=%d "
+					            "maybe=%d buffer=%d gpu=%d stencil=%d usage=%c%c%c%c depth_id=%d tiled=%d\n",
+					            static_cast<unsigned long long>(image.info.data.address),
+					            static_cast<unsigned long long>(image.info.data.size), image.info.extent.width,
+					            image.info.extent.height, image.info.resources.layers, image.info.resources.levels, kind,
+					            image.IsCpuDirty() ? 1 : 0, image.IsPartiallyCpuDirty() ? 1 : 0,
+					            image.IsMaybeCpuDirty() ? 1 : 0, image.IsBufferModified() ? 1 : 0,
+					            image.IsGpuModified() ? 1 : 0, image.IsStencilModified() ? 1 : 0,
+					            image.usage.texture ? 't' : '-', image.usage.storage ? 's' : '-',
+					            image.usage.render_target ? 'r' : '-', image.usage.depth_target ? 'd' : '-',
+					            image.depth_id ? 1 : 0, image.info.IsTiled() ? 1 : 0);
+					std::fflush(stdout);
+				}
+			}
 			const auto [source, source_offset] =
 			    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 			marks[2] = Clock::now();
