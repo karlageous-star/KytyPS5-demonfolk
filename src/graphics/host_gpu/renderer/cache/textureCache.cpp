@@ -20,6 +20,7 @@
 #include "kernel/memory.h"
 #include "live-counters.h"
 #include "native-resource-state.h"
+#include "local/local-platform.h"
 
 #include <algorithm>
 #include <array>
@@ -4512,6 +4513,18 @@ void TextureCache::RunGarbageCollector() {
 	constexpr uint64_t FailingTicks = 600;
 	const bool         failing      = !m_failed_images.empty() && tick < m_failed_images.back().tick + FailingTicks;
 	const uint64_t     download_max = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download).Size() / 2;
+	// Short of system memory (under 2 GiB available): images past the budget would be moved out of video memory by
+	// Windows into that RAM (KYTY_VRAM_FIRST allocates past the budget as a last step), and a heavy scene's streaming
+	// burst then took the PC to 1 MiB free (S40, 10-19, Gates of Boletaria). Unused images go after 2 s instead of 10
+	// while video memory is past the pressure mark. Checked every 8th pass. KYTY_RAM_SHORT_GC=0: off.
+	static const bool ram_short_gc = [] {
+		const char* value = std::getenv("KYTY_RAM_SHORT_GC");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (ram_short_gc && (tick & 7u) == 0) {
+		const uint64_t available = LocalPlatform::AvailablePhysicalMemory();
+		m_ram_short = available != 0 && available < (uint64_t {2} << 30u);
+	}
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
@@ -4521,7 +4534,8 @@ void TextureCache::RunGarbageCollector() {
 		// (oldest first, until usage is under the mark), 30 s otherwise. With deletions working,
 		// chenxiao measured images behind a turned camera coming back after a few seconds at 160
 		// flips (5-7 MB of uploads a frame, 1% low 47 -> 27 fps) and none at 600 (~10 s).
-		const uint64_t below = std::min(tick - age, m_tick_history.TickSecondsAgo(pressured ? 10.0 : 30.0));
+		const uint64_t below =
+		    std::min(tick - age, m_tick_history.TickSecondsAgo(pressured ? (m_ram_short ? 2.0 : 10.0) : 30.0));
 		// An image the collector keeps (a depth image with its stencil association; one the GPU wrote
 		// that is tiled, or any GPU-written one below the pressure mark: no download for its data) is
 		// passed over, not counted. Never used again, kept images stay at the front of the list, and

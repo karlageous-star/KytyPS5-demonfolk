@@ -314,6 +314,7 @@ private:
 	std::atomic<uint64_t> m_frame {0};
 	uint64_t              m_trimmed_bytes = 0; // KYTY_TEXTURE_RAM_TRIM total
 	uint64_t              m_target_trimmed_bytes = 0; // KYTY_TARGET_RAM_TRIM total
+	bool                  m_ram_short            = false; // under 2 GiB of system memory available (KYTY_RAM_SHORT_GC)
 	// Reduced texture quality: whether a new image for `desc` may leave out its top level, and the
 	// guest addresses a lookup needed at full quality (never reduced again).
 	[[nodiscard]] bool               MayReduce(const ImageDesc& desc);
