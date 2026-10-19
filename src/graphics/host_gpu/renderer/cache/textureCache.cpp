@@ -1789,9 +1789,11 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	const auto          layers          = info.resources.layers;
 	const auto          full_slice_size = info.data.size / layers;
 	auto                copies          = BuildDepthCopies(info, full_slice_size);
+	// Default on since S55 (10-19, Gates of Boletaria): an 80-layer 320 MiB depth array went up whole again and again
+	// with a scratch of its whole size each time (86 such scratches in one walk, S53); 0: off.
 	static const bool bound_depth_fallback = [] {
 		const char* value = std::getenv("KYTY_DEPTH_FALLBACK_SCRATCH_REUSE");
-		return value != nullptr && std::string_view(value) == "1";
+		return !(value != nullptr && value[0] == '0');
 	}();
 	// Keep the whole-path source acquisition and ownership decisions unchanged,
 	// including GPU image aliases that make CPU staging unsafe. Bound only its
@@ -1812,9 +1814,9 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 			        copies[i].bufferOffset == tile.linear_offset;
 		}
 		if (valid) {
-			static const bool batch_depth_fallback = [] {
+			static const bool batch_depth_fallback = [] { // default on since S55; 0: a layer at a time
 				const char* value = std::getenv("KYTY_DEPTH_FALLBACK_BATCH");
-				return value != nullptr && std::string_view(value) == "1";
+				return !(value != nullptr && value[0] == '0');
 			}();
 			// An opt-in batch keeps the same original synchronized source and all
 			// layers, but pays the scratch clear/copy barriers once per batch. Only
