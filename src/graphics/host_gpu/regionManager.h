@@ -181,19 +181,6 @@ public:
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
-		if constexpr (source == DirtySource::Gpu && enable) {
-			// Hot pages the GPU now writes: tracked again (their bytes went up with the upload before this),
-			// ahead of the conflict check below: a hot page is CPU-dirty by design.
-			if (m_hot.AnyInRange(start, end)) {
-				for (size_t page = start; page < end; ++page) {
-					if (m_hot.Get(page)) {
-						m_hot.Unset(page);
-						m_cpu_dirty.Unset(page);
-					}
-				}
-				UpdateCpuProtection<true>();
-			}
-		}
 		if constexpr (source == DirtySource::Cpu && enable) {
 			if (m_gpu_dirty.AnyInRange(start, end)) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
@@ -202,6 +189,18 @@ public:
 		if constexpr (source == DirtySource::Gpu && enable) {
 			if (m_cpu_dirty.AnyInRange(start, end)) {
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
+			}
+		}
+		if constexpr (source == DirtySource::Gpu && enable) {
+			// Hot pages the GPU now writes: tracked again (their bytes went up with the upload before this).
+			if (m_hot.AnyInRange(start, end)) {
+				for (size_t page = start; page < end; ++page) {
+					if (m_hot.Get(page)) {
+						m_hot.Unset(page);
+						m_cpu_dirty.Unset(page);
+					}
+				}
+				UpdateCpuProtection<true>();
 			}
 		}
 		if constexpr (source == DirtySource::Cpu && enable) {
