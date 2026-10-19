@@ -4521,10 +4521,12 @@ void TextureCache::RunGarbageCollector() {
 	// Short of system memory (under 2 GiB available): images past the budget would be moved out of video memory by
 	// Windows into that RAM (KYTY_VRAM_FIRST allocates past the budget as a last step), and a heavy scene's streaming
 	// burst then took the PC to 1 MiB free (S40, 10-19, Gates of Boletaria). Unused images go after 2 s instead of 10
-	// while video memory is past the pressure mark. Checked every 8th pass. KYTY_RAM_SHORT_GC=0: off.
+	// while video memory is past the pressure mark. Checked every 8th pass. Opt-in (KYTY_RAM_SHORT_GC=1): available RAM
+	// sits under 2 GiB in most runs (the file cache fills the rest), and the 2 s deletions cost the tunnel ~1.8 FPS in
+	// re-uploads (S44 25.8 vs S45 27.6); the crash it was for was the tiler scratch (KYTY_COLOR_CHUNK_SCRATCH_REUSE).
 	static const bool ram_short_gc = [] {
 		const char* value = std::getenv("KYTY_RAM_SHORT_GC");
-		return value == nullptr || value[0] != '0';
+		return value != nullptr && value[0] == '1';
 	}();
 	if (ram_short_gc && (tick & 7u) == 0) {
 		const uint64_t available = LocalPlatform::AvailablePhysicalMemory();
