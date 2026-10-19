@@ -3,6 +3,11 @@
 
 #include "common/assert.h"
 
+extern "C" {
+// KYTY_HOT_PAGES (live; default 0 until measured): see HotPages in regionManager.h.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_hot_pages_mode {0};
+}
+
 namespace Libs::Graphics {
 
 static_assert(std::atomic<void*>::is_always_lock_free);

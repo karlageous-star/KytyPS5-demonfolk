@@ -4478,6 +4478,9 @@ void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
 	m_tick_history.Record(tick);
+	// KYTY_HOT_PAGES: the guest frame its write counts are per, and the decay of hot pages (~17 s at 30 FPS).
+	HotPages::g_frame.fetch_add(1, std::memory_order_relaxed);
+	if ((tick & 511u) == 511u) HotPages::g_epoch.fetch_add(1, std::memory_order_relaxed);
 	if (LiveCounters::g_cache_map_due.load(std::memory_order_acquire)) {
 		WriteCacheMap(LiveCounters::g_cache_map_path);
 		LiveCounters::g_cache_map_due.store(false, std::memory_order_release);
