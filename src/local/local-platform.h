@@ -49,7 +49,7 @@ uint32_t ReadOpenFileAt(uint64_t file, uint64_t offset, void* buffer, uint32_t s
 // Large reads of the game's read-only files that leave nothing in the system file cache (Windows: a second handle
 // kept open per file, FILE_FLAG_NO_BUFFERING). Buffered, each byte a level streams in stayed in the cache manager's
 // working set next to its copy in guest memory: S29 (10-18) peaked at 2.26 GB of file cache, not available to anything
-// else. Reads at or above UncachedReadThreshold() take it (KYTY_UNCACHED_READ_KB, default 1024; 0: off); small reads
+// else. Reads at or above UncachedReadThreshold() take it (KYTY_UNCACHED_READ_KB, default 256; 0: off); small reads
 // (an audio stream's 16 KiB pieces) keep the cache manager's read-ahead.
 uint64_t UncachedReadThreshold();
 // The unbuffered handle of the read-only file at `path` (kept open, never closed, like OpenKeptReadFile: for the

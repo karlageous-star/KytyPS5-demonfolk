@@ -342,7 +342,10 @@ struct UncachedBuffer {
 uint64_t UncachedReadThreshold() {
 	static const uint64_t threshold = [] {
 		const char* value = std::getenv("KYTY_UNCACHED_READ_KB");
-		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {1024}) << 10u;
+		// 256 KiB since S50 (10-19): the file cache held 1,256 MiB on average instead of 1,885 (peak 1,411 vs 2,161), the
+		// tunnel stood at 28.2 FPS (27.6 at 1024) and walked with no frame over 50 ms. 64 KiB cost FPS (S35: the many
+		// smaller reads lost the cache).
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {256}) << 10u;
 	}();
 	return threshold;
 }
