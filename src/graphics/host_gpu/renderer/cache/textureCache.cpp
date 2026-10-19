@@ -2651,9 +2651,14 @@ bool TextureCache::UploadImageChunked(Image& image) {
 	TileBlockLayout block {};
 	if (!TileGetBlockLayout(plan.tiles.front().family, plan.tiles.front().bytes_per_element, block)) return false;
 	uint64_t uploaded_bytes = 0;
+	// KYTY_COLOR_CHUNK_SCRATCH_REUSE (default 1 since S43, 10-19; 0: a scratch buffer a batch): every batch detiles into
+	// one capacity-sized scratch. A batch's scratch was released only when its tick completed, and a texture array's
+	// batches are recorded in one tick: walking at the Gates of Boletaria put 1.8 GB of tiler scratch in flight (VMA block
+	// log, S42), video memory ran out ("allocate TileManager scratch buffer failed: ErrorOutOfDeviceMemory") after
+	// Windows had moved video memory out into the last of the RAM (S39-S42). With one scratch S43 walked the whole route.
 	static const bool reuse_scratch = [] {
 		const char* value = std::getenv("KYTY_COLOR_CHUNK_SCRATCH_REUSE");
-		return value != nullptr && std::string_view(value) == "1";
+		return !(value != nullptr && value[0] == '0');
 	}();
 	bool complete = true;
 	const auto record_batches = [&](TileManager::Result scratch) {
