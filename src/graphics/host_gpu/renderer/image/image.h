@@ -402,6 +402,8 @@ public:
 	// Page-aligned ranges inside the tracked pages the image stopped watching after partial
 	// CPU writes; always inside CpuDirtyRanges while the image is partially dirty.
 	std::vector<std::pair<uint64_t, uint64_t>> untracked_holes;
+	// KYTY_PARTIAL_IMAGE_DIRTY=2: guest data hashes per partial-dirty granule at the last upload.
+	std::vector<uint64_t> partial_hashes;
 	ImageId          depth_id {};
 	uint64_t         frame_accessed_last = 0; // TextureCache::AdvanceFrame count at the last use
 	size_t           lru_id             = 0;

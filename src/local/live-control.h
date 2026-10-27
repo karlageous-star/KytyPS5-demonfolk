@@ -153,8 +153,7 @@ inline void Flip() {
 			std::fprintf(file, "frame,end_ms,frame_ms,idle_ms,gpu_wait_ms,readback_wait_ms,download_wait_ms,compile_ms,"
 			                   "sync_downloads,async_readbacks,region_syncs,upload_kib,full_upload_kib,any_wait_ms,"
 			                   "gpu_self_ms,readback_self_ms,download_self_ms,compile_self_ms,linear_copies,copy_forwards,"
-			                   "sync_reads_render,sync_reads_guest,srt_watched_reads,rb_queue_done,rb_queue_inflight,"
-			                   "rb_queue_verified,rb_queue_mismatch,phase\n");
+			                   "sync_reads_render,sync_reads_guest,srt_watched_reads,rb_queue_done,phase\n");
 		}
 		return file;
 	}();
@@ -162,8 +161,7 @@ inline void Flip() {
 		using C = LiveCounters::Id;
 		static constexpr std::array counted {C::SyncDownloads, C::AsyncReadbacks, C::RegionSyncs, C::UploadBytes,
 		                                     C::FullUploadBytes, C::LinearCopies, C::CopyForwards, C::SyncReadsRender,
-		                                     C::SyncReadsGuest, C::SrtWatchedReads, C::RbQueueDone, C::RbQueueInflight,
-		                                     C::RbQueueVerified, C::RbQueueMismatch};
+		                                     C::SyncReadsGuest, C::SrtWatchedReads, C::RbQueueDone};
 		static std::chrono::steady_clock::time_point  start = std::chrono::steady_clock::now(), last {};
 		static int64_t                                last_idle = 0, last_any = 0;
 		static std::array<int64_t, LiveCensus::Waits> last_waits {}, last_self {};
@@ -208,12 +206,10 @@ inline void Flip() {
 			std::fprintf(frame_log, ",%.3f", static_cast<double>(LiveCensus::g_wait_any_ns - last_any) / 1e6);
 			for (size_t i = 0; i < LiveCensus::Waits && i < 4; ++i)
 				std::fprintf(frame_log, ",%.3f", static_cast<double>(LiveCensus::g_wait_self_ns[i] - last_self[i]) / 1e6);
-			std::fprintf(frame_log, ",%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%s\n",
+			std::fprintf(frame_log, ",%llu,%llu,%llu,%llu,%llu,%llu,%s\n",
 			             static_cast<unsigned long long>(delta[5]), static_cast<unsigned long long>(delta[6]),
 			             static_cast<unsigned long long>(delta[7]), static_cast<unsigned long long>(delta[8]),
-			             static_cast<unsigned long long>(delta[9]), static_cast<unsigned long long>(delta[10]),
-			             static_cast<unsigned long long>(delta[11]), static_cast<unsigned long long>(delta[12]),
-			             static_cast<unsigned long long>(delta[13]), phase);
+			             static_cast<unsigned long long>(delta[9]), static_cast<unsigned long long>(delta[10]), phase);
 			std::fflush(frame_log);
 		}
 		last      = now;
@@ -231,8 +227,7 @@ inline void Flip() {
 		                                     C::XprMissRefused, C::XprMissValidate, C::XprMissUnseen, C::XprMissBudget,
 		                                     C::UploadBytes, C::AsyncImageBytes, C::FullUploadBytes,
 		                                     C::BufferRegistrations, C::RegionSyncs, C::SyncDownloads, C::AsyncReadbacks,
-		                                     C::ReadbackParts, C::ReadbackRegions, C::RbQueueDone, C::RbQueueInflight,
-		                                     C::RbQueueVerified, C::RbQueueMismatch, C::SyncReadsRender, C::SyncReadsGuest,
+		                                     C::ReadbackParts, C::ReadbackRegions, C::RbQueueDone, C::SyncReadsRender, C::SyncReadsGuest,
 		                                     C::SrtWatchedReads, C::GuestCommands, C::TextureUnmaps, C::AsyncPipelines,
 		                                     C::TableDraws, C::TableStores, C::TableStoreVariant, C::TableStoreTargets,
 		                                     C::TableRefusedSets, C::TableNoSet, C::TableDrawNative, C::TableEvaluations,

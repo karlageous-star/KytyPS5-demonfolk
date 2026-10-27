@@ -50,6 +50,7 @@
 #include <thread>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
+#include <xxhash.h>
 
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_write_window_handoff_mode {1};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_image_granules_mode {2};
@@ -2658,6 +2659,20 @@ void DirtyRowBands(const std::vector<std::pair<uint64_t, uint64_t>>& dirty, uint
 			bands.push_back({first, last});
 		}
 	}
+}
+
+[[nodiscard]] uint64_t HashGuestRange(uint64_t vaddr, uint64_t size) {
+	if (const auto* data = LibKernel::Memory::TryGetBackingPointer(vaddr, size)) {
+		return XXH3_64bits(data, static_cast<size_t>(size));
+	}
+	thread_local std::vector<uint8_t> bytes;
+	bytes.resize(size);
+	if (!LibKernel::Memory::TryReadBacking(vaddr, bytes.data(), size) &&
+	    !LibKernel::Memory::TryReadPrtBacking(vaddr, bytes.data(), size)) {
+		// Unreadable (unbacked sparse pages): equal to itself until the pages become readable.
+		return 0x5ca1ab1e0ddba11ull;
+	}
+	return XXH3_64bits(bytes.data(), static_cast<size_t>(size));
 }
 
 } // namespace

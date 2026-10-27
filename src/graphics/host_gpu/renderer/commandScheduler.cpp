@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
@@ -730,7 +731,7 @@ void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
 	info.pSignalSemaphores    = submit.signal_semaphores;
 	for (uint32_t i = 0; i < submit.signals; ++i) {
 		if (submit.signal_ticks[i] != submit.tick) continue;
-		DeviceFault::NoteSubmit(static_cast<uint64_t>(submit.signal_semaphores[i]), submit.tick, // NOLINT
+		DeviceFault::NoteSubmit(std::bit_cast<uint64_t>(submit.signal_semaphores[i]), submit.tick,
 		                        submit.commands, submit.count, submit.wait_semaphores, submit.wait_ticks,
 		                        submit.waits);
 		break;
@@ -873,7 +874,7 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 		info.pSignalSemaphores = submit.signal_semaphores.data();
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 		static_assert(sizeof(vk::CommandBuffer) == sizeof(VkCommandBuffer));
-		DeviceFault::NoteSubmit(static_cast<uint64_t>(static_cast<VkSemaphore>(m_master.Handle())), tick, // NOLINT
+		DeviceFault::NoteSubmit(std::bit_cast<uint64_t>(static_cast<VkSemaphore>(m_master.Handle())), tick,
 		                        reinterpret_cast<const VkCommandBuffer*>(buffers.data()),
 		                        static_cast<uint32_t>(entries.size()),
 		                        reinterpret_cast<const VkSemaphore*>(submit.wait_semaphores.data()),
@@ -916,7 +917,7 @@ void CommandScheduler::QueueSubmit(const SubmitJob& job) {
 		Common::LockGuard lock(m_graphics.queue_mutex);
 		static_assert(sizeof(vk::CommandBuffer) == sizeof(VkCommandBuffer));
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
-		DeviceFault::NoteSubmit(static_cast<uint64_t>(static_cast<VkSemaphore>(m_master.Handle())), job.tick, // NOLINT
+		DeviceFault::NoteSubmit(std::bit_cast<uint64_t>(static_cast<VkSemaphore>(m_master.Handle())), job.tick,
 		                        reinterpret_cast<const VkCommandBuffer*>(job.buffers.data()), job.buffer_count,
 		                        reinterpret_cast<const VkSemaphore*>(submit.wait_semaphores.data()),
 		                        submit.wait_ticks.data(), submit.num_wait_semaphores);
