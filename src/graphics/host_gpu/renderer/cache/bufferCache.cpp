@@ -1053,7 +1053,6 @@ bool BufferCache::TryGuestReadFromFeedback(uint64_t vaddr, uint64_t size, bool i
 
 void BufferCache::Register(BufferId id) {
 	ChangeRegister<true>(id);
-	ChangeRegister<true>(id);
 	// Defragmentation identifies a pool allocation by its registered buffer id.
 	if (m_graphics.game_buffer_pool != nullptr && m_slot_buffers[id].Allocation() != nullptr) {
 		vmaSetAllocationUserData(m_graphics.allocator, m_slot_buffers[id].Allocation(),
