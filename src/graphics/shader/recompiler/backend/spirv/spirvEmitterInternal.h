@@ -313,8 +313,6 @@ enum : uint32_t {
 	GlslUMin            = 38,
 	GlslFMax            = 40,
 	GlslFClamp          = 43,
-	GlslNMin            = 79,
-	GlslNMax            = 80,
 	GlslSClamp          = 45,
 	GlslLdexp           = 53,
 	GlslFma             = 50,
