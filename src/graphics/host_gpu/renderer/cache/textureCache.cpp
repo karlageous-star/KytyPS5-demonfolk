@@ -481,6 +481,32 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 #endif
 }
 
+uint64_t KytyGcLiveBudgetValue(const GraphicContext& graphics) {
+	static const uint64_t cap = [] {
+		const char* env = std::getenv("KYTY_GC_BUDGET_CAP_MB");
+		return env != nullptr ? std::strtoull(env, nullptr, 10) << 20 : 0ull;
+	}();
+	const uint64_t budget     = graphics.GetTotalMemoryBudget();
+	const uint64_t now_budget = cap != 0 ? std::min(budget, cap) : budget;
+	static std::mutex mutex;
+	static std::array<uint64_t, 15> samples {};
+	static size_t next = 0;
+	static std::chrono::steady_clock::time_point last {};
+	std::scoped_lock lock {mutex};
+	const auto now = std::chrono::steady_clock::now();
+	if (samples[0] == 0) {
+		samples.fill(now_budget);
+		last = now;
+	} else if (now - last >= std::chrono::seconds(2)) {
+		next = (next + 1) % samples.size();
+		samples[next] = now_budget;
+		last = now;
+	} else {
+		samples[next] = std::min(samples[next], now_budget);
+	}
+	return *std::min_element(samples.begin(), samples.end());
+}
+
 TextureCache::~TextureCache() {
 	g_offload_alive.store(false, std::memory_order_release); // (no restores: the images go)
 	// (Jobs of the priority thread and the offload worker may still name them: never freed.)
