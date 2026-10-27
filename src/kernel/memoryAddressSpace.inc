@@ -23,10 +23,67 @@ static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t 
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
-	return size != 0 && VirtualFree(reinterpret_cast<void*>(vaddr), size,
-	                                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0;
+// (A placeholder split or coalesce, counted with its time: placeholder_calls, placeholder_kt.)
+static bool PlaceholderFree(void* vaddr, uint64_t size, DWORD type) {
+	const auto start = __rdtsc();
+	const bool done  = VirtualFree(vaddr, size, type) != 0;
+	LiveCounters::Add(LiveCounters::PlaceholderCalls);
+	LiveCounters::Add(LiveCounters::PlaceholderKt, (__rdtsc() - start) >> 10u);
+	return done;
 }
+
+static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
+	return size != 0 && PlaceholderFree(reinterpret_cast<void*>(vaddr), size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+}
+
+// Kyty.Trim's trim of a parked range: GuestAddressSpace::TrimParked while the address space lives (below).
+static void TrimParkedRange(uint64_t vaddr, uint64_t size);
+
+// Ranges parked in their views (GuestBackingStore::UnmapOne) taken out of the working set by a thread of its own: mapped,
+// their pages stayed counted in use (~1.5 GB of the game's freed streaming memory at a time), and dropping them costs
+// ~0.5 us per 4 KiB page (VirtualUnlock on pages not locked), which the game's threads no longer pay. Harmless when late:
+// on a range unmapped meanwhile it fails, a range mapped again has its pages faulted back in.
+class ParkedRangeTrimmer {
+public:
+	static void Trim(uint64_t vaddr, uint64_t size) {
+		// KYTY_WORKING_SET_TRIM=0 (a test; the launcher's Experimental "Keep memory resident"): none, parked ranges and the
+		// texture offload's guest pages (TrimGuestRange) left to Windows: ~1.5 GB more in use on a 16 GB PC. These trims
+		// take guest pages out of the working set, as Windows had done with the page of the MEMORY_MANAGEMENT blue screen's
+		// stack (KeepResident, memory.cpp).
+		static const bool off = [] {
+			const char* value = std::getenv("KYTY_WORKING_SET_TRIM");
+			return value != nullptr && value[0] == '0';
+		}();
+		if (off) return;
+		static auto* trimmer = new ParkedRangeTrimmer; // (never destroyed: its thread may outlive static destructors)
+		{
+			std::lock_guard lock(trimmer->m_mutex);
+			trimmer->m_ranges.emplace_back(vaddr, size);
+		}
+		trimmer->m_ready.notify_one();
+	}
+
+private:
+	ParkedRangeTrimmer() {
+		std::thread([this] {
+			LocalPlatform::SetThreadName("Kyty.Trim");
+			SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+			std::vector<std::pair<uint64_t, uint64_t>> ranges;
+			for (;;) {
+				{
+					std::unique_lock lock(m_mutex);
+					m_ready.wait(lock, [this] { return !m_ranges.empty(); });
+					ranges.swap(m_ranges);
+				}
+				for (const auto& [vaddr, size]: ranges) TrimParkedRange(vaddr, size);
+				ranges.clear();
+			}
+		}).detach();
+	}
+	std::mutex                                 m_mutex;
+	std::condition_variable                    m_ready;
+	std::vector<std::pair<uint64_t, uint64_t>> m_ranges;
+};
 #endif
 
 // Guest ranges that still hold their data but were mapped again with their view's protection:
@@ -62,6 +119,7 @@ static void ReapplyRemappedViews() {
 		}
 	}
 }
+
 
 // Backing aliases bypass guest page protection. Invalidate hoisted preparation
 // across every such write and mapping/protection mutation on every host OS.
@@ -143,9 +201,11 @@ public:
 
 	~GuestBackingStore() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		for (const auto& [_, entry]: m_maps) {
-			UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size);
+		for (const auto& [base, size]: m_views) {
+			UnmapViewPreservePlaceholder(reinterpret_cast<void*>(base), size);
 		}
+		m_views.clear();
+		m_parked.clear();
 		m_maps.clear();
 		m_coverage.clear();
 		if (m_backing_base != nullptr) {
@@ -228,16 +288,15 @@ public:
 	// Diagnostic (live measure: backing_lock_*, backing_hold_*): the render thread's waits for
 	// either lock are counted when it is contended, and how long the writers hold them.
 	template <typename Lock>
-	static void AcquireCounted(Lock& lock) {
+	static void AcquireCounted(Lock& lock, bool write = false) {
 		if (lock.try_lock()) return;
 		const auto start = std::chrono::steady_clock::now();
 		lock.lock();
 		if (Graphics::GuestGpu::IsGpuThread()) {
-			LiveCounters::Add(LiveCounters::BackingLockWaits);
-			LiveCounters::Add(LiveCounters::BackingLockWaitUs,
-			                  static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-			                                            std::chrono::steady_clock::now() - start)
-			                                            .count()));
+			const auto us = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+			LiveCounters::Add(write ? LiveCounters::BackingWriteWaits : LiveCounters::BackingLockWaits);
+			LiveCounters::Add(write ? LiveCounters::BackingWriteWaitUs : LiveCounters::BackingLockWaitUs, us);
 		}
 	}
 	std::shared_lock<std::shared_mutex> MapReadLock() {
@@ -245,9 +304,9 @@ public:
 		AcquireCounted(lock);
 		return lock;
 	}
-	std::unique_lock<std::mutex> DataLock() {
+	std::unique_lock<std::mutex> DataLock(bool write = false) {
 		std::unique_lock lock(m_data_mutex, std::defer_lock);
-		AcquireCounted(lock);
+		AcquireCounted(lock, write);
 		return lock;
 	}
 	struct HoldTimer {
@@ -259,6 +318,42 @@ public:
 			                                              .count()));
 		}
 	};
+
+	// Linux, the texture offload: the pages of [address, address + size) of the backing view freed
+	// (a hole punched in the store's memfd: gone from every view of them, a later read gets zeros).
+	// False elsewhere.
+	bool DiscardPages(uint64_t address, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+		const auto base = reinterpret_cast<uint64_t>(m_backing_base);
+		return IsAvailable() && address >= base && RangeOk(address - base, size) &&
+		       fallocate(m_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+		                 static_cast<off_t>(address - base), static_cast<off_t>(size)) == 0;
+#else
+		(void)address, (void)size;
+		return false;
+#endif
+	}
+
+	// Linux, the file offload: the byte at `address` of the backing view in a second read-write
+	// view of the store (mapped on first use), which the offload's protections of the backing view
+	// leave alone. Null elsewhere.
+	uint8_t* SparePointer(uint64_t address) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+		std::call_once(m_spare_once, [this] {
+			if (!IsAvailable()) return;
+			void* view =
+			    mmap(nullptr, m_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NORESERVE, m_fd, 0);
+			if (view != MAP_FAILED) m_spare = static_cast<uint8_t*>(view);
+		});
+		const auto base = reinterpret_cast<uint64_t>(m_backing_base);
+		return m_spare != nullptr && address >= base && address - base < m_size
+		           ? m_spare + (address - base)
+				   : nullptr;
+#else
+		(void)address;
+		return nullptr;
+#endif
+	}
 
 	bool ZeroRange(uint64_t backing_offset, uint64_t size) {
 		GuestBackingMutation mutation;
@@ -281,7 +376,34 @@ public:
 		return TryTransferBacking<true>(vaddr, size,
 		                          [source](uint8_t* backing, uint64_t data_offset, size_t bytes) {
 			                          std::memcpy(backing, source + data_offset, bytes);
+			                          FreshMemory::MarkBacking(reinterpret_cast<uint64_t>(backing), bytes);
 		                          });
+	}
+
+	// A write of bytes no data writer writes, such as a linear copy's into pages the CPU owns (TryWriteBacking's GPU
+	// results go to GPU-owned pages only: BufferCache::WriteBackGpuOwned): its own mutex and fence, so it never waits
+	// behind a data write (the render thread's linear copies waited there ~1.5 times a frame, 0.13 ms at Latria). A
+	// reader excludes both kinds of writer (the slow path both mutexes, the fast one both fences). False when one
+	// mapping does not cover the range.
+	bool TryWriteCpuBacking(uint64_t vaddr, const void* data, uint64_t size) {
+		GuestBackingMutation mutation;
+		if (data == nullptr || !IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		auto            lock = MapReadLock();
+		std::lock_guard cpu_lock(m_cpu_write_mutex);
+		MapEntry        entry {};
+		if (!FindContainingUnlocked(vaddr, size, &entry)) {
+			return false;
+		}
+		const auto begin = entry.backing_offset + vaddr - entry.vaddr;
+		if (!RangeOk(begin, size)) {
+			return false;
+		}
+		DataWriteFence fence(*this, begin, begin + size, m_cpu_write_pages);
+		std::memcpy(m_backing_base + begin, data, size);
+		FreshMemory::MarkBacking(reinterpret_cast<uint64_t>(m_backing_base + begin), size);
+		return true;
 	}
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -311,13 +433,13 @@ public:
 		    data && size && size <= 0x10000 && UINT64_MAX - vaddr >= size) {
 			BackingReadTransaction read(*this);
 			if (read.Acquired()) {
-				auto& cached = m_host_read_translations[(vaddr >> 22) % m_host_read_translations.size()];
-				MapEntry entry {};
-				if (cached.epoch == m_mapping_epoch &&
-				    GuestFreeRangeContains(cached.entry.vaddr, cached.entry.size, vaddr, size)) {
+				auto&      cached = HostReadTranslationOf(vaddr);
+				const auto epoch  = RegionEpoch(vaddr);
+				MapEntry   entry {};
+				if (cached.epoch == epoch && GuestFreeRangeContains(cached.entry.vaddr, cached.entry.size, vaddr, size)) {
 					entry = cached.entry;
 				} else if (FindContainingUnlocked(vaddr, size, &entry)) {
-					cached = {entry, m_mapping_epoch};
+					cached = {entry, epoch};
 				}
 				if (entry.size && RangeOk(entry.backing_offset + vaddr - entry.vaddr, size)) {
 					const auto offset = entry.backing_offset + vaddr - entry.vaddr;
@@ -343,12 +465,12 @@ public:
 		{
 			BackingReadTransaction read(*this);
 			if (read.Acquired()) {
-				auto& cached = m_host_read_translations[(vaddr >> 22) % m_host_read_translations.size()];
-				if (cached.epoch == m_mapping_epoch &&
-				    GuestFreeRangeContains(cached.entry.vaddr, cached.entry.size, vaddr, size)) {
+				auto&      cached = HostReadTranslationOf(vaddr);
+				const auto epoch  = RegionEpoch(vaddr);
+				if (cached.epoch == epoch && GuestFreeRangeContains(cached.entry.vaddr, cached.entry.size, vaddr, size)) {
 					entry = cached.entry;
 				} else if (FindContainingUnlocked(vaddr, size, &entry)) {
-					cached = {entry, m_mapping_epoch};
+					cached = {entry, epoch};
 				}
 			}
 		}
@@ -360,6 +482,31 @@ public:
 		}
 		const auto offset = entry.backing_offset + vaddr - entry.vaddr;
 		return RangeOk(offset, size) ? m_backing_base + offset : nullptr;
+	}
+
+	// The end of the mapping `vaddr` is in (0: none), through this thread's host read translations (BackingPointer's
+	// lookups of the same mappings then find them there).
+	uint64_t MappingEndOf(uint64_t vaddr) {
+		if (!IsAvailable()) {
+			return 0;
+		}
+		{
+			BackingReadTransaction read(*this);
+			if (read.Acquired()) {
+				auto&      cached = HostReadTranslationOf(vaddr);
+				const auto epoch  = RegionEpoch(vaddr);
+				if (cached.epoch == epoch && GuestFreeRangeContains(cached.entry.vaddr, cached.entry.size, vaddr, 1)) {
+					return cached.entry.vaddr + cached.entry.size;
+				}
+				MapEntry entry {};
+				if (!FindContainingUnlocked(vaddr, 1, &entry)) return 0;
+				cached = {entry, epoch};
+				return entry.vaddr + entry.size;
+			}
+		}
+		auto     lock = MapReadLock();
+		MapEntry entry {};
+		return FindContainingUnlocked(vaddr, 1, &entry) ? entry.vaddr + entry.size : 0;
 	}
 
 	// The backing bytes of [vaddr, vaddr + size) as one piece per guest mapping it spans, in
@@ -392,8 +539,9 @@ public:
 			return false;
 		}
 
-		auto lock      = MapReadLock();
-		auto data_lock = DataLock();
+		auto            lock      = MapReadLock();
+		auto            data_lock = DataLock();
+		std::lock_guard cpu_lock(m_cpu_write_mutex);
 		const auto      end   = vaddr + size;
 		auto            first = m_maps.lower_bound(vaddr);
 		if (first != m_maps.begin()) {
@@ -454,6 +602,7 @@ public:
 			BackingWriteFence fence(*this);
 			InvalidateMappingLookup();
 			EXIT_IF(!MapsEmplace(MapEntry {vaddr, size, backing_offset, mode}));
+			EXIT_IF(!m_views.emplace(vaddr, size).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
@@ -475,7 +624,10 @@ public:
 #endif
 	}
 
-	bool Unmap(uint64_t vaddr, uint64_t size, bool* placeholder_preserved = nullptr) {
+	// [vaddr, vaddr + size) unmapped. The ranges that became free placeholders (each one placeholder) are appended to
+	// `freed`: on Windows a range left parked in its view is none, and a view released whole frees its parked ranges too.
+	bool Unmap(uint64_t vaddr, uint64_t size, bool* placeholder_preserved,
+	           std::vector<std::pair<uint64_t, uint64_t>>* freed) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
@@ -504,36 +656,29 @@ public:
 
 		std::vector<MapEntry> removed;
 		removed.reserve(targets.size());
+		const auto freed_before = freed->size();
+		bool       parked       = false;
 		for (const auto& entry: targets) {
 			bool part_placeholder_preserved = false;
-			if (!UnmapOne(entry.vaddr, entry.size, &part_placeholder_preserved)) {
+			bool part_parked                = false;
+			if (!UnmapOne(entry.vaddr, entry.size, &part_placeholder_preserved, freed, &part_parked)) {
+				// (A part parked in its view or released with it is not given back: those fail only fatally.)
+				EXIT_IF(parked);
 				for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
 					EXIT_IF(!MapExistingPlaceholderFixed(it->vaddr, it->size, it->backing_offset,
 					                                     it->mode, nullptr, ProtectiveRemap()));
 					NoteRemapped(it->vaddr, it->size);
 				}
+				freed->resize(freed_before);
 				if (placeholder_preserved != nullptr) {
 					*placeholder_preserved = false;
 				}
 				return false;
 			}
 			EXIT_IF(!part_placeholder_preserved);
+			parked = parked || part_parked;
 			removed.push_back(entry);
 		}
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		// Each unmapped file view becomes a separate Windows placeholder. The address-space owner
-		// records this contiguous guest span as one free range, so normalize fragmented backing
-		// views into one placeholder before publishing it there.
-		if (removed.size() > 1 && !CoalescePlaceholders(vaddr, size)) {
-			for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
-				EXIT_IF(!MapExistingPlaceholderFixed(it->vaddr, it->size, it->backing_offset,
-				                                     it->mode, nullptr, ProtectiveRemap()));
-				NoteRemapped(it->vaddr, it->size);
-			}
-			return false;
-		}
-#endif
 
 		if (placeholder_preserved != nullptr) {
 			*placeholder_preserved = true;
@@ -541,16 +686,24 @@ public:
 		return true;
 	}
 
-	// The span of the views over [vaddr, vaddr + size), widening [*begin, *end) (a partial unmap maps the other parts
-	// of the first and the last view again: GuestAddressSpace::UnmapBacking marks it busy).
+	// The span of the views over [vaddr, vaddr + size), widening [*begin, *end) (an unmap maps the other parts of the
+	// first and the last view again, or releases a view whole: GuestAddressSpace::UnmapBacking marks it busy).
 	void ViewSpan(uint64_t vaddr, uint64_t size, uint64_t* begin, uint64_t* end) {
-		auto     lock = MapReadLock();
+		auto lock = MapReadLock();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (const auto view = FindViewUnlocked(vaddr); view != m_views.end()) *begin = std::min(*begin, view->first);
+		if (const auto view = FindViewUnlocked(vaddr + size - 1); view != m_views.end())
+			*end = std::max(*end, view->first + view->second);
+#else
 		MapEntry entry {};
 		if (FindContainingUnlocked(vaddr, 1, &entry)) *begin = std::min(*begin, entry.vaddr);
 		if (FindContainingUnlocked(vaddr + size - 1, 1, &entry)) *end = std::max(*end, entry.vaddr + entry.size);
+#endif
 	}
 
-	bool UnmapOne(uint64_t vaddr, uint64_t size, bool* placeholder_preserved = nullptr) {
+	// `freed`: as Unmap's. `parked` (Windows): the range was left parked in its view, or released with it.
+	bool UnmapOne(uint64_t vaddr, uint64_t size, bool* placeholder_preserved,
+	              std::vector<std::pair<uint64_t, uint64_t>>* freed, bool* parked = nullptr) {
 		GuestBackingMutation mutation;
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		if (g_test_backing_store_unmaps_before_failure == 0) {
@@ -561,6 +714,9 @@ public:
 			g_test_backing_store_unmaps_before_failure--;
 		}
 #endif
+		if (parked != nullptr) {
+			*parked = false;
+		}
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 		// Only the unmapped pages get a placeholder, under the lock. Mapping the
@@ -590,43 +746,99 @@ public:
 			MapsEmplace(MapEntry {right, old.vaddr + old.size - right, old.backing_offset + (right - old.vaddr),
 			                      old.mode});
 		}
+		freed->emplace_back(vaddr, size);
 		if (placeholder_preserved != nullptr) {
 			*placeholder_preserved = true;
 		}
 		return true;
 #else
-		MapEntry old {};
+		// Whole: the range is its view. Split: the view unmapped and its other parts mapped again (a view cannot be split).
+		// Park: the range left in its view (m_parked). Release: the view unmapped whole, nothing of it mapped.
+		enum class How { Whole, Split, Park, Release };
+		const auto park_mode = kyty_local_park_unmaps.load(std::memory_order_relaxed);
+		const bool park_new  = park_mode != 0;
+		MapEntry   old {};
+		uint64_t   view_base = 0, view_size = 0;
+		How        how = How::Whole;
 		{
 			std::lock_guard lock(m_mutex);
 			HoldTimer hold {LiveCounters::BackingHoldMapUs};
-			auto            next = m_maps.upper_bound(vaddr);
-			if (next != m_maps.begin()) {
-				auto entry = std::prev(next);
-				if (vaddr + size <= entry->second.vaddr + entry->second.size) {
-					old = entry->second;
-					BackingWriteFence fence(*this);
-					InvalidateMappingLookup();
-					MapsErase(entry);
+			const auto      next = m_maps.upper_bound(vaddr);
+			if (next == m_maps.begin()) {
+				return false;
+			}
+			const auto entry = std::prev(next);
+			if (vaddr + size > entry->second.vaddr + entry->second.size) {
+				return false;
+			}
+			old             = entry->second;
+			const auto view = FindViewUnlocked(old.vaddr);
+			EXIT_IF(view == m_views.end() || old.vaddr + old.size > view->first + view->second);
+			view_base             = view->first;
+			view_size             = view->second;
+			const bool whole_view = old.vaddr == view_base && old.size == view_size;
+			const bool exact      = vaddr == old.vaddr && size == old.size;
+			how                   = !whole_view ? How::Park : exact ? How::Whole : park_new ? How::Park : How::Split;
+			BackingWriteFence fence(*this);
+			InvalidateMappingLookup();
+			MapsErase(entry);
+			if (how != How::Park) {
+				m_views.erase(view);
+			} else {
+				if (vaddr != old.vaddr) {
+					EXIT_IF(!MapsEmplace(MapEntry {old.vaddr, vaddr - old.vaddr, old.backing_offset, old.mode}));
+				}
+				if (const auto right = vaddr + size; right != old.vaddr + old.size) {
+					EXIT_IF(!MapsEmplace(MapEntry {right, old.vaddr + old.size - right,
+					                               old.backing_offset + (right - old.vaddr), old.mode}));
+				}
+				const auto view_end = view_base + view_size;
+				if (const auto live = m_maps.lower_bound(view_base); live == m_maps.end() || live->first >= view_end) {
+					how = How::Release;
+					m_parked.erase(m_parked.lower_bound(view_base), m_parked.lower_bound(view_end));
+					m_views.erase(view);
+				} else {
+					ParkUnlocked(vaddr, size, view_base, view_end);
 				}
 			}
 		}
 
-		if (old.size == 0) {
-			return false;
+		if (how == How::Park) {
+			// The range keeps its protection: the guest has no mapping there (a map over it splits the view first), and the
+			// emulator's reads and writes of guest memory find none either (m_maps). Made no-access, ~0.5 us per 4 KiB page
+			// on the game's thread, it cost a third of what splitting the view did (kyty_local_park_unmaps 2: a stray access
+			// faults, for debugging); its pages leave the working set on the trimming thread instead. (The address space
+			// holds the range busy: no protection of it changes meanwhile.)
+			if (park_mode == 2) {
+				EXIT_IF(!ApplyProtection(reinterpret_cast<void*>(vaddr), size, VirtualMemory::Mode::NoAccess));
+			} else {
+				ParkedRangeTrimmer::Trim(vaddr, size);
+			}
+			LiveCounters::Add(LiveCounters::ParkedUnmaps);
+			if (parked != nullptr) *parked = true;
+			if (placeholder_preserved != nullptr) *placeholder_preserved = true;
+			return true;
 		}
-
-		const bool exact_unmap = (vaddr == old.vaddr && size == old.size);
-		if (exact_unmap) {
-			const bool unmapped =
-			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
+		if (how == How::Release) {
+			EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(view_base), view_size));
+			LiveCounters::Add(LiveCounters::ParkedReleases);
+			freed->emplace_back(view_base, view_size);
+			if (parked != nullptr) *parked = true;
+			if (placeholder_preserved != nullptr) *placeholder_preserved = true;
+			return true;
+		}
+		if (how == How::Whole) {
+			const bool unmapped = UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
 			if (!unmapped) {
 				std::lock_guard lock(m_mutex);
 				HoldTimer hold {LiveCounters::BackingHoldMapUs};
 				BackingWriteFence fence(*this);
 				InvalidateMappingLookup();
 				MapsEmplace(old);
+				m_views.emplace(old.vaddr, old.size);
 				return false;
 			}
+			freed->emplace_back(vaddr, size);
 			if (placeholder_preserved != nullptr) {
 				*placeholder_preserved = true;
 			}
@@ -662,17 +874,19 @@ public:
 				ok = mapped && ok;
 			}
 			if (ok) {
+				freed->emplace_back(vaddr, size);
 				if (placeholder_preserved != nullptr) {
 					*placeholder_preserved = true;
 				}
 				return true;
 			}
 
+			std::vector<std::pair<uint64_t, uint64_t>> scratch;
 			if (left_size != 0 && Contains(old.vaddr, left_size)) {
-				EXIT_IF(!UnmapOne(old.vaddr, left_size));
+				EXIT_IF(!UnmapOne(old.vaddr, left_size, nullptr, &scratch));
 			}
 			if (right_size != 0 && Contains(right_addr, right_size)) {
-				EXIT_IF(!UnmapOne(right_addr, right_size));
+				EXIT_IF(!UnmapOne(right_addr, right_size, nullptr, &scratch));
 			}
 			EXIT_IF(VirtualFree(reinterpret_cast<void*>(old.vaddr), old.size,
 			                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) == 0);
@@ -686,7 +900,100 @@ public:
 		BackingWriteFence fence(*this);
 		InvalidateMappingLookup();
 		MapsEmplace(old);
+		m_views.emplace(old.vaddr, old.size);
 		return false;
+#endif
+	}
+
+	// Whether ranges parked in views (UnmapOne) overlap [vaddr, vaddr + size); the span of their views widens
+	// [*begin, *end).
+	bool ParkedViews(uint64_t vaddr, uint64_t size, uint64_t* begin, uint64_t* end) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		auto lock  = MapReadLock();
+		bool found = false;
+		for (auto it = FirstParkedUnlocked(vaddr, size); it != m_parked.end() && it->first < vaddr + size; ++it) {
+			const auto view = FindViewUnlocked(it->first);
+			EXIT_IF(view == m_views.end());
+			*begin = std::min(*begin, view->first);
+			*end   = std::max(*end, view->first + view->second);
+			found  = true;
+		}
+		return found;
+#else
+		(void)vaddr, (void)size, (void)begin, (void)end;
+		return false;
+#endif
+	}
+
+	// The end of the parked range holding `vaddr`, 0 when none.
+	uint64_t ParkedEnd(uint64_t vaddr) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		auto       lock = MapReadLock();
+		const auto it   = FirstParkedUnlocked(vaddr, 1);
+		return it != m_parked.end() ? it->first + it->second : 0;
+#else
+		(void)vaddr;
+		return 0;
+#endif
+	}
+
+	// The views holding ranges parked over [vaddr, vaddr + size) split for real, before something is mapped there: each
+	// unmapped whole and its mapped parts mapped again as views of their own (as a partial unmap did, protective); its
+	// parked ranges, free placeholders now, are appended to `freed`. (GuestAddressSpace::MaterializeParked holds the
+	// views busy.)
+	void Materialize(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* freed) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		GuestBackingMutation mutation;
+		g_protective_remap = kyty_local_protective_remap.load(std::memory_order_relaxed) != 0;
+		for (;;) {
+			uint64_t                                   view_base = 0, view_size = 0;
+			std::vector<MapEntry>                      mapped;
+			std::vector<std::pair<uint64_t, uint64_t>> parts;
+			{
+				std::lock_guard lock(m_mutex);
+				HoldTimer hold {LiveCounters::BackingHoldMapUs};
+				const auto      parked = FirstParkedUnlocked(vaddr, size);
+				if (parked == m_parked.end()) return;
+				const auto view = FindViewUnlocked(parked->first);
+				EXIT_IF(view == m_views.end());
+				view_base           = view->first;
+				view_size           = view->second;
+				const auto view_end = view_base + view_size;
+				BackingWriteFence fence(*this);
+				InvalidateMappingLookup();
+				for (auto it = m_maps.lower_bound(view_base); it != m_maps.end() && it->first < view_end;) {
+					mapped.push_back(it->second);
+					parts.emplace_back(it->second.vaddr, it->second.size);
+					MapsErase(it++);
+				}
+				for (auto it = m_parked.lower_bound(view_base); it != m_parked.end() && it->first < view_end;) {
+					parts.emplace_back(it->first, it->second);
+					freed->emplace_back(it->first, it->second);
+					it = m_parked.erase(it);
+				}
+				m_views.erase(view);
+			}
+			g_remap_window_end.store(view_base + view_size, std::memory_order_relaxed);
+			g_remap_window_begin.store(view_base, std::memory_order_release);
+			EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(view_base), view_size));
+			// The view's placeholder cut at the parts (they tile it), then the mapped ones mapped again.
+			std::sort(parts.begin(), parts.end());
+			uint64_t at = view_base;
+			for (size_t i = 0; i < parts.size(); ++i) {
+				EXIT_IF(parts[i].first != at);
+				at += parts[i].second;
+				if (i + 1 < parts.size()) EXIT_IF(!SplitPlaceholder(parts[i].first, parts[i].second));
+			}
+			EXIT_IF(at != view_base + view_size);
+			for (const auto& entry: mapped) {
+				EXIT_IF(!MapExistingPlaceholderFixed(entry.vaddr, entry.size, entry.backing_offset, entry.mode, nullptr,
+				                                     ProtectiveRemap()));
+				NoteRemapped(entry.vaddr, entry.size);
+			}
+			LiveCounters::Add(LiveCounters::ParkedSplits);
+		}
+#else
+		(void)vaddr, (void)size, (void)freed;
 #endif
 	}
 
@@ -722,8 +1029,18 @@ public:
 		auto           lock = MapReadLock();
 		const uint64_t end  = vaddr + size;
 		for (uint64_t at = vaddr; at < end;) {
-			MapEntry entry {};
-			if (!FindContainingUnlocked(at, 1, &entry)) return false;
+			// (Each mapping through this thread's translations, held under the lock: a search of m_maps per mapping, ten
+			// of them for the 4 MiB copies, was 0.9% of the render thread at Latria.)
+			auto&      cached = HostReadTranslationOf(at);
+			const auto epoch  = RegionEpoch(at);
+			MapEntry   entry {};
+			if (cached.epoch == epoch && GuestFreeRangeContains(cached.entry.vaddr, cached.entry.size, at, 1)) {
+				entry = cached.entry;
+			} else if (FindContainingUnlocked(at, 1, &entry)) {
+				cached = {entry, epoch};
+			} else {
+				return false;
+			}
 			const uint64_t piece    = std::min(end, entry.vaddr + entry.size) - at;
 			const uint64_t physical = entry.backing_offset + at - entry.vaddr;
 			if (!CoverageUnique(physical, physical + piece)) return false;
@@ -733,98 +1050,38 @@ public:
 	}
 
 	bool IsUniqueRange(uint64_t vaddr, uint64_t size) {
-		// KYTY_ALIAS_VERIFY: every answer is compared with the full rebuild it replaces.
-		static const bool verify = std::getenv("KYTY_ALIAS_VERIFY") != nullptr;
-		if (!verify) {
-			if (size == 0 || UINT64_MAX - vaddr < size) return false; // (as FindContainingUnlocked)
-			auto lock = MapReadLock();
-			// The mapping over each 4 MiB of address and whether no byte of it is mapped twice (the usual case), kept until
-			// the mappings change (every change moves the epoch under the exclusive lock): any range in such a mapping is
-			// unique. The game asks about ~1000 ranges a frame, most of them new (ring buffers), in a few mappings: two cold
-			// tree lookups each.
-			struct Owner {
-				const GuestBackingStore* store;
-				uint64_t                 epoch;
-				MapEntry                 entry;
-				bool                     unique;
-			};
-			thread_local std::array<Owner, 256> owners {};
-			auto& owner = owners[(vaddr >> 22u) % owners.size()];
-			if (owner.store != this || owner.epoch != m_mapping_epoch ||
-			    !GuestFreeRangeContains(owner.entry.vaddr, owner.entry.size, vaddr, size)) {
-				MapEntry entry {};
-				if (!FindContainingUnlocked(vaddr, size, &entry)) return false;
-				owner = {this, m_mapping_epoch, entry, CoverageUnique(entry.backing_offset, entry.backing_offset + entry.size)};
-			}
-			if (owner.unique) return true;
-			const auto physical = owner.entry.backing_offset + vaddr - owner.entry.vaddr;
-			return CoverageUnique(physical, physical + size);
+		if (size == 0 || UINT64_MAX - vaddr < size) return false; // (as FindContainingUnlocked)
+		auto lock = MapReadLock();
+		// The mapping over each 256 KiB of address and whether no byte of it is mapped twice (the usual case), kept
+		// while its region's mappings (RegionEpoch) and the aliases anywhere (m_alias_epoch) stay the same: any range in
+		// such a mapping is unique. The game asks about ~1000 ranges a frame (and every write fault one), most of them
+		// new (ring buffers), in a few mappings: two cold tree lookups each. (By 4 MiB and one epoch for every mapping
+		// change, the game's ever finer mappings evicted each other and its streaming invalidated them all.)
+		struct Owner {
+			const GuestBackingStore* store;
+			uint64_t                 epoch, alias_epoch;
+			MapEntry                 entry;
+			bool                     unique;
+		};
+		thread_local std::array<Owner, 1024> owners {};
+		auto&      owner = owners[(vaddr >> 18u) % owners.size()];
+		const auto epoch = RegionEpoch(vaddr);
+		if (owner.store != this || owner.epoch != epoch || owner.alias_epoch != m_alias_epoch ||
+		    !GuestFreeRangeContains(owner.entry.vaddr, owner.entry.size, vaddr, size)) {
+			MapEntry entry {};
+			if (!FindContainingUnlocked(vaddr, size, &entry)) return false;
+			owner = {this, epoch, m_alias_epoch, entry, CoverageUnique(entry.backing_offset, entry.backing_offset + entry.size)};
 		}
-		std::lock_guard lock(m_mutex); // the full rebuild writes its intervals
-		const bool unique = IsUniqueRangeUnlocked(vaddr, size);
-		if (unique != IsUniqueRangeRebuilt(vaddr, size)) {
-			EXIT("alias coverage disagrees with the rebuilt intervals: vaddr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 " coverage=%d mappings=%zu segments=%zu\n",
-			     vaddr, size, unique ? 1 : 0, m_maps.size(), m_coverage.size());
-		}
-		return unique;
-	}
-
-private:
-	bool IsUniqueRangeUnlocked(uint64_t vaddr, uint64_t size) const {
-		MapEntry owner {};
-		if (!FindContainingUnlocked(vaddr, size, &owner)) return false;
-		const auto physical = owner.backing_offset + vaddr - owner.vaddr;
+		if (owner.unique) return true;
+		const auto physical = owner.entry.backing_offset + vaddr - owner.entry.vaddr;
 		return CoverageUnique(physical, physical + size);
 	}
 
-	// The previous answer: the alias intervals of every mapping, rebuilt after each change.
-	bool IsUniqueRangeRebuilt(uint64_t vaddr, uint64_t size) {
-		MapEntry owner {};
-		if (!FindContainingUnlocked(vaddr, size, &owner)) return false;
-		if (!m_alias_ranges_valid) {
-			// Diagnostic (live measure: alias_rebuilds, alias_rebuild_us, alias_maps).
-			HoldTimer rebuild_time {LiveCounters::AliasRebuildUs};
-			LiveCounters::Add(LiveCounters::AliasRebuilds);
-			LiveCounters::Add(LiveCounters::AliasMaps, m_maps.size());
-			// Build physical intervals shared by at least two guest mappings.
-			// An alias elsewhere in a large allocation does not affect this range.
-			std::vector<std::pair<uint64_t, int>> endpoints;
-			endpoints.reserve(m_maps.size() * 2);
-			for (const auto& [_, entry] : m_maps) {
-				endpoints.emplace_back(entry.backing_offset, 1);
-				endpoints.emplace_back(entry.backing_offset + entry.size, -1);
-			}
-			std::sort(endpoints.begin(), endpoints.end());
-			m_aliased_physical_ranges.clear();
-			uint64_t previous = 0;
-			int active = 0;
-			for (size_t i = 0; i < endpoints.size();) {
-				const auto position = endpoints[i].first;
-				if (active > 1 && previous < position) {
-					if (!m_aliased_physical_ranges.empty() &&
-					    m_aliased_physical_ranges.back().second == previous)
-						m_aliased_physical_ranges.back().second = position;
-					else m_aliased_physical_ranges.emplace_back(previous, position);
-				}
-				do { active += endpoints[i++].second; }
-				while (i < endpoints.size() && endpoints[i].first == position);
-				previous = position;
-			}
-			EXIT_IF(active != 0);
-			m_alias_ranges_valid = true;
-		}
-		const auto physical = owner.backing_offset + vaddr - owner.vaddr;
-		const auto found = std::lower_bound(m_aliased_physical_ranges.begin(),
-		    m_aliased_physical_ranges.end(), physical,
-		    [](const auto& interval, uint64_t value) { return interval.second <= value; });
-		return found == m_aliased_physical_ranges.end() || physical + size <= found->first;
-	}
-
 private:
-	// One writer at a time: data writers hold m_data_mutex (and m_mutex shared), zeroing and
-	// mapping mutations hold m_mutex exclusively, which excludes the data writers.
-	// A writer announces itself before inspecting the one reader slot. Sequential
+	// One writer at a time of each kind: data writers hold m_data_mutex (and m_mutex shared), CPU-owned
+	// writers m_cpu_write_mutex (bytes no data writer writes: TryWriteCpuBacking), zeroing and
+	// mapping mutations hold m_mutex exclusively, which excludes both.
+	// A writer announces itself before inspecting the reader slots. Sequential
 	// consistency makes it impossible for both entrants to miss the other: either
 	// the reader falls back, or the writer waits for its bounded host copy to end.
 	// No GPU work, guest faults, or other locks occur inside that copy transaction.
@@ -834,9 +1091,11 @@ private:
 		explicit BackingWriteFence(GuestBackingStore& store): m_store(store) {
 			m_store.m_host_write_pending.store(true, std::memory_order_seq_cst);
 			unsigned spins = 0;
-			while (m_store.m_host_read_pages.load(std::memory_order_seq_cst) != 0) {
-				_mm_pause();
-				if (++spins == 256) { std::this_thread::yield(); spins = 0; }
+			for (const auto& slot: m_store.m_host_read_slots) {
+				while (slot.pages.load(std::memory_order_seq_cst) != 0) {
+					_mm_pause();
+					if (++spins == 256) { std::this_thread::yield(); spins = 0; }
+				}
 			}
 		}
 		~BackingWriteFence() {
@@ -866,40 +1125,50 @@ private:
 	class DataWriteFence {
 	public:
 		KYTY_CLASS_NO_COPY(DataWriteFence);
-		DataWriteFence(GuestBackingStore& store, uint64_t begin, uint64_t end): m_store(store) {
+		// `published`: m_data_write_pages, or m_cpu_write_pages for a CPU-owned write (TryWriteCpuBacking).
+		DataWriteFence(GuestBackingStore& store, uint64_t begin, uint64_t end, std::atomic<uint64_t>& published)
+		    : m_published(published) {
 			const auto pages = PackPages(begin, end);
-			m_store.m_data_write_pages.store(pages, std::memory_order_seq_cst);
+			m_published.store(pages, std::memory_order_seq_cst);
 			unsigned spins = 0;
-			while (PagesOverlap(m_store.m_host_read_pages.load(std::memory_order_seq_cst), pages)) {
-				_mm_pause();
-				if (++spins == 256) { std::this_thread::yield(); spins = 0; }
+			for (const auto& slot: store.m_host_read_slots) {
+				while (PagesOverlap(slot.pages.load(std::memory_order_seq_cst), pages)) {
+					_mm_pause();
+					if (++spins == 256) { std::this_thread::yield(); spins = 0; }
+				}
 			}
 		}
-		~DataWriteFence() { m_store.m_data_write_pages.store(0, std::memory_order_release); }
+		~DataWriteFence() { m_published.store(0, std::memory_order_release); }
 	private:
-		GuestBackingStore& m_store;
+		std::atomic<uint64_t>& m_published;
 	};
 
 	class BackingReadTransaction {
 	public:
 		KYTY_CLASS_NO_COPY(BackingReadTransaction);
 		explicit BackingReadTransaction(GuestBackingStore& store): m_store(store) {
-			// One reader at a time; it holds every page until Narrow names the ones it copies.
-			uint64_t idle = 0;
-			if (m_store.m_host_write_pending.load(std::memory_order_relaxed) ||
-			    !m_store.m_host_read_pages.compare_exchange_strong(idle, AllPages, std::memory_order_seq_cst))
-				return;
-			m_acquired = true;
-			if (m_store.m_host_write_pending.load(std::memory_order_seq_cst)) Release();
+			// A reader per slot (this thread's first, then the next free one); it holds every page until Narrow
+			// names the ones it copies.
+			if (m_store.m_host_write_pending.load(std::memory_order_relaxed)) return;
+			thread_local const size_t first = std::hash<std::thread::id> {}(std::this_thread::get_id());
+			for (size_t i = 0; i < HostReadSlots && m_slot == nullptr; ++i) {
+				auto&    slot = m_store.m_host_read_slots[(first + i) % HostReadSlots].pages;
+				uint64_t idle = 0;
+				if (slot.load(std::memory_order_relaxed) == 0 &&
+				    slot.compare_exchange_strong(idle, AllPages, std::memory_order_seq_cst))
+					m_slot = &slot;
+			}
+			if (m_slot != nullptr && m_store.m_host_write_pending.load(std::memory_order_seq_cst)) Release();
 		}
 		~BackingReadTransaction() { Release(); }
-		bool Acquired() const { return m_acquired; }
-		// The read copies backing bytes [begin, end): false (and released) while a data write
+		bool Acquired() const { return m_slot != nullptr; }
+		// The read copies backing bytes [begin, end): false (and released) while a data or CPU-owned write
 		// into overlapping pages is under way.
 		bool Narrow(uint64_t begin, uint64_t end) {
 			const auto pages = PackPages(begin, end);
-			m_store.m_host_read_pages.store(pages, std::memory_order_seq_cst);
-			if (PagesOverlap(m_store.m_data_write_pages.load(std::memory_order_seq_cst), pages)) {
+			m_slot->store(pages, std::memory_order_seq_cst);
+			if (PagesOverlap(m_store.m_data_write_pages.load(std::memory_order_seq_cst), pages) ||
+			    PagesOverlap(m_store.m_cpu_write_pages.load(std::memory_order_seq_cst), pages)) {
 				Release();
 				return false;
 			}
@@ -907,13 +1176,13 @@ private:
 		}
 	private:
 		void Release() {
-			if (m_acquired) {
-				m_store.m_host_read_pages.store(0, std::memory_order_release);
-				m_acquired = false;
+			if (m_slot != nullptr) {
+				m_slot->store(0, std::memory_order_release);
+				m_slot = nullptr;
 			}
 		}
-		GuestBackingStore& m_store;
-		bool m_acquired = false;
+		GuestBackingStore&     m_store;
+		std::atomic<uint64_t>* m_slot = nullptr;
 	};
 
 	template <bool Write, typename Transfer>
@@ -923,19 +1192,42 @@ private:
 		}
 
 		auto lock      = MapReadLock();
-		auto data_lock = DataLock();
+		auto data_lock = DataLock(Write);
+		// (A reader excludes the CPU-owned writers too; a data writer's bytes are never theirs.)
+		std::unique_lock cpu_lock(m_cpu_write_mutex, std::defer_lock);
+		if constexpr (!Write) cpu_lock.lock();
 		if constexpr (Write) {
 			HoldTimer hold {LiveCounters::BackingHoldWriteUs};
-			// The shared map lock keeps the mapping, so its backing bytes, fixed. A range
-			// that spans mappings keeps the fence that excludes every reader.
+			// The shared map lock keeps the mapping, so its backing bytes, fixed.
 			MapEntry entry {};
 			if (FindContainingUnlocked(vaddr, size, &entry)) {
 				const auto      begin = entry.backing_offset + vaddr - entry.vaddr;
-				DataWriteFence fence(*this, begin, begin + size);
+				DataWriteFence fence(*this, begin, begin + size, m_data_write_pages);
 				return TransferBackingUnlocked(vaddr, size, transfer);
 			}
-			BackingWriteFence fence(*this);
-			return TransferBackingUnlocked(vaddr, size, transfer);
+			// A range over several mappings (validated whole first: all or nothing) is written a mapping's piece at a
+			// time, each under the fence of its own pages. The fence that excludes every reader made each lock-free
+			// read of other bytes (the render thread's table copies) fall back to the data mutex and wait there for the
+			// whole copy (~160 us). A reader that spans mappings takes that mutex anyway, so it still sees all or none.
+			LiveCounters::Add(LiveCounters::BackingSpanWrites);
+			const auto end = vaddr + size;
+			for (auto current = vaddr; current < end;) {
+				MapEntry piece {};
+				if (!FindContainingUnlocked(current, 1, &piece) ||
+				    !RangeOk(piece.backing_offset + current - piece.vaddr, std::min(end, piece.vaddr + piece.size) - current))
+					return false;
+				current = std::min(end, piece.vaddr + piece.size);
+			}
+			for (auto current = vaddr; current < end;) {
+				MapEntry piece {};
+				EXIT_IF(!FindContainingUnlocked(current, 1, &piece));
+				const auto     bytes = std::min(end, piece.vaddr + piece.size) - current;
+				const auto     begin = piece.backing_offset + current - piece.vaddr;
+				DataWriteFence fence(*this, begin, begin + bytes, m_data_write_pages);
+				transfer(m_backing_base + begin, current - vaddr, static_cast<size_t>(bytes));
+				current += bytes;
+			}
+			return true;
 		} else {
 			return TransferBackingUnlocked(vaddr, size, transfer);
 		}
@@ -1001,7 +1293,9 @@ private:
 		auto last  = CoverageSplit(end);
 		for (auto it = first; it != last; ++it) {
 			EXIT_IF(delta < 0 && it->second == 0);
-			it->second = static_cast<uint32_t>(static_cast<int>(it->second) + delta);
+			const bool aliased = it->second > 1;
+			it->second         = static_cast<uint32_t>(static_cast<int>(it->second) + delta);
+			if ((it->second > 1) != aliased) ++m_alias_epoch; // (a byte gained or lost its second mapping)
 		}
 		// Merge keys that no longer start a different count.
 		for (auto it: {first, last}) {
@@ -1011,15 +1305,41 @@ private:
 		}
 	}
 
-	// Every m_maps change goes through these two (they keep m_coverage in step).
+	// Every m_maps change goes through these two (they keep m_coverage and the region epochs in step).
 	bool MapsEmplace(const MapEntry& entry) {
 		if (!m_maps.emplace(entry.vaddr, entry).second) return false;
 		AddCoverage(entry.backing_offset, entry.backing_offset + entry.size, 1);
+		TouchRegions(entry.vaddr, entry.size);
 		return true;
 	}
 	void MapsErase(std::map<uint64_t, MapEntry>::iterator entry) {
 		AddCoverage(entry->second.backing_offset, entry->second.backing_offset + entry->second.size, -1);
+		TouchRegions(entry->second.vaddr, entry->second.size);
 		m_maps.erase(entry);
+	}
+
+	// The mappings' change count of each 64 MiB of guest address (MapsEmplace and MapsErase move the ones a mapping
+	// spans; under the mapping mutation, which readers' transactions exclude), each region's counts its own (its index in
+	// the high bits): a translation cached for an address holds while its region's count is the same, whatever was mapped
+	// or unmapped elsewhere. (With one count for all mappings, the game's streaming invalidated every cached translation
+	// several times a frame.) Past the regions' 2 TiB, the global epoch.
+	static constexpr uint64_t RegionEpochBits = 26;
+	static constexpr uint64_t RegionEpochCount = uint64_t {1} << (41u - RegionEpochBits);
+	std::unique_ptr<std::atomic<uint64_t>[]> m_region_epochs = [] {
+		auto epochs = std::make_unique<std::atomic<uint64_t>[]>(RegionEpochCount);
+		for (uint64_t region = 0; region < RegionEpochCount; ++region)
+			epochs[region].store((region + 1) << 32u, std::memory_order_relaxed);
+		return epochs;
+	}();
+	void TouchRegions(uint64_t vaddr, uint64_t size) {
+		if (size == 0) return;
+		for (uint64_t region = vaddr >> RegionEpochBits, last = (vaddr + size - 1) >> RegionEpochBits;
+		     region <= last && region < RegionEpochCount; ++region)
+			m_region_epochs[region].fetch_add(1, std::memory_order_relaxed);
+	}
+	[[nodiscard]] uint64_t RegionEpoch(uint64_t vaddr) const {
+		const auto region = vaddr >> RegionEpochBits;
+		return region < RegionEpochCount ? m_region_epochs[region].load(std::memory_order_relaxed) : m_mapping_epoch;
 	}
 
 	// True when no physical byte of [begin, end) is mapped by more than one guest mapping.
@@ -1035,12 +1355,26 @@ private:
 	}
 
 	void InvalidateMappingLookup() {
-		m_alias_ranges_valid = false;
-		if (++m_mapping_epoch == 0) {
-			m_mapping_epoch = 1;
-			// In place: assigning {} builds a 40 KiB array on the stack (every caller's frame, called or not).
-			m_host_read_translations.fill({});
+		if (++m_mapping_epoch == 0) m_mapping_epoch = 1;
+	}
+
+	struct HostReadTranslation { MapEntry entry; uint64_t epoch = 0; };
+	// The host read translation of `vaddr`'s 256 KiB granule, this thread's (readers of different slots fill them at
+	// once): 4096 cover 1 GiB without two granules sharing one. An entry holds while its epoch is its region's
+	// (RegionEpoch, read under a read slot). (By 4 MiB granule, the mappings of the game's heaps - 43 to 208 of 192-512
+	// KiB in each of its 120 MiB heaps, more as its direct memory gets cut finer - evicted each other, and their reads
+	// searched m_maps.)
+	HostReadTranslation& HostReadTranslationOf(uint64_t vaddr) {
+		struct Translations {
+			const GuestBackingStore*               store = nullptr;
+			std::array<HostReadTranslation, 4096> entries {};
+		};
+		thread_local Translations translations;
+		if (translations.store != this) {
+			translations.store = this;
+			translations.entries.fill({});
 		}
+		return translations.entries[(vaddr >> 18) % translations.entries.size()];
 	}
 
 	bool FindContainingUnlocked(uint64_t vaddr, uint64_t size, MapEntry* out) const {
@@ -1084,7 +1418,7 @@ private:
 			case VirtualMemory::Mode::ExecuteWrite:
 			case VirtualMemory::Mode::ExecuteReadWrite: return PAGE_EXECUTE_READWRITE;
 			case VirtualMemory::Mode::NoAccess:
-			default: return PAGE_NOACCESS;
+			default: return kyty_local_read_guard.load(std::memory_order_relaxed) != 0 ? PAGE_GUARD | PAGE_READONLY : PAGE_NOACCESS;
 		}
 	}
 
@@ -1140,13 +1474,17 @@ private:
 			return nullptr;
 		}
 
-		// MapViewOfFile3 already installed map_protect. Only NoAccess used a
-		// temporary readable mapping and still needs a protection transition.
+		// (Mapped with its protection, but for no access, which a view is not mapped with. A protection change of the whole
+		// view right after it is mapped is part of the stand-alone reproducer of bug check 0x1A/0x41202 (issues #5, #50: a
+		// view mapped again while protections change and pages are paged), and changed nothing.)
 		if (mode == VirtualMemory::Mode::NoAccess && !ApplyProtection(ptr, size, mode)) {
 			UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);
 			SetFailure(failure_reason, FailureReason::ProtectFailed);
 			return nullptr;
 		}
+		// (A view mapped again comes back without the trackers' protection until it is applied: a write meanwhile goes
+		// unseen, so its write-watched never-written granules count as written.)
+		FreshMemory::MarkArmedBacking(GetBackingBase() + backing_offset, size);
 		return ptr;
 	}
 
@@ -1181,6 +1519,7 @@ private:
 			SetFailure(failure_reason, FailureReason::FixedMapViewFailed);
 			return nullptr;
 		}
+		VirtualMemory::WriteWatchMapped(vaddr, size, mode);
 		return ptr;
 	}
 
@@ -1188,19 +1527,64 @@ private:
 	// process-lifetime guest reservation.
 	static bool UnmapViewPreservePlaceholder(void* vaddr, uint64_t size) {
 		void* ptr = mmap(vaddr, size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+		VirtualMemory::WriteWatchUnmapped(reinterpret_cast<uint64_t>(vaddr), size);
 		return ptr != MAP_FAILED && ptr == vaddr;
 	}
 
-	int m_fd = -1;
+	int            m_fd    = -1;
+	uint8_t*       m_spare = nullptr; // (SparePointer)
+	std::once_flag m_spare_once;
 #endif
 
 	uint8_t*                     m_backing_base = nullptr;
 	uint64_t                     m_size         = 0;
 	std::shared_mutex            m_mutex;
 	std::mutex                   m_data_mutex;
-	std::vector<std::pair<uint64_t, uint64_t>> m_aliased_physical_ranges;
-	bool m_alias_ranges_valid = false;
+	std::mutex                   m_cpu_write_mutex; // (TryWriteCpuBacking)
 	std::map<uint64_t, MapEntry> m_maps;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// The file views of the guest mappings (base -> size): each view's mapped parts (m_maps) and parked ranges (m_parked)
+	// tile it. A view is one mapping until a partial unmap parks a range in it.
+	std::map<uint64_t, uint64_t> m_views;
+	// Ranges the guest unmapped from views still mapped (base -> size, each inside one view). A view cannot be
+	// split: unmapping it whole and mapping its other parts again cost ~0.05 ms per MiB of the view (1.3 s in 3 minutes
+	// of play, up to 29 ms a call, on the game's job threads, all its memory calls waiting), while the game mapped
+	// something over under 1% of such ranges within a second (96%: after 10 s or never). Their views are split for real
+	// when something is mapped over one (Materialize), or unmapped whole once nothing of them stays mapped.
+	std::map<uint64_t, uint64_t> m_parked;
+
+	std::map<uint64_t, uint64_t>::iterator FindViewUnlocked(uint64_t vaddr) {
+		const auto next = m_views.upper_bound(vaddr);
+		if (next == m_views.begin()) return m_views.end();
+		const auto view = std::prev(next);
+		return vaddr < view->first + view->second ? view : m_views.end();
+	}
+
+	// The first parked range that overlaps [vaddr, vaddr + size), or end.
+	std::map<uint64_t, uint64_t>::iterator FirstParkedUnlocked(uint64_t vaddr, uint64_t size) {
+		auto it = m_parked.upper_bound(vaddr);
+		if (it != m_parked.begin() && std::prev(it)->first + std::prev(it)->second > vaddr) --it;
+		return it != m_parked.end() && it->first < vaddr + size ? it : m_parked.end();
+	}
+
+	// [vaddr, vaddr + size) parked, joined to the parked ranges next to it in the same view [view_begin, view_end).
+	void ParkUnlocked(uint64_t vaddr, uint64_t size, uint64_t view_begin, uint64_t view_end) {
+		uint64_t begin = vaddr, end = vaddr + size;
+		auto     next = m_parked.lower_bound(vaddr);
+		if (next != m_parked.begin()) {
+			const auto previous = std::prev(next);
+			if (previous->first >= view_begin && previous->first + previous->second == begin) {
+				begin = previous->first;
+				m_parked.erase(previous);
+			}
+		}
+		if (next != m_parked.end() && next->first == end && next->first + next->second <= view_end) {
+			end = next->first + next->second;
+			m_parked.erase(next);
+		}
+		EXIT_IF(!m_parked.emplace(begin, end - begin).second);
+	}
+#endif
 	// Physical coverage of m_maps: [key, next key) is mapped by `value` guest mappings (the
 	// last key closes the covered space with 0). Changed with m_maps (MapsEmplace/MapsErase),
 	// so IsUniqueRange looks only at the requested range instead of rebuilding the alias
@@ -1210,14 +1594,29 @@ private:
 	alignas(64) std::atomic_bool m_host_write_pending {false};
 	// The pages of the data write in progress (DataWriteFence), 0 when none.
 	alignas(64) std::atomic<uint64_t> m_data_write_pages {0};
-	// The pages the one active host read copies (all until it knows), 0 when none.
-	alignas(64) std::atomic<uint64_t> m_host_read_pages {0};
-	struct HostReadTranslation { MapEntry entry; uint64_t epoch = 0; };
-	// By 4 MiB granule: 1024 slots cover 4 GiB without two granules sharing one (with 64, granules 256 MiB apart
-	// evicted each other and their reads searched m_maps).
-	std::array<HostReadTranslation, 1024> m_host_read_translations {};
+	// ... of the CPU-owned write in progress (TryWriteCpuBacking).
+	alignas(64) std::atomic<uint64_t> m_cpu_write_pages {0};
+	// The pages each active host read copies (all until it knows), 0 when none: a reader per slot. With one slot,
+	// a read that met another (an upload worker's BackingPointer, hundreds a frame) took the data mutex instead and
+	// waited there behind the copies of the writers (the render thread's per-draw reads: ~2.6 waits, ~0.23 ms a frame).
+	struct alignas(64) HostReadSlot {
+		std::atomic<uint64_t> pages {0};
+	};
+	static constexpr size_t                    HostReadSlots = 8;
+	std::array<HostReadSlot, HostReadSlots> m_host_read_slots {};
 	uint64_t m_mapping_epoch = 1;
+	// Moves when some physical byte gains or loses its second guest mapping (AddCoverage): uniqueness proven before holds
+	// while it stays (and the mapping's region epoch, RegionEpoch).
+	uint64_t m_alias_epoch = 1;
 };
+
+// The address range ReserveGuestRegions holds free for frame generation's device creation (ReleaseFrameGenAddressHole).
+static constexpr uint64_t FrameGenHoleSize = uint64_t {64} << 30u;
+static void*              g_frame_gen_hole = nullptr;
+
+class GuestAddressSpace;
+// (The address space while it lives: Kyty.Trim's trims go through it, TrimParkedRange.)
+static std::atomic<GuestAddressSpace*> g_trim_space {nullptr};
 
 class GuestAddressSpace {
 	// m_mutex held exclusively, counted with its time (address_space_holds, address_space_hold_kt): every protection
@@ -1246,6 +1645,7 @@ public:
 #endif
 		ReserveGuestRegions();
 		m_backing = new GuestBackingStore(backing_size);
+		g_trim_space.store(this, std::memory_order_release);
 		if (!m_backing->IsAvailable()) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			EXIT("could not reserve %" PRIu64 " MB for guest direct memory. Windows commits\n"
@@ -1259,6 +1659,7 @@ public:
 	}
 
 	~GuestAddressSpace() {
+		g_trim_space.store(nullptr, std::memory_order_release);
 		delete m_backing;
 		m_backing = nullptr;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -1333,6 +1734,9 @@ public:
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 		return m_backing->TryWriteBacking(vaddr, data, size);
 	}
+	bool TryWriteCpuBacking(uint64_t vaddr, const void* data, uint64_t size) {
+		return m_backing->TryWriteCpuBacking(vaddr, data, size);
+	}
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
@@ -1342,6 +1746,11 @@ public:
 	}
 
 	const uint8_t* BackingPointer(uint64_t vaddr, uint64_t size) { return m_backing->BackingPointer(vaddr, size); }
+	uint64_t       BackingMappingEnd(uint64_t vaddr) { return m_backing->MappingEndOf(vaddr); }
+	uint8_t* SpareBackingPointer(uint64_t address) { return m_backing->SparePointer(address); }
+	bool           DiscardBacking(uint64_t address, uint64_t size) {
+		return m_backing->DiscardPages(address, size);
+	}
 	bool BackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) {
 		return m_backing->BackingPieces(vaddr, size, pieces);
 	}
@@ -1391,7 +1800,7 @@ public:
 			const auto end   = std::min(run.address + run.size, vaddr + size);
 			if (begin >= end) continue;
 			if (at < begin && !ProtectMappedUnlocked(at, begin - at, mode)) return false;
-			if (!ProtectMappedUnlocked(begin, end - begin, run.mode)) return false;
+			if (!ProtectMappedUnlocked(begin, end - begin, run.mode, true)) return false;
 			at = end;
 		}
 		return at >= vaddr + size || ProtectMappedUnlocked(at, vaddr + size - at, mode);
@@ -1419,18 +1828,204 @@ public:
 			if (LiveCensus::g_render) LiveCounters::Add(LiveCounters::AddressSpaceWaitKtRender, waited);
 		}
 		WaitNotBusy(lock, vaddr, size);
-		return ProtectMappedUnlocked(vaddr, size, mode);
+		return ProtectMappedUnlocked(vaddr, size, mode, true);
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// KYTY_READ_GUARD_RACES=1 (diagnostics): a guard fault whose page another thread read before it is guarded again
+	// (read_guard_races). The faulting read left the page out of the working set; in it now, another thread's read
+	// brought it in, and read the bytes the fault is about to replace (pressure mode at the Tower of Latria's start: ~1 a
+	// frame of ~100 guard faults; the hot pages' no access, 0.0).
+	static void CountReadGuardRace(uint64_t page) {
+		static const bool on = [] {
+			const char* value = std::getenv("KYTY_READ_GUARD_RACES");
+			return value != nullptr && *value == '1';
+		}();
+		if (!on) return;
+		PSAPI_WORKING_SET_EX_INFORMATION entry {};
+		entry.VirtualAddress = reinterpret_cast<void*>(page);
+		if (K32QueryWorkingSetEx(GetCurrentProcess(), &entry, sizeof(entry)) != 0 && entry.VirtualAttributes.Valid != 0)
+			LiveCounters::Add(LiveCounters::ReadGuardRaces);
+	}
+
+	// KYTY_READ_GUARD: the 4 KiB page of `vaddr` guarded again after its guard raised a fault, when it is a guest view's
+	// (true). At once, without the lock: Windows took the guard off as it raised the fault, and until it is back any other
+	// thread reads the page without a fault - a GPU-written page's stale bytes, a texture-offloaded page's zeros. The
+	// waits for maps and unmaps in flight anywhere (WaitNotBusy with KYTY_PROTECT_SERIAL) left it open for whole system
+	// calls while the game streamed (issues #157, #158). A guest view is a mapped view of the backing section
+	// (MEM_MAPPED); guards in the guest's private memory are its stacks' (GuestStackOverflow). A guard armed over a change
+	// another thread made meanwhile is settled once the fault is served (SettleReadGuard); a view mapped or unmapped
+	// meanwhile takes the locked path below.
+	bool ArmReadGuard(uint64_t vaddr) {
+		constexpr uint64_t       Page = 0x1000;
+		const uint64_t           page = vaddr & ~(Page - 1);
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(page), &info, sizeof(info)) != sizeof(info) ||
+		    info.Type != MEM_MAPPED || info.State != MEM_COMMIT)
+			return false;
+		CountReadGuardRace(page);
+		if (DWORD old = 0; VirtualProtect(reinterpret_cast<void*>(page), Page, PAGE_GUARD | PAGE_READONLY, &old) != 0)
+			return true;
+		std::shared_lock lock(m_mutex);
+		WaitNotBusy(lock, page, Page);
+		auto it = m_mapped.upper_bound(page);
+		if (it == m_mapped.begin()) return false;
+		--it;
+		const auto& region = it->second;
+		if (region.type != MappingType::Backing || page + Page > region.vaddr + region.size) return false;
+		DWORD old = 0;
+		return VirtualProtect(reinterpret_cast<void*>(page), Page, PAGE_GUARD | PAGE_READONLY, &old) != 0;
+	}
+
+	// KYTY_READ_GUARD with KYTY_HOT_READS: a guest page the game read back (a read fault the GPU trackers served) keeps no
+	// access instead of a guard while it is read back every few seconds, its page of the backing view locked in RAM. A
+	// guard is one-shot, and the game's job threads read the same GPU results at once: the others read the page stale
+	// before its guard was back (1 in ~90 guard faults at the Tower of Latria, whose lights went out: issues #158, #159).
+	// No access keeps every reader out, and its blue screen (0x1A/0x41202, issues #5, #50) needs a no-access page whose
+	// memory Windows took out of RAM, which a locked page never is. The pages read back are few (~1,100 a second at
+	// Latria): the rest of the watched memory keeps its guards. Not while the PC is short of memory (HotReadsPressure):
+	// the lock holds the page of the backing view, not the guest view's page tables, and a 16 GB PC with 0.9 GB left
+	// blue-screened (0x1A) with these pages the only ones of the views without access (issue #91).
+	void NoteRead(uint64_t vaddr) {
+		if (m_hot_pressure.load(std::memory_order_relaxed)) return;
+		constexpr uint64_t Page    = 0x1000;
+		const uint64_t     page    = vaddr & ~(Page - 1);
+		auto*              backing = const_cast<uint8_t*>(m_backing->BackingPointer(page, Page));
+		// (Not in the texture offload's ranges: it gives their backing pages no access and discards them, and Windows
+		// unlocks a locked page given no access. DropHotBacking.)
+		if (backing == nullptr || TextureOffload::MayOverlap(page, Page) ||
+		    TextureOffload::MayOverlapBacking(reinterpret_cast<uint64_t>(backing), Page))
+			return;
+		const uint64_t  now = GetTickCount64();
+		std::lock_guard lock(m_hot_mutex);
+		auto            it = m_hot.find(page);
+		if (it != m_hot.end() && it->second.backing == backing) {
+			it->second.noted = now;
+			return;
+		}
+		if (it == m_hot.end() && m_hot.size() >= HotReadsMax) {
+			LiveCounters::Add(LiveCounters::ReadHotFull);
+			return;
+		}
+		if (!LockHotBacking(backing)) return;
+		LiveCounters::Add(LiveCounters::ReadHotLocks);
+		if (it != m_hot.end()) {
+			// (Mapped again over other memory since.)
+			UnlockHotBacking(it->second.backing);
+			it->second = {backing, now};
+			return;
+		}
+		m_hot.emplace(page, HotRead {backing, now});
+	}
+
+	// Whether the PC is short of memory for no-access pages (NoteRead): less than KYTY_HOT_READS_MIN_AVAIL_MB (default
+	// 1536; 0: never) of RAM left, until 512 MiB more is. The blue screens came with less than 1.5 GB left (issues #5,
+	// #47, #50, #91; the laptop's and this desktop's under a memory hog), when Windows takes pages and page tables out of
+	// RAM. Each guard is a gap other threads read stale bytes in: at the Tower of Latria's start ~1 a frame with guards
+	// everywhere, none with these pages' no access (KYTY_READ_GUARD_RACES=1); and 16 GB PCs spend whole sessions around
+	// 2 GB left (issue #159: 2.0-2.5 GB the median), so from 2 GB, leaving at 3, they flickered as before the hot pages.
+	bool HotReadsPressure() {
+		static const uint64_t minimum = [] {
+			const char* value = std::getenv("KYTY_HOT_READS_MIN_AVAIL_MB");
+			return (value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {1536}) << 20u;
+		}();
+		bool pressure = m_hot_pressure.load(std::memory_order_relaxed);
+		if (minimum == 0) return pressure;
+		const uint64_t available = LocalPlatform::AvailablePhysicalMemory();
+		if (available == 0) return pressure;
+		const bool next = pressure ? available < minimum + (uint64_t {512} << 20u) : available < minimum;
+		if (next != pressure) {
+			m_hot_pressure.store(next, std::memory_order_relaxed);
+			static std::atomic<uint32_t> reports {0};
+			if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+				std::printf("Memory: %llu MiB left on the PC: the pages read back %s\n",
+				            static_cast<unsigned long long>(available >> 20u),
+				            next ? "get guards like the rest until there is more (KYTY_HOT_READS_MIN_AVAIL_MB)"
+				                 : "keep no access again");
+		}
+		return next;
+	}
+
+	// The pages not read back for a while (HotReadsKeepMs) go back to guards, their backing pages unlocked: twice a
+	// second, under the lock held exclusively (no protection of the trackers changes meanwhile) when it is free at once.
+	// While the PC is short of memory, all of them, every flip until none is left. The render thread's
+	// (GpuResourceManager::RunCollectors).
+	void CoolHotReads() {
+		constexpr uint64_t Page = 0x1000;
+		const uint64_t     now  = GetTickCount64();
+		if (now - m_hot_cooled < 500 && !m_hot_draining) return;
+		m_hot_cooled        = now;
+		const bool pressure = kyty_local_read_guard.load(std::memory_order_relaxed) != 0 &&
+		                      kyty_local_hot_reads.load(std::memory_order_relaxed) != 0 && HotReadsPressure();
+		{
+			std::lock_guard hot_lock(m_hot_mutex);
+			m_hot_draining = pressure && !m_hot.empty();
+			if (!m_hot_draining && std::none_of(m_hot.begin(), m_hot.end(), [&](const auto& hot) {
+				    return now - hot.second.noted >= HotReadsKeepMs;
+			    }))
+				return;
+		}
+		std::unique_lock lock(m_mutex, std::try_to_lock);
+		if (!lock.owns_lock()) return;
+		std::lock_guard hot_lock(m_hot_mutex);
+		uint64_t        cooled = 0;
+		for (auto it = m_hot.begin(); it != m_hot.end() && cooled < (pressure ? 2048u : 512u);) {
+			const auto page = it->first;
+			if ((!pressure && now - it->second.noted < HotReadsKeepMs) || BusyUnlocked(page, Page)) {
+				++it;
+				continue;
+			}
+			// (In guard mode only these pages of the views have no access: ProtectView.)
+			MEMORY_BASIC_INFORMATION info {};
+			if (kyty_local_read_guard.load(std::memory_order_relaxed) != 0 &&
+			    VirtualQuery(reinterpret_cast<const void*>(page), &info, sizeof(info)) == sizeof(info) &&
+			    info.Type == MEM_MAPPED && info.State == MEM_COMMIT && info.Protect == PAGE_NOACCESS) {
+				DWORD old = 0;
+				(void)VirtualProtect(reinterpret_cast<void*>(page), Page, PAGE_GUARD | PAGE_READONLY, &old);
+			}
+			UnlockHotBacking(it->second.backing);
+			it = m_hot.erase(it);
+			++cooled;
+		}
+		m_hot_draining = pressure && !m_hot.empty();
+		LiveCounters::Add(LiveCounters::ReadHotCools, cooled);
+	}
+
+	// The texture offload is about to give [backing, backing + size) of the backing view no access, or discard it: the
+	// pages read back there are no longer locked (Windows unlocks a locked page given no access; a discard would keep a
+	// locked one in RAM), so they leave the set. Their guest pages have guards by then: the offload counts its range
+	// (TextureOffload::MayOverlap) before its watchers protect the guest view, and ProtectView gives such pages guards.
+	// (Bios2000's point in PR #164.)
+	void DropHotBacking(uint64_t backing, uint64_t size) {
+		constexpr uint64_t Page  = 0x1000;
+		const auto         begin = reinterpret_cast<uint8_t*>(backing & ~(Page - 1));
+		const auto         end   = reinterpret_cast<uint8_t*>(backing + size);
+		std::lock_guard    lock(m_hot_mutex);
+		if (m_hot_locks.empty() || m_hot_locks.lower_bound(begin) == m_hot_locks.lower_bound(end)) return;
+		for (auto it = m_hot.begin(); it != m_hot.end();) {
+			if (it->second.backing >= begin && it->second.backing < end) {
+				UnlockHotBacking(it->second.backing);
+				it = m_hot.erase(it);
+			} else {
+				++it;
+			}
+		}
+	}
+#endif
 
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                VirtualMemory::Mode               mode,
 	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
 		LiveTrace::SlowOsCallScope slow(LiveTrace::OsMapBacking, vaddr, size);
+		// (Offloaded ranges of the memory mapped given back first: the new view would not fault.)
+		TextureOffload::OnBackingMapped(GetBackingBase() + backing_offset, size);
+		MaterializeParked(vaddr, size);
+		FreeSplit split;
 		{
 			ExclusiveLock lock(m_mutex);
 			// (Guest maps and unmaps run one at a time: another one over the range is only waited for here.)
 			m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(vaddr, size); });
-			if (!ConsumeUnlocked(vaddr, size)) {
+			if (!ConsumeDeferredUnlocked(vaddr, size, &split)) {
 				if (failure_reason != nullptr) {
 					*failure_reason = GuestBackingStore::FailureReason::AddressRangeUnavailable;
 				}
@@ -1439,16 +2034,18 @@ public:
 			m_busy.emplace_back(vaddr, vaddr + size);
 		}
 		// The system calls without the lock (BusyUnlocked): the trackers' protections of other ranges go on.
-		const auto host_mode = VirtualMemory::IsExecute(mode)
-		                           ? VirtualMemory::Mode::ExecuteReadWrite
-		                           : VirtualMemory::Mode::ReadWrite;
-		const bool mapped = m_backing->MapExistingPlaceholderFixed(vaddr, size, backing_offset, host_mode, failure_reason);
+		const bool split_done = SplitPlaceholders(split, vaddr, size);
+		const auto host_mode  = VirtualMemory::IsExecute(mode)
+		                            ? VirtualMemory::Mode::ExecuteReadWrite
+		                            : VirtualMemory::Mode::ReadWrite;
+		const bool mapped =
+		    split_done && m_backing->MapExistingPlaceholderFixed(vaddr, size, backing_offset, host_mode, failure_reason);
 		{
 			ExclusiveLock lock(m_mutex);
 			if (mapped) {
 				EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Backing));
 			} else {
-				AddFreeUnlocked(vaddr, size);
+				RestoreSplitUnlocked(split, vaddr, size);
 			}
 			EraseBusyUnlocked(vaddr, vaddr + size);
 		}
@@ -1487,18 +2084,22 @@ public:
 				}
 			}
 			if (contained) {
-				bool       placeholder_preserved = false;
-				const bool done = m_backing->Unmap(vaddr, size, &placeholder_preserved) && placeholder_preserved;
+				bool                                       placeholder_preserved = false;
+				std::vector<std::pair<uint64_t, uint64_t>> freed, spans;
+				const bool done = m_backing->Unmap(vaddr, size, &placeholder_preserved, &freed) && placeholder_preserved;
 				{
 					ExclusiveLock lock(m_mutex);
 					if (done) {
 						EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Backing));
-						AddFreeUnlocked(vaddr, size);
+						spans    = AddFreedUnlocked(freed);
 						unmapped = true;
 					}
 					EraseBusyUnlocked(busy_begin, busy_end);
 				}
 				m_busy_done.notify_all();
+				// (The free placeholders around them made one without the lock: guest maps and unmaps, the only users of
+				// the free list, run one at a time.)
+				CoalesceSpans(spans);
 			}
 		}
 		if (g_remapped_count != 0) {
@@ -1546,22 +2147,23 @@ public:
 			return false;
 		}
 		std::shared_lock lock(m_mutex);
-		return FindContaining(vaddr, size) != m_free.end();
+		return FreeOrParkedUnlocked(vaddr, size);
 	}
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	bool TestContainsFree(uint64_t vaddr, uint64_t size) {
 		ExclusiveLock lock(m_mutex);
-		return FindContaining(vaddr, size) != m_free.end();
+		return FreeOrParkedUnlocked(vaddr, size);
 	}
 #endif
 
 	bool ReleaseFree(uint64_t vaddr, uint64_t size) {
 		std::shared_lock lock(m_mutex);
-		return FindContaining(vaddr, size) != m_free.end();
+		return FreeOrParkedUnlocked(vaddr, size);
 	}
 
 	bool Commit(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+		MaterializeParked(vaddr, size);
 		ExclusiveLock lock(m_mutex);
 		if (!ConsumeUnlocked(vaddr, size)) {
 			return false;
@@ -1690,8 +2292,7 @@ private:
 	// pages (2 MiB of addresses each, and the next one where it ends on one's start) as a whole. Windows' memory manager
 	// bug-checked (0x1A/0x41202, issues #5 and #50, 16 GB PCs) in a protection change of a host thread from the first page
 	// of a 2 MiB-aligned range (a texture's) while another view was mapped or unmapped: busy ranges were per view, and a
-	// protection change of a neighbouring view in the same page-table page went on during the system calls. Protection
-	// changes in those pages wait for the map or unmap, or for a working-set trim (TrimWorkingSet), to finish.
+	// Protection changes in the same page-table area wait for map/unmap operations and working-set trims to finish.
 	// Any map or unmap anywhere makes a protection change wait, not only one in its page-table pages (the views are all of
 	// one section: their prototype PTEs are shared): two reporters of #5 still bug-checked with v20261018, whose waits
 	// were per page-table page; no measurable cost (an RTX 5090 desktop and an RTX 3080 laptop, 1-1 routes A-B-A).
@@ -1715,9 +2316,8 @@ private:
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 public:
-	// Memory::TrimGuestWorkingSet's VirtualUnlock of guest views (the working-set trim), 16 MiB at a time, each busy
-	// meanwhile: no map or unmap runs in its page-table pages then, nor it during theirs. It ran unlocked before, during a
-	// view's map or unmap too (one of the overlaps of the bug check above). No lock is held during the trim itself.
+	// Memory::TrimGuestWorkingSet's VirtualUnlock of guest views, 16 MiB at a time; each chunk is marked busy so
+	// maps and unmaps cannot overlap its page-table pages. No address-space lock is held during VirtualUnlock.
 	void TrimWorkingSet(uint64_t vaddr, uint64_t size) {
 		constexpr uint64_t Chunk = uint64_t {16} << 20u;
 		for (uint64_t at = vaddr, end = vaddr + size; at < end;) {
@@ -1737,6 +2337,11 @@ public:
 		}
 	}
 
+	// The parked-range trimmer uses the same busy-range protocol around VirtualUnlock.
+	void TrimParked(uint64_t vaddr, uint64_t size) {
+		TrimWorkingSet(vaddr, size);
+	}
+
 private:
 #endif
 
@@ -1753,23 +2358,240 @@ private:
 		m_busy.erase(it);
 	}
 
-	bool ProtectMappedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+	// `trackers`: the GPU trackers' protection (VirtualMemory::ProtectWriteWatch), not the guest's.
+	bool ProtectMappedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode, bool trackers = false) {
 		const auto end = vaddr + size;
 		auto       it  = m_mapped.upper_bound(vaddr);
 		if (it != m_mapped.begin()) {
 			--it;
 		}
+#if defined(__linux__)
+		static const bool coalesce = [] {
+			const char* value = std::getenv("KYTY_LINUX_COALESCE_MPROTECT");
+			return value == nullptr || value[0] != '0';
+		}();
+		// Linux: mprotect spans adjacent mappings, so contiguous regions take one call (Windows' VirtualProtect cannot
+		// cross MapViewOfFile3 views, hence one call per region below). KYTY_LINUX_COALESCE_MPROTECT=0: one call per region.
+		if (coalesce) {
+			uint64_t   run_start = 0;
+			uint64_t   run_end   = 0;
+			const auto flush_run = [&]() {
+				if (run_start >= run_end) return true;
+				LiveTrace::SlowOsCallScope slow(LiveTrace::OsProtect, run_start, run_end - run_start);
+				return trackers ? VirtualMemory::ProtectWriteWatch(run_start, run_end - run_start, mode)
+				                : VirtualMemory::Protect(run_start, run_end - run_start, mode);
+			};
+			for (; it != m_mapped.end() && it->second.vaddr < end; ++it) {
+				const auto& region      = it->second;
+				const auto  range_start = std::max(vaddr, region.vaddr);
+				const auto  range_end   = std::min(end, region.vaddr + region.size);
+				if (range_start >= range_end) continue;
+				if (run_start < run_end && range_start == run_end) {
+					run_end = range_end;
+					continue;
+				}
+				if (!flush_run()) return false;
+				run_start = range_start;
+				run_end   = range_end;
+			}
+			return flush_run();
+		}
+#endif
 		for (; it != m_mapped.end() && it->second.vaddr < end; ++it) {
 			const auto& region      = it->second;
 			const auto  range_start = std::max(vaddr, region.vaddr);
 			const auto  range_end   = std::min(end, region.vaddr + region.size);
 			if (range_start >= range_end) continue;
 			LiveTrace::SlowOsCallScope slow(LiveTrace::OsProtect, range_start, range_end - range_start);
-			if (!VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
+			if (!ProtectView(range_start, range_end - range_start, mode, region.type, trackers)) {
 				return false;
 			}
 		}
 		return true;
+	}
+
+	// A guest mapping's protection; on Windows with KYTY_READ_GUARD, a view's no access as a read guard
+	// (kyty_local_read_guard: private memory is no section's), but for the pages read back lately (NoteRead).
+	bool ProtectView(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode, MappingType type, bool trackers) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (mode == VirtualMemory::Mode::NoAccess && type == MappingType::Backing &&
+		    kyty_local_read_guard.load(std::memory_order_relaxed) != 0) {
+			constexpr uint64_t Page = 0x1000;
+			const uint64_t     end  = vaddr + size;
+			const auto         set  = [](uint64_t begin, uint64_t until, DWORD protection) {
+				DWORD old = 0;
+				return begin >= until ||
+				       VirtualProtect(reinterpret_cast<void*>(begin), until - begin, protection, &old) != 0;
+			};
+			if (kyty_local_hot_reads.load(std::memory_order_relaxed) == 0 || m_hot_pressure.load(std::memory_order_relaxed))
+				return set(vaddr, end, PAGE_GUARD | PAGE_READONLY);
+			thread_local std::vector<std::pair<uint64_t, uint64_t>> hot;
+			hot.clear();
+			{
+				std::lock_guard lock(m_hot_mutex);
+				for (auto it = m_hot.lower_bound(vaddr & ~(Page - 1)); it != m_hot.end() && it->first < end; ++it) {
+					// (A page mapped again over other memory is no longer the one locked; one the texture offload takes is
+					// its guard's: DropHotBacking.)
+					if (m_backing->BackingPointer(it->first, Page) != it->second.backing ||
+					    TextureOffload::MayOverlap(it->first, Page))
+						continue;
+					const auto begin = std::max(it->first, vaddr);
+					const auto until = std::min(it->first + Page, end);
+					if (!hot.empty() && hot.back().second == begin) {
+						hot.back().second = until;
+					} else {
+						hot.emplace_back(begin, until);
+					}
+				}
+			}
+			uint64_t at = vaddr;
+			for (const auto& [begin, until]: hot) {
+				if (!set(at, begin, PAGE_GUARD | PAGE_READONLY) || !set(begin, until, PAGE_NOACCESS)) return false;
+				at = until;
+			}
+			return set(at, end, PAGE_GUARD | PAGE_READONLY);
+		}
+#endif
+		return trackers ? VirtualMemory::ProtectWriteWatch(vaddr, size, mode) : VirtualMemory::Protect(vaddr, size, mode);
+	}
+
+	// A free entry consumed with its placeholder split later (SplitPlaceholders, outside the lock).
+	struct FreeSplit {
+		uint64_t base = 0, end = 0; // the free entry
+	};
+
+	// ConsumeUnlocked's free-list change without its system calls: the remainders become free entries now.
+	bool ConsumeDeferredUnlocked(uint64_t vaddr, uint64_t size, FreeSplit* split) {
+		auto it = FindContaining(vaddr, size);
+		if (it == m_free.end()) {
+			return false;
+		}
+		split->base = it->first;
+		split->end  = it->first + it->second;
+		m_free.erase(it);
+		if (split->base != vaddr) m_free.emplace(split->base, vaddr - split->base);
+		if (vaddr + size != split->end) m_free.emplace(vaddr + size, split->end - (vaddr + size));
+		return true;
+	}
+
+	// The placeholder of a consumed free entry split around [vaddr, vaddr + size) (SplitUnlocked's calls). False when
+	// a split failed (RestoreSplitUnlocked).
+	static bool SplitPlaceholders(const FreeSplit& split, uint64_t vaddr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (split.base != vaddr &&
+		    !PlaceholderFree(reinterpret_cast<void*>(split.base), vaddr - split.base, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
+			return false;
+		if (vaddr + size != split.end &&
+		    !PlaceholderFree(reinterpret_cast<void*>(vaddr), size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
+			return false;
+#else
+		(void)split, (void)vaddr, (void)size;
+#endif
+		return true;
+	}
+
+	// A map that failed gives its free entry back whole, its placeholders (the ones split) made one again.
+	void RestoreSplitUnlocked(const FreeSplit& split, uint64_t vaddr, uint64_t size) {
+		m_free.erase(m_free.lower_bound(split.base), m_free.lower_bound(split.end));
+		(void)vaddr, (void)size;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// (A coalesce of one placeholder fails: nothing was split then.)
+		(void)CoalescePlaceholders(split.base, split.end - split.base);
+#endif
+		m_free.emplace(split.base, split.end - split.base);
+	}
+
+	// AddFreeUnlocked's free-list change without its system calls, for the free placeholders of an unmap
+	// (GuestBackingStore::Unmap's `freed`): each joins the list as its own entry. Returned: the spans they make with the
+	// free entries next to them, where there are such, to be coalesced outside the lock (CoalesceSpans).
+	std::vector<std::pair<uint64_t, uint64_t>> AddFreedUnlocked(const std::vector<std::pair<uint64_t, uint64_t>>& freed) {
+		for (const auto& [vaddr, size]: freed) {
+			auto [it, inserted] = m_free.emplace(vaddr, size);
+			if (!inserted) it->second = size;
+		}
+		std::vector<std::pair<uint64_t, uint64_t>> spans;
+		for (const auto& [vaddr, size]: freed) {
+			const auto it    = m_free.find(vaddr);
+			uint64_t   begin = it->first, end = it->first + it->second;
+			for (auto first = it; first != m_free.begin() && std::prev(first)->first + std::prev(first)->second == begin;) {
+				--first;
+				begin = first->first;
+			}
+			for (auto last = std::next(it); last != m_free.end() && last->first == end; ++last) end = last->first + last->second;
+			if (end - begin > size &&
+			    std::none_of(spans.begin(), spans.end(), [begin](const auto& span) { return span.first == begin; }))
+				spans.emplace_back(begin, end);
+		}
+		return spans;
+	}
+
+	// The free entries of each span made one, their placeholders first (outside the lock: guest maps and unmaps, the only
+	// users of the free list, run one at a time).
+	void CoalesceSpans(const std::vector<std::pair<uint64_t, uint64_t>>& spans) {
+		for (const auto& [begin, end]: spans) {
+			if (CoalesceFreePlaceholders(begin, end)) {
+				ExclusiveLock lock(m_mutex);
+				MergeFreeUnlocked(begin, end);
+			}
+		}
+	}
+
+	// Whether [vaddr, vaddr + size) is free: free placeholders, or ranges parked in views (GuestBackingStore::UnmapOne),
+	// which a map or commit there makes free placeholders first (MaterializeParked).
+	bool FreeOrParkedUnlocked(uint64_t vaddr, uint64_t size) {
+		if (FindContaining(vaddr, size) != m_free.end()) return true;
+		const auto end = vaddr + size;
+		for (auto at = vaddr; at < end;) {
+			if (const auto it = FindContaining(at, 1); it != m_free.end()) {
+				at = it->first + it->second;
+			} else if (const auto parked_end = m_backing->ParkedEnd(at); parked_end != 0) {
+				at = parked_end;
+			} else {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	// The ranges parked in views over [vaddr, vaddr + size) made free placeholders before a map or commit there: their
+	// views split for real (GuestBackingStore::Materialize), busy meanwhile (their mapped parts are mapped again).
+	void MaterializeParked(uint64_t vaddr, uint64_t size) {
+		uint64_t begin = UINT64_MAX, end = 0;
+		if (!m_backing->ParkedViews(vaddr, size, &begin, &end)) return;
+		{
+			ExclusiveLock lock(m_mutex);
+			m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(begin, end - begin); });
+			m_busy.emplace_back(begin, end);
+		}
+		std::vector<std::pair<uint64_t, uint64_t>> freed, spans;
+		m_backing->Materialize(vaddr, size, &freed);
+		{
+			ExclusiveLock lock(m_mutex);
+			spans = AddFreedUnlocked(freed);
+			EraseBusyUnlocked(begin, end);
+		}
+		m_busy_done.notify_all();
+		CoalesceSpans(spans);
+		if (g_remapped_count != 0) {
+			LiveCounters::Add(LiveCounters::RemappedViews, std::exchange(g_remapped_count, 0u));
+		}
+		ReapplyRemappedViews();
+		g_remap_window_begin.store(0, std::memory_order_release);
+	}
+
+	static bool CoalesceFreePlaceholders(uint64_t begin, uint64_t end) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		return CoalescePlaceholders(begin, end - begin);
+#else
+		(void)begin, (void)end;
+		return true;
+#endif
+	}
+
+	// The free entries of [begin, end) made one (their placeholders were: CoalesceFreePlaceholders).
+	void MergeFreeUnlocked(uint64_t begin, uint64_t end) {
+		m_free.erase(m_free.lower_bound(begin), m_free.lower_bound(end));
+		m_free.emplace(begin, end - begin);
 	}
 
 	bool ConsumeUnlocked(uint64_t vaddr, uint64_t size) {
@@ -1878,14 +2700,35 @@ private:
 		// driver. DLSS frame generation (KYTY_FRAMEGEN) needs it: NVIDIA's optical flow and NGX
 		// interop reserve about 44 GiB of host address space below 1 TiB when the device is
 		// created, and fail it (VK_ERROR_INITIALIZATION_FAILED) when the guest took all of it.
+		// With frame generation the guest stops at 512 GiB (its mappings take the lowest free
+		// addresses, tens of GiB above HOST_USER_MIN): a ceiling of 0xE0_0000_0000 left an RTX 5090
+		// enough, an RTX 5080's device creation failed until 0x80_0000_0000 (issue #32).
+		// (DLSS super resolution, KYTY_UPSCALER=dlss, makes its device through NGX the same way.)
+		const char* framegen   = std::getenv("KYTY_FRAMEGEN");
+		const char* upscaler   = std::getenv("KYTY_UPSCALER");
+		const bool  streamline = (framegen != nullptr && std::atoi(framegen) > 0) ||
+		                        (upscaler != nullptr && std::strcmp(upscaler, "dlss") == 0);
 		uint64_t ceiling = 0;
 		if (const char* value = std::getenv("KYTY_RESERVE_CEILING"); value != nullptr && *value != '\0') {
 			ceiling = std::strtoull(value, nullptr, 16);
-		} else if (const char* framegen = std::getenv("KYTY_FRAMEGEN"); framegen != nullptr && std::atoi(framegen) > 0) {
-			ceiling = 0xE000000000ull;
+		} else if (streamline) {
+			ceiling = 0x8000000000ull;
 		}
 		if (ceiling != 0) {
 			guest_end = std::clamp<uint64_t>(ceiling, HOST_USER_MIN, guest_end);
+		}
+		// KYTY_FG_ADDRESS_HOLE=0|1 (default 1 with frame generation): 64 GiB right above the guest held free until the
+		// Vulkan device is made (ReleaseFrameGenAddressHole). The executable is not randomized (/DYNAMICBASE:NO), so the
+		// process's allocations after the guest's take the lowest free addresses one after another, from the guest's end
+		// up: on an RTX 5080 the device creation with frame generation failed (VK_ERROR_INITIALIZATION_FAILED) until the
+		// user turned on bottom-up address randomization for the emulator in Windows' exploit protection (issue #45),
+		// which scatters them. (The size NVIDIA's interop reserved below 1 TiB on the 5090: about 44 GiB.)
+		if (streamline && guest_end <= (uint64_t {1} << 40u) - FrameGenHoleSize) {
+			const char* hole = std::getenv("KYTY_FG_ADDRESS_HOLE");
+			if (hole == nullptr || *hole != '0') {
+				g_frame_gen_hole = VirtualAlloc(reinterpret_cast<void*>(guest_end), FrameGenHoleSize, MEM_RESERVE,
+				                                PAGE_NOACCESS);
+			}
 		}
 
 		while (next_addr < guest_end) {
@@ -2063,8 +2906,7 @@ private:
 		if (base != vaddr) {
 			const auto left_size = vaddr - base;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			if (VirtualFree(reinterpret_cast<void*>(base), left_size,
-			                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0) {
+			if (!PlaceholderFree(reinterpret_cast<void*>(base), left_size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
 				LOGF_COLOR(Log::Color::Red,
 				           "\t guest placeholder split failed: base=0x%016" PRIx64
 				           " size=0x%016" PRIx64 " requested=0x%016" PRIx64
@@ -2079,8 +2921,7 @@ private:
 
 		if (it->second != size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			if (VirtualFree(reinterpret_cast<void*>(it->first), size,
-			                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0) {
+			if (!PlaceholderFree(reinterpret_cast<void*>(it->first), size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
 				LOGF_COLOR(Log::Color::Red,
 				           "\t guest placeholder split failed: base=0x%016" PRIx64
 				           " size=0x%016" PRIx64 " requested=0x%016" PRIx64
@@ -2146,6 +2987,7 @@ private:
 		// mappings and never acquires a new guest address.
 		void* ptr = mmap(reinterpret_cast<void*>(vaddr), size, PROT_NONE,
 		                 MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+		VirtualMemory::WriteWatchUnmapped(vaddr, size);
 		EXIT_IF(ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != vaddr);
 #else
 		(void)vaddr;
@@ -2167,4 +3009,45 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
 	uint64_t                                   m_granularity = 0x10000;
 	GuestBackingStore*                         m_backing     = nullptr;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// The pages read back lately (NoteRead) by guest address, with their locked page of the backing view and the time
+	// of their last read fault; the locks per backing page (aliases share one).
+	struct HotRead {
+		uint8_t* backing = nullptr;
+		uint64_t noted   = 0;
+	};
+	static constexpr size_t   HotReadsMax    = 8192; // 32 MiB locked at most (memory.cpp AllowHotReadLocks)
+	static constexpr uint64_t HotReadsKeepMs = 8000;
+	bool LockHotBacking(uint8_t* backing) {
+		auto [it, inserted] = m_hot_locks.try_emplace(backing, 0);
+		if (inserted && VirtualLock(backing, 0x1000) == 0) {
+			m_hot_locks.erase(it);
+			return false;
+		}
+		++it->second;
+		return true;
+	}
+	void UnlockHotBacking(uint8_t* backing) {
+		auto it = m_hot_locks.find(backing);
+		if (it == m_hot_locks.end() || --it->second != 0) return;
+		(void)VirtualUnlock(backing, 0x1000);
+		m_hot_locks.erase(it);
+	}
+	std::mutex                   m_hot_mutex;
+	std::map<uint64_t, HotRead>  m_hot;
+	std::map<uint8_t*, uint32_t> m_hot_locks;
+	uint64_t                     m_hot_cooled = 0; // (CoolHotReads: one thread)
+	bool                         m_hot_draining = false; // (CoolHotReads: short of memory, pages left to cool)
+	std::atomic<bool>            m_hot_pressure {false}; // HotReadsPressure
+#endif
 };
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static void TrimParkedRange(uint64_t vaddr, uint64_t size) {
+	if (auto* space = g_trim_space.load(std::memory_order_acquire); space != nullptr) {
+		space->TrimParked(vaddr, size);
+	} else {
+		VirtualUnlock(reinterpret_cast<void*>(vaddr), size);
+	}
+}
+#endif

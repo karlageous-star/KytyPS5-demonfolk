@@ -2,10 +2,15 @@
 // the port of `tools/local/static-precompile/precompile.py seeds` (with what it uses of agc.py, keys.py,
 // materials.py and warmfile.py), which needs Python 3 with numpy, and it writes the same file byte for byte:
 // the same records and pipeline recipes, deduplicated and ordered the same way, under the same identity line
-// and checksum (xxh3.py is XXH3_64bits). Where precompile.py stops with an exception (a game file it does not
-// expect) this stops too (Fatal: nothing is written); where it skips what it was reading (a ValueError it
+// and checksum (xxh3.py is XXH3_64bits) for the same title and host inputs. Where precompile.py stops with an
+// exception (a game file it does not expect) this stops too (Fatal: nothing is written); where it skips what it was
+// reading (a ValueError it
 // catches) this skips it too (Refused). The Python tools stay the reference and do the analyses.
 #include "static-seeds.h"
+
+#include "common/archive.h"
+#include "common/file.h"
+#include "common/stringUtils.h"
 
 #include <nlohmann/json.hpp>
 #include <xxhash.h>
@@ -64,8 +69,6 @@ constexpr uint32_t NoShader = 0xffffffffu;
 constexpr uint32_t StageVertex = 1, StagePixel = 2, StageCompute = 4;
 // Prospero::ShaderBinaryType of an AGC header.
 constexpr uint8_t TypeCs = 0, TypePs = 1, TypeGs = 2;
-// Host inputs are supplied by the precompiler's actual Vulkan device, as at runtime.
-
 #ifdef _WIN32
 // pathlib's Windows paths: '\' separates too, and paths compare, hash and match patterns case-insensitively.
 constexpr bool WindowsPaths = true;
@@ -153,6 +156,15 @@ std::string Utf8(const fs::path& path) {
 
 // Path.read_bytes(): a file it cannot read stops precompile.py.
 std::vector<uint8_t> ReadAll(const fs::path& path) {
+	if (Common::IsArchivePath(path)) { // a game packed into a ZArchive ("game.zar!/dir/file")
+		Common::File file;
+		if (!file.Open(path, Common::File::Mode::Read) || file.Size() > UINT32_MAX) throw Fatal("cannot read " + Utf8(path));
+		std::vector<uint8_t> data(static_cast<size_t>(file.Size()));
+		uint32_t             read = 0;
+		if (!data.empty()) file.Read(data.data(), static_cast<uint32_t>(data.size()), &read);
+		if (read != data.size()) throw Fatal("cannot read " + Utf8(path));
+		return data;
+	}
 	std::ifstream file(path, std::ios::binary | std::ios::ate);
 	if (!file) throw Fatal("cannot read " + Utf8(path));
 	const auto size = static_cast<std::streamoff>(file.tellg());
@@ -203,21 +215,27 @@ std::vector<GameFile> FindGameFiles(const fs::path& game, std::string_view suffi
 	while (!directories.empty()) {
 		const auto directory = std::move(directories.back());
 		directories.pop_back();
-		std::vector<fs::directory_entry> entries;
-		std::error_code                  error;
-		for (fs::directory_iterator it(directory.path, error), end; !error && it != end; it.increment(error)) {
-			entries.push_back(*it);
+		// (path, name, a directory): a game packed into a ZArchive lists its directories itself (no links there).
+		std::vector<std::tuple<fs::path, std::string, bool>> entries;
+		if (Common::IsArchivePath(directory.path)) {
+			for (const auto& entry: Common::File::GetDirEntries(directory.path)) {
+				entries.emplace_back(directory.path / Common::PathFromUtf8(entry.name), entry.name, !entry.is_file);
+			}
+		} else {
+			std::error_code error;
+			for (fs::directory_iterator it(directory.path, error), end; !error && it != end; it.increment(error)) {
+				std::error_code status;
+				entries.emplace_back(it->path(), Utf8(it->path().filename()), !it->is_symlink(status) && it->is_directory(status));
+			}
+			if (error) continue;
 		}
-		if (error) continue;
-		for (const auto& entry: entries) {
-			GameFile   file {entry.path(), directory.parts, directory.compared};
-			const auto name = Utf8(entry.path().filename());
+		for (const auto& [path, name, is_directory]: entries) {
+			GameFile file {path, directory.parts, directory.compared};
 			file.parts.push_back(name);
 			file.compared.push_back(Compared(name));
 			const auto ending = std::string_view(name).substr(name.size() - std::min(name.size(), suffix.size()));
 			if (name.size() >= suffix.size() && Compared(ending) == suffix) found.push_back(file);
-			std::error_code status;
-			if (!entry.is_symlink(status) && entry.is_directory(status)) directories.push_back(std::move(file));
+			if (is_directory) directories.push_back(std::move(file));
 		}
 	}
 	std::stable_sort(found.begin(), found.end(),
@@ -521,10 +539,9 @@ Relocations RelativeRelocations(Bytes elf, const std::vector<ElfLoad>& loads) {
 // the game has one, else the eboot.bin the emulator runs), none without either. `image` keeps the ELF image the
 // code views.
 std::vector<Shader> EmbeddedShaders(const fs::path& game, std::vector<uint8_t>& image) {
-	std::error_code error;
-	auto            path = game / "decrypted" / "eboot.bin";
-	if (!fs::is_regular_file(path, error)) path = game / "eboot.bin";
-	if (!fs::is_regular_file(path, error)) return {};
+	auto path = game / "decrypted" / "eboot.bin";
+	if (!Common::File::IsFileExisting(path)) path = game / "eboot.bin";
+	if (!Common::File::IsFileExisting(path)) return {};
 	image             = PlainElf(ReadAll(path));
 	const Bytes elf   = image;
 	const auto  loads = ElfLoads(elf);
@@ -832,25 +849,40 @@ std::vector<uint32_t> PixelRecord(Bytes code, const Agc& agc, const Agc& vertex,
 	return RecordWords(StagePixel, code, UserDataCount(rsrc2), key, info);
 }
 
+// keys.INDIRECT_START_INSTANCE_SGPR: the SGPR the game's indirect draws have the CP write the start instance into
+// (START_INST_LOC): the third GS user SGPR, s8 + 2, of a vertex shader with three (its table pointer, then the instance
+// offset; every recorded indirect draw's).
+constexpr uint32_t IndirectStartInstanceSgpr = 8 + 2;
+
 // keys.vertex_record: this game's vertex shaders pull their vertices through the SRT (no fetch tables, no clip
-// transform, no mesh path), so the key holds header fields only; Refused with fetch tables.
-std::vector<uint32_t> VertexRecord(Bytes code, const Agc& agc) {
+// transform, no mesh path), so the key holds header fields only; Refused with fetch tables. start_instance_sgpr -1
+// for direct draws, the SGPR the start instance is written to for indirect ones.
+std::vector<uint32_t> VertexRecord(Bytes code, const Agc& agc, uint32_t start_instance_sgpr = 0xffffffffu) {
 	const auto& offsets = agc.direct_resource_offset;
 	if ((offsets.size() > 10 && offsets[10] != 0xffff) || (offsets.size() > 8 && offsets[8] != 0xffff)) {
 		throw Refused("vertex shader with fetch tables: its key needs draw-time descriptors");
 	}
 	const uint32_t scratch  = agc.scratch_size_dw_per_thread;
 	const uint32_t out_cntl = RegFirst(agc.cx_registers, PaClVsOutCntl).value_or(0);
-	// start_instance_sgpr -1: the direct draws' variant.
-	const uint32_t key[]  = {0, 0, 0, 0, scratch, out_cntl, 0xffffffffu, 0, 0};
-	const uint32_t info[] = {0, 0, 0,                         // resources_num, fetch_attrib_reg, fetch_buffer_reg
-	                         scratch, out_cntl, 0xffffffffu, // scratch, PA_CL_VS_OUT_CNTL, start_instance_sgpr
-	                         0, 0, 0,                         // fetch_external, fetch_embedded, clip enabled
-	                         0, 0, 0, 0, 0, 0,                // clip scale, offset, half extent
-	                         0, 0, 0, 0, 0, 64, 64,           // mesh: threads, LDS, scratch, subgroup, wave
-	                         0, 0, 0, 0, 0, 0};               // mesh: primitive and vertex counts, provoking vertex
+	const uint32_t key[]  = {0, 0, 0, 0, scratch, out_cntl, start_instance_sgpr, 0, 0};
+	const uint32_t info[] = {0, 0, 0,                                 // resources_num, fetch_attrib_reg, fetch_buffer_reg
+	                         scratch, out_cntl, start_instance_sgpr, // scratch, PA_CL_VS_OUT_CNTL, start_instance_sgpr
+	                         0, 0, 0,                                 // fetch_external, fetch_embedded, clip enabled
+	                         0, 0, 0, 0, 0, 0,                        // clip scale, offset, half extent
+	                         0, 0, 0, 0, 0, 64, 64,                   // mesh: threads, LDS, scratch, subgroup, wave
+	                         0, 0, 0, 0, 0, 0};                       // mesh: primitive and vertex counts, provoking vertex
 	const auto     rsrc2  = RegFirst(agc.sh_registers, SpiShaderPgmRsrc2Gs).value_or(0);
 	return RecordWords(StageVertex, code, UserDataCount(rsrc2), key, info);
+}
+
+// keys.vertex_records: the records of a vertex shader, its direct draws' and, where it has the three user SGPRs whose
+// last the CP writes the start instance into, its indirect draws' (read from Vulkan's base instance there).
+std::vector<std::vector<uint32_t>> VertexRecords(Bytes code, const Agc& agc) {
+	std::vector<std::vector<uint32_t>> records {VertexRecord(code, agc)};
+	if (UserDataCount(RegFirst(agc.sh_registers, SpiShaderPgmRsrc2Gs).value_or(0)) == 3) {
+		records.push_back(VertexRecord(code, agc, IndirectStartInstanceSgpr));
+	}
+	return records;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1278,6 +1310,24 @@ std::filesystem::path FindStates() {
 	return {};
 }
 
+// Windows: a path of MAX_PATH (260) characters or more opens only in the extended-length form (\\?\, \\?\UNC\ for a
+// share): a game folder deep in a user's documents put a material at 265 characters (issue #13: "cannot read"), and
+// directories past the limit were left out unlisted. The game folder takes that form, and every path made below it.
+fs::path ExtendedLength(const fs::path& path) {
+#if defined(_WIN32)
+	if (Common::IsArchivePath(path)) return path;
+	std::error_code error;
+	const auto      absolute = fs::absolute(path, error);
+	if (error) return path;
+	const auto text = absolute.lexically_normal().wstring();
+	if (text.starts_with(L"\\\\?\\") || text.starts_with(L"\\\\.\\")) return absolute;
+	if (text.starts_with(L"\\\\")) return fs::path(L"\\\\?\\UNC\\" + text.substr(2));
+	return fs::path(L"\\\\?\\" + text);
+#else
+	return path;
+#endif
+}
+
 // precompile.py cmd_seeds.
 int Make(const Options& options) {
 	try {
@@ -1285,7 +1335,7 @@ int Make(const Options& options) {
 		const auto states_file = options.states.empty() ? FindStates() : options.states;
 		if (states_file.empty()) throw Fatal("no tools/local/static-precompile/pass-states.json (--states <file>)");
 		const auto      states = LoadStates(states_file);
-		const Inventory inventory(options.game);
+		const Inventory inventory(ExtendedLength(options.game));
 		if (inventory.bundles.empty()) {
 			std::fprintf(stderr, "no shader bundles (*.csdr) under %s\n", Utf8(options.game).c_str());
 		}
@@ -1325,20 +1375,25 @@ int Make(const Options& options) {
 				counts["pairs without states (" + group + ")"]++;
 				return;
 			}
-			uint32_t vs = 0, ps = 0;
+			std::vector<uint32_t> vertex_records;
+			uint32_t              ps = 0;
 			try {
-				vs = seeds.Record(VertexRecord(vertex.code, vertex.agc));
+				for (auto& record: VertexRecords(vertex.code, vertex.agc)) {
+					vertex_records.push_back(seeds.Record(std::move(record)));
+				}
 				ps = seeds.Record(PixelRecord(pixel.code, pixel.agc, vertex.agc, options.lod_stats_subgroup));
 			} catch (const Refused&) {
 				counts["pairs with unsupported inputs"]++;
 				return;
 			}
-			for (const auto& words: *palette) {
-				if (!culling) {
-					seeds.Pipeline(WithShaders(vs, ps, words));
-					continue;
+			for (const auto vs: vertex_records) {
+				for (const auto& words: *palette) {
+					if (!culling) {
+						seeds.Pipeline(WithShaders(vs, ps, words));
+						continue;
+					}
+					for (const auto& variant: CullingVariants(words)) seeds.Pipeline(WithShaders(vs, ps, variant));
 				}
-				for (const auto& variant: CullingVariants(words)) seeds.Pipeline(WithShaders(vs, ps, variant));
 			}
 		};
 
@@ -1354,13 +1409,16 @@ int Make(const Options& options) {
 			// Inventory.vertex_only: eboot.bin's vertex shaders, which the engine also draws without a pixel shader.
 			for (const auto& shader: inventory.embedded) {
 				if (shader.agc.type != TypeGs) continue;
-				uint32_t vs = 0;
+				std::vector<std::vector<uint32_t>> records;
 				try {
-					vs = seeds.Record(VertexRecord(shader.code, shader.agc));
+					records = VertexRecords(shader.code, shader.agc);
 				} catch (const Refused& error) {
 					throw Fatal(std::string("eboot.bin: ") + error.what()); // not caught there
 				}
-				for (const auto& words: states.VertexOnly()) seeds.Pipeline(WithShaders(vs, NoShader, words));
+				for (auto& record: records) {
+					const auto vs = seeds.Record(std::move(record));
+					for (const auto& words: states.VertexOnly()) seeds.Pipeline(WithShaders(vs, NoShader, words));
+				}
 			}
 		}
 
@@ -1404,6 +1462,19 @@ int Make(const Options& options) {
 	} catch (const std::exception& error) {
 		std::fprintf(stderr, "kyty_shader_precompile --make-seeds: %s\n", error.what());
 		return 1;
+	}
+}
+
+uint64_t Write(const fs::path& path, std::vector<std::vector<uint32_t>> records,
+	           std::vector<std::vector<uint32_t>> pipelines, const std::string& title_id) {
+	SeedFile file;
+	file.records   = std::move(records);
+	file.pipelines = std::move(pipelines);
+	try {
+		return file.Write(path, title_id);
+	} catch (const Fatal& error) {
+		std::fprintf(stderr, "%s\n", error.what());
+		return 0;
 	}
 }
 

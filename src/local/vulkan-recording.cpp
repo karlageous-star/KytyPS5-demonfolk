@@ -1,12 +1,15 @@
 #include "vulkan-recording.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "live-census.h"
+#include "live-counters.h"
 #include "live-trace-gpu.h"
 #include "local-platform.h"
+#include "spin-gate.h"
 #include "time-census.h"
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -22,15 +25,20 @@
 extern "C" {
 // 1: record Vulkan commands for the worker thread, draws and descriptor
 // encoding as whole packets (KYTY_VULKAN_RECORDING).
-volatile std::atomic<uint32_t> kyty_local_vulkan_recording_mode {0};
+volatile std::atomic<uint32_t> kyty_local_vulkan_recording_mode {1};
 // 1: queue command-buffer begin/end/submit instead of draining (DeferredSubmitEnabled).
 volatile std::atomic<uint32_t> kyty_local_deferred_submit_mode {0};
 // 1: back-to-back buffer-only pipeline barriers of the recording thread become one call (HoldBarrier).
 volatile std::atomic<uint32_t> kyty_local_barrier_merge_mode {0};
 // Pauses the idle worker spins before it blocks (a blocked worker costs the render thread a
-// wake-up system call per publish on Windows).
+// wake-up system call per publish on Windows; Linux the same unless KYTY_LINUX_FAST_LOCKS=0).
 #if defined(_WIN32)
 volatile std::atomic<uint32_t> kyty_local_recording_spin {4000};
+#elif defined(__linux__)
+volatile std::atomic<uint32_t> kyty_local_recording_spin {[] {
+    const char* value = std::getenv("KYTY_LINUX_FAST_LOCKS");
+    return value == nullptr || value[0] != '0' ? 4000u : 0u;
+}()};
 #else
 volatile std::atomic<uint32_t> kyty_local_recording_spin {0};
 #endif
@@ -156,6 +164,20 @@ public:
     }
 };
 
+// A producer waiting for the worker (a full stream, a drain): the slow-frame lines' record_wait (render thread) and
+// the live counter record_wait_us.
+struct RecordWait {
+    LiveCensus::WaitScope                       scope {LiveCensus::WaitRecord};
+    const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    RecordWait() = default;
+    RecordWait(const RecordWait&) = delete;
+    RecordWait& operator=(const RecordWait&) = delete;
+    ~RecordWait() {
+        LiveCounters::Add(LiveCounters::RecordWaitUs,
+                          static_cast<uint64_t>((std::chrono::steady_clock::now() - start).count()) / 1000u);
+    }
+};
+
 class Stream;
 thread_local Stream* executing = nullptr;
 class Stream {
@@ -207,6 +229,20 @@ public:
     void Drain() {
         Publish();
         if (completed.load(std::memory_order_acquire) == sequence) return;
+        const RecordWait waiting;
+#if defined(__linux__)
+        static const bool fast_locks = [] {
+            const char* value = std::getenv("KYTY_LINUX_FAST_LOCKS");
+            return value == nullptr || value[0] != '0';
+        }();
+        // Linux: a short spin first, the same as the worker's (KYTY_LINUX_FAST_LOCKS=0: waits at once).
+        if (fast_locks) {
+            for (uint32_t spin = 0; spin < 4000; ++spin) {
+                if (completed.load(std::memory_order_acquire) == sequence) return;
+                _mm_pause();
+            }
+        }
+#endif
         for (auto done = completed.load(std::memory_order_acquire); done != sequence;
              done = completed.load(std::memory_order_acquire)) completed.wait(done, std::memory_order_acquire);
     }
@@ -222,8 +258,11 @@ private:
     std::thread worker;
 
     void WaitForRoom() {
-        for (auto done = completed.load(std::memory_order_acquire); sequence - done >= ChunkCount;
-             done = completed.load(std::memory_order_acquire)) completed.wait(done, std::memory_order_acquire);
+        auto done = completed.load(std::memory_order_acquire);
+        if (sequence - done < ChunkCount) return;
+        const RecordWait waiting;
+        for (; sequence - done >= ChunkCount; done = completed.load(std::memory_order_acquire))
+            completed.wait(done, std::memory_order_acquire);
     }
     void Publish() {
         WaitForRoom();
@@ -250,12 +289,13 @@ private:
             if ((current & 4095u) == 0) KeepAffinity();
             for (auto ready = published.load(std::memory_order_acquire); current == ready;
                  ready = published.load(std::memory_order_acquire)) {
-                const uint32_t spins = kyty_local_recording_spin.load(std::memory_order_relaxed);
+                const uint32_t spins = SpinGate::Open(true) ? kyty_local_recording_spin.load(std::memory_order_relaxed) : 0;
                 for (uint32_t spin = 0; spin < spins && ready == current; ++spin) {
                     _mm_pause();
                     ready = published.load(std::memory_order_acquire);
                 }
                 if (ready != current) break;
+                LiveCounters::Add(LiveCounters::RecordSleeps);
                 sleeping.store(true, std::memory_order_seq_cst);
                 if (published.load(std::memory_order_seq_cst) == current)
                     published.wait(current, std::memory_order_seq_cst);
@@ -466,6 +506,11 @@ void FlushHeldBarrier() {
 
 void Install() { InstallDispatch(); }
 const vk::detail::DispatchLoaderDynamic& DirectDispatch() { return original; }
+void* ReplaceBindPipeline(void* entry) {
+    auto* replaced = reinterpret_cast<void*>(original.vkCmdBindPipeline);
+    original.vkCmdBindPipeline = reinterpret_cast<PFN_vkCmdBindPipeline>(entry);
+    return replaced;
+}
 uint64_t WorkCalls() { return g_work_calls; }
 uint64_t RecordedWork() { return g_work_calls + g_packets; }
 void Drain() {
@@ -519,6 +564,8 @@ std::atomic<uint64_t> g_deferred_queued {0};
 std::atomic<uint64_t> g_deferred_done {0};
 } // namespace
 void NoteDeferredSubmitQueued() { g_deferred_queued.fetch_add(1, std::memory_order_release); }
+uint64_t DeferredSubmitsQueued() { return g_deferred_queued.load(std::memory_order_acquire); }
+uint64_t DeferredSubmitsDone() { return g_deferred_done.load(std::memory_order_acquire); }
 void NoteDeferredSubmitDone() {
     g_deferred_done.fetch_add(1, std::memory_order_release);
     g_deferred_done.notify_all();
@@ -533,6 +580,7 @@ void ReplayInline(ReplayPacket replay, std::span<const Segment> segments) {
     if (producer) producer->BeforeDirect();
     replay(segments, original);
 }
+void InvalidateReplayState() { InvalidateRawState(); }
 ProducerScope::ProducerScope() {
     if (producer) std::abort();
     producer = std::make_unique<Stream>();

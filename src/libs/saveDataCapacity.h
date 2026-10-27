@@ -42,8 +42,10 @@ inline std::optional<SaveDataCapacity> ReadSaveDataCapacity(const std::filesyste
 	uint64_t      allocated = 0;
 	std::ifstream file(metadata);
 	if (file) {
+		// The emulator's own bookkeeping: unreadable (a file of zeros after a power cut) counts as none, and the
+		// mount writes it again. Refused, it failed every later mount of that save.
 		if (!(file >> allocated)) {
-			return std::nullopt;
+			allocated = 0;
 		}
 	} else if (std::filesystem::exists(metadata, ec) || ec) {
 		return std::nullopt;

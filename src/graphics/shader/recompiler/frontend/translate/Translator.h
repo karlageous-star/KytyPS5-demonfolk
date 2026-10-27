@@ -15,7 +15,8 @@ public:
 	void TranslateInstruction(const Decoder::Instruction& inst);
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
-	void AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo& info);
+	// (branch_pc: the block's last instruction, the branch; a cooperative program's wave-decided branches by it.)
+	void AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo& info, uint32_t branch_pc = UINT32_MAX);
 
 private:
 	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);

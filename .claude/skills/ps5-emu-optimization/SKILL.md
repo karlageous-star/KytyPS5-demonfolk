@@ -1,67 +1,84 @@
 ---
 name: ps5-emu-optimization
-description: Playbook for making a PS5 emulator (Kyty, shadPS4-style HLE + Vulkan) run a real game faster and without stutter, and for reverse-engineering the game's code and shaders. Use when asked to raise fps, remove hitches/stalls, find a bottleneck, judge whether an optimization idea is worth trying, design an A/B benchmark, debug a crash in guest or host code, disassemble guest code, extract/precompile shaders, or patch a PS5 game binary.
+description: Methodology-first playbook for making an HLE PS5 emulator (Kyty-style, Vulkan) run a real game fast, smooth and stable, and for specializing it to one title. Covers how to find and prove a bottleneck, measured wins and dead ends (general), Demon's Souls-specific facts, and how to find the same levers in another PS5 game. Use when asked to raise fps or 1% lows, remove hitches, cut RAM/VRAM, fix long-play slowdowns or crashes, judge an optimization idea, design an A/B, reverse-engineer a game's shaders/code/settings, or carry this work to a new title.
 ---
 
-# PS5 emulator optimization and game reverse-engineering
+# PS5 emulator optimization: method first
 
-Distilled from ~100 perf commits, ~150 recorded experiments and the tooling built while taking
-Demon's Souls (PPSA01341) on KytyPS5 from ~21 fps to ~40 fps, and from multi-second shader stalls
-to none. Numbers are from that project (i9-14900K + RTX 5090); treat them as orders of magnitude.
+Distilled from three weeks (2026-09-25 .. 10-15) and ~350 perf/fix commits taking Demon's Souls (PPSA01341) on KytyPS5
+from ~21 fps to 60-105 fps standing (120 fps cap, i9-14900K + RTX 5090), from multi-second shader stalls to none,
+and to flat memory over long play. Numbers are that project's; use them as orders of magnitude.
+Source: branch `experiment/perf-40fps-20260926` of https://github.com/chenxiao07/KytyPS5 (`KYTY_*` switches,
+scripts and file names below live there).
 
-Source: the `experiment/perf-40fps-20260926` branch of https://github.com/chenxiao07/KytyPS5 (an
-earlier snapshot: https://github.com/KytyPS5/KytyPS5/pull/599). The `KYTY_*` switches, scripts and
-file names mentioned here live in that branch; take them as examples and adapt the ideas to your tree.
+| Task | Read |
+|---|---|
+| How to measure, A/B, decide, test safely; the tools | `references/methodology.md` |
+| What worked / failed in any game (check before proposing an idea) | `references/general.md` |
+| Demon's Souls facts: shaders, patch sites, engine settings, passes, quirks | `references/demons-souls.md` |
+| Specializing another PS5 title: what generalizes, how each lever was found | `references/other-games.md` |
+| Guest code, shaders, patches, crash triage, recurring bug classes | `references/reverse-engineering.md` |
 
-Read the reference that matches the task:
-- `references/lessons.md`: what worked, what failed and why (check before proposing an idea).
-- `references/measurement.md`: benchmark harness, A/B protocol, noise, correctness gates.
-- `references/reverse-engineering.md`: guest address model, disassembly, shaders, game patches, crash triage.
+## The method (in order; skipping a step cost days every time)
 
-## Core model: where the time goes
+1. **Set the target like the porting developer.** The console runs this at 60 fps: aim for the frame budget, not
+   +10%. Name the structural cause; micro-tuning a structurally bound path ends flat.
+2. **Find what bounds the frame before touching code.** Trace one frame flip to flip: render-thread busy vs idle,
+   GPU busy, which queue/slice gates the next one, where the game waits. Only time on the critical path converts to
+   frame time (a translation thread ~95% busy; GPU ~65% busy at the same spot means: CPU-side translation).
+3. **Rank by per-call cost x calls per frame** (a census of scoped timers per phase/shader), then profile the
+   critical thread with symbols of the exact build. Census numbers per call beat fps for small changes.
+4. **Prove causality and the ceiling.** Inject a known delay at the site (frame-time slope ~1 = on the path, ~0 =
+   saving it gains nothing). Make the unsafe "skip it" version and measure: a small ceiling ends the idea.
+5. **Quantify the opportunity with a counter before building.** One cheap counter decided ideas in minutes (ring
+   copies trimmable by static extents: 0.25% of bytes -> dropped; draws on the slow path: 0.14-0.47 ms -> not the
+   lows' cause).
+6. **Change only what you can prove removes work or waits, for the whole game.** No per-scene thresholds. Put it
+   behind a live switch (a global you can poke) and add a verify mode when it replaces correctness work.
+7. **A/B in one process, alternating** (poke the switch, A B A B, 4-6 rounds of 5 s at a fixed spot). Cross-boot
+   variance is +-3-5% per world; read single sweeps as noise. Compare render ms / per-call census, not capped fps.
+8. **Test short, then broad.** 1 boot, 2-4 rounds, 120 cap for a change; a screenshot for UI; then a multi-world
+   soak (worlds x cycles) for stability and memory, and route tours for crashes before keeping risky changes.
+9. **Keep or delete.** Not clearly faster -> remove the code (no default-off piles). Record every dead end with its
+   numbers and reason, so nobody retries it without a new argument.
+10. **Re-profile.** The bottleneck moves (translation-bound -> GPU tail -> game-side waits -> memory latency).
 
-An HLE PS5 emulator runs the game's x86-64 CPU code natively and translates its GPU command buffers
-(PM4) and shaders (RDNA2 -> SPIR-V) at run time. In practice:
+## What the profiler will not tell you
 
-1. **One thread translating the graphics queue is the bottleneck.** The game's own CPU work ran
-   headless at ~100 fps; the render thread was 84% busy at 40 fps. The GPU is idle for much of the
-   frame waiting for translation. Only time on that thread converts ~1:1 into frame time.
-2. **Per-dispatch/per-draw fixed cost dominates**, not per-byte cost: ~4000 dispatches and ~1000 draws
-   per frame at 1-5 us each. Resource-table (SRT/V#/T#) evaluation, buffer lookups, dirty checks,
-   descriptor binding and barriers are the hot categories.
-3. **Guest-visible memory coherence is the second tax**: write-protect/fault tracking of guest pages
-   (hundreds of mprotect/VirtualProtect calls per frame), CPU->GPU uploads, GPU->CPU readbacks the
-   game waits for, and invalidation after unmap.
-4. **Stutter is a separate problem from fps**: first-use shader translation + driver pipeline
-   compile (100 ms - several s), cache/pool re-creation after the game unmaps memory, and
-   synchronous waits hidden in rare paths.
+- **Overlapping cache misses.** Late per-draw costs are memory latency spread over many structures (pairs, sets,
+  held entries, guest tables in 4 KiB pages). A lookup that shows 2% in the profile can be removed for 0 gain:
+  four such changes measured flat (general.md). Confirm with census per call before and after.
+- **Symbol misattribution.** Exports-only DLLs name samples after the nearest export: in vcruntime140
+  `_NLG_Return2` = memmove's large-copy path, `memchr` = memcmp. Check with a disassembler before chasing.
+- **Instrumentation cost.** Scoped timers inflate small phases (~10x); traces add ~10%; never quote instrumented fps.
+- **Sampling the wrong build.** Profiles and crash addresses are valid only against that exact exe + map/PDB.
 
-Always establish which of the four you are looking at before changing code.
+## Rules (the user's, and the ones that saved time)
 
-## Method (follow in order)
+- **Crashes first, then lows, then average fps.** Stability regressions are never traded for speed.
+- **Never make users recompile.** No change to the SPIR-V of shaders already in users' caches unless the cache key is
+  versioned; precompile speedups stay tool-side.
+- **Logic-only optimization**; hit rate is not savings (count lookup + proof + invalidation + fallback).
+- **Protect the player.** Benchmarks run only on a fixed baseline save, swapped in and restored with hash checks
+  (restore by hand if a script is killed); one emulator at a time; never rebuild while it runs.
+- **Diagnostics cost one relaxed load when off**; keep them out of commits (a separate uncommitted set).
+- **Keep the console's timing.** Vblank 60 Hz by default; above it the game clock and movies need their own fixes.
+- **Release only when asked; no upstream PRs without being asked.**
+- **Short tests, more thinking.** Long sweeps for a 1% change waste hours; reason in code, test briefly.
 
-1. **Fix the scene and the metric.** A reproducible spot (fixed save, scripted input) plus a
-   moving route; report fps as total frames / total time and the worst 1-s window. Screenshot every
-   run; an fps-only benchmark once hid black triangles for days.
-2. **Profile the render thread with symbols of the exact build** (linker map, not a stale PDB), and
-   split it by work kind per frame (dispatch prep, draws, waits, sync downloads, faults).
-3. **Prove causality before optimizing.** Inject a known delay (e.g. +1.2 ms/frame) at the candidate
-   site and measure the frame-time slope. Slope ~1 = on the critical path; ~0 = saving it gains
-   nothing (work on async queues or inside GPU-bound windows). This single probe explained why many
-   "saved 0.8 ms" changes gained 0 fps.
-4. **Measure the upper bound first.** Make the unsafe version (skip the work entirely) and measure.
-   If the ceiling is small, stop. Then subtract the real cost of the safe replacement
-   (bookkeeping, proofs, fallbacks). Most failed ideas had a real ceiling eaten by bookkeeping.
-5. **Implement behind a default-off switch** (env var or a 32-bit global you can poke live), with a
-   verify mode when the change replaces correctness work (compare old vs new result, count mismatches).
-6. **A/B in the same process**, alternating A/B/A/B at the same spot (live toggle), several rounds.
-   Cross-session numbers drift +-1-3 fps; same-process noise is ~+-0.1 fps.
-7. **Check correctness broadly**: verify-mode mismatches = 0, screenshots, a second scene, a long
-   scripted playtest, the test suite.
-8. **Keep or delete.** If it is not clearly faster, remove the code (do not accumulate default-off
-   knobs). If it is, make it unconditional. Record the result, including failures, in an experiment log.
+## Where the time goes (model at 60-100 fps)
 
-## Rules that saved time
+1. **The render (translation) thread bounds the frame** in heavy scenes: ~15 ms at Boletaria 1-1 standing, ~5.5K
+   table draws at ~1.4 us and ~1.4K table dispatches at ~1.8 us. Heavy walking views have 13-17K draws -> 25-45 ms.
+2. **Per-draw cost is memory latency**, not instructions: cold guest tables (4 KiB pages, TLB misses) and emulator
+   lookup tables. It grows with distinct data per frame (walking views cost 2x per draw vs standing).
+3. **Memory coherence tax**: page protection (every downgrade IPIs all cores running the process), ring copies of
+   guest-written constants (~10 MB/frame), uploads, readbacks the game waits on.
+4. **Stutter**: first-use translation/pipelines (precompile + recorded warmup), texture streaming bursts, guest
+   partial unmaps (a Windows view cannot be split: unmapping it whole and mapping the rest again cost up to 29 ms a
+   call on the game's threads; now parked in the view instead, general.md).
+5. **Long play**: the game cuts its direct memory finer every level load (mappings 9K -> 50K over 24 loads); every
+   per-mapping structure must be O(1) or epoch-cached, or later worlds get slower.
 
 - **Logic-only optimizations.** Every change must name the work or wait it provably removes, for
   the whole game. No tuned thresholds or per-scene knobs; they don't transfer and hide the real cause.
@@ -138,3 +155,4 @@ When a crash is reported: get host frames (RtlVirtualUnwind or backtrace), the f
 state and the guest registers, symbolize with the build's linker map, then reproduce with the
 save/route that triggers it. Guessing from the symptom produced one wrong fix in the source project;
 the host frames found the real one immediately.
+Directions that paid, ranked, and the dead ends: `references/general.md`.

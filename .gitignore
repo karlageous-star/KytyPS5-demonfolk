@@ -9,3 +9,9 @@ _PipelineCache/
 /game-path.txt
 /no-precompile-prompt.txt
 /launcher-settings.json
+
+# Runtime data (saves, dev logs, F9's debug snapshots)
+_DevLog/
+_SaveData/
+_DebugSnapshots/
+__pycache__/

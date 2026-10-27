@@ -54,6 +54,8 @@ bool        SysFileUnlink(sys_file_t&                  f,
                           const std::filesystem::path& name); // NOLINT(google-runtime-references)
 void        SysFileWrite(uint32_t n, sys_file_t& f);          // NOLINT(google-runtime-references)
 uint64_t    SysFileSize(const std::filesystem::path& file_name);
+// A file (its size) or a directory, in one query: false when there is none.
+bool        SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size);
 bool        SysFileIsError(sys_file_t& f); // NOLINT(google-runtime-references)
 bool        SysFileIsDirectoryExisting(const std::filesystem::path& path);
 bool        SysFileIsFileExisting(const std::filesystem::path& name);
@@ -81,6 +83,10 @@ void SysFileFindFiles(const std::filesystem::path& path, std::vector<sys_file_fi
 void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out);
 bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst);
+// This thread's latest failed file create, open or write: the system's error code (GetLastError, errno), 0 when none
+// failed since the last call, which clears it; and an error code's text.
+uint32_t    SysFileTakeLastError();
+std::string SysFileErrorText(uint32_t error);
 void SysFileRemoveReadonly(const std::filesystem::path& name);
 
 #endif /* KYTY_COMMON_PLATFORM_SYSFILEIO_H_ */

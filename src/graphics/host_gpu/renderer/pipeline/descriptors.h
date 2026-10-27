@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -77,6 +78,9 @@ IsSupportedSampledVideoOutView(const ShaderRecompiler::IR::ImageResource& resour
                                const ShaderTextureResource& descriptor, const Image& image);
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
                             const ShaderTextureResource& descriptor, uint64_t size, uint32_t levels = 0);
+[[nodiscard]] std::string StorageTextureReport(const ShaderRecompiler::IR::ImageResource& resource,
+                                               const ShaderTextureResource& descriptor, uint64_t size,
+                                               uint32_t levels = 0);
 
 } // namespace Libs::Graphics
 

@@ -33,6 +33,7 @@ import keys  # noqa: E402
 import materials  # noqa: E402
 import warmfile  # noqa: E402
 import xxh3  # noqa: E402
+from gamefs import game_path  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[3]
 GAME = Path.home() / 'Documents' / 'PPSA01341-app0'  # precompile-windows.ps1's default too
@@ -48,7 +49,7 @@ class Inventory:
     """Every shader of the game, by code bytes, with the headers it comes with."""
 
     def __init__(self, game):
-        self.game = Path(game)
+        self.game = game_path(game)
         self.headers = collections.defaultdict(list)  # code -> [agc]
         self.bundles = {}                              # bundle file -> [(code, agc)]
         self.failures = []
@@ -62,7 +63,13 @@ class Inventory:
             self.bundles[f] = parsed
             for code, header in parsed:
                 self._add(code, header)
-        self.embedded = agc.embedded_shaders(self.game)
+        try:
+            self.embedded = agc.embedded_shaders(self.game)
+        except (ValueError, agc.AgcError) as error:
+            # (The bundles' shaders still precompile: eboot.bin's own are left to the first frames that use them.)
+            self.embedded = []
+            self.failures.append(('eboot.bin', str(error)))
+            print(f'eboot.bin: {error}; its embedded shaders are not precompiled', file=sys.stderr)
         for shader in self.embedded:
             self._add(shader['code'], shader['agc'])
         self.materials = materials.techniques(self.game)
@@ -126,12 +133,19 @@ class Inventory:
         return [(s['code'], s['agc']) for s in self.embedded if s['agc']['type'] == agc.GS]
 
 
-def recorded_file(path=None):
+def game_id(game):
+    """The name of the game version's caches (PipelineCacheGameId in pipelineCache.cpp): <title>_<version>."""
+    param = json.loads((game_path(game) / 'sce_sys' / 'param.json').read_text(encoding='utf-8'))
+    return f"{param['titleId']}_{param['contentVersion']}"
+
+
+def recorded_file(path=None, game=GAME):
     if path:
         return Path(path)
-    files = sorted((REPO / '_PipelineCache' / 'warmup-v2').glob('*/PPSA01341.shaders'), key=lambda p: p.stat().st_mtime)
+    name = f'{game_id(game)}.shaders'
+    files = sorted((REPO / '_PipelineCache' / 'warmup-v2').glob(f'*/{name}'), key=lambda p: p.stat().st_mtime)
     if not files:
-        sys.exit('no recorded warmup cache under _PipelineCache/warmup-v2')
+        sys.exit(f'no recorded warmup cache {name} under _PipelineCache/warmup-v2')
     return files[-1]
 
 
@@ -151,7 +165,7 @@ def cmd_inventory(args):
 def cmd_check(args):
     """Static compile keys against every recorded record: the program-entry level of coverage."""
     inv = Inventory(args.game)
-    wf = warmfile.WarmFile(recorded_file(args.recorded)).load(verify_checksum=False)
+    wf = warmfile.WarmFile(recorded_file(args.recorded, args.game)).load(verify_checksum=False)
     records = wf.ok_records()
     vs_for_ps = collections.defaultdict(set)
     for p in wf.ok_pipelines():
@@ -171,7 +185,7 @@ def cmd_check(args):
                 if rec.stage == warmfile.ST_COMPUTE:
                     candidates.append(keys.compute_record(rec.code, header, HOST_SUBGROUP_SIZE))
                 elif rec.stage == warmfile.ST_VERTEX:
-                    candidates.append(keys.vertex_record(rec.code, header))
+                    candidates += keys.vertex_records(rec.code, header)
                 elif rec.stage == warmfile.ST_PIXEL:
                     for vs_index in vs_for_ps.get(rec.index, ()) or (None,):
                         vs_code = records[vs_index].code if vs_index is not None else None
@@ -220,7 +234,7 @@ def cmd_learn_states(args):
     """The states each material pass draws with (the engine's render-pass setup: targets, blending,
     depth and stencil), and those of the engine's own passes, learned from a recorded cache."""
     inv = Inventory(args.game)
-    wf = warmfile.WarmFile(recorded_file(args.recorded)).load(verify_checksum=False)
+    wf = warmfile.WarmFile(recorded_file(args.recorded, args.game)).load(verify_checksum=False)
     records = wf.records
     pass_of = collections.defaultdict(set)
     for vs_code, _, ps_code, _, pass_id, _ in inv.graphics_pairs():
@@ -242,7 +256,7 @@ def cmd_learn_states(args):
         words = _state_words(p)
         if words not in groups[group]:
             groups[group].append(words)
-    out = {'source': str(recorded_file(args.recorded)), 'groups': dict(sorted(groups.items()))}
+    out = {'source': str(recorded_file(args.recorded, args.game)), 'groups': dict(sorted(groups.items()))}
     STATES.write_text(json.dumps(out, separators=(',', ':')))
     print(f'{STATES.name}: ' + ', '.join(f'{g} {len(v)}' for g, v in out['groups'].items()))
 
@@ -307,14 +321,15 @@ def cmd_seeds(args):
             counts[f'pairs without states ({group})'] += 1
             return
         try:
-            vs = seeds.record(keys.vertex_record(vs_code, vs_agc))
+            vertex = [seeds.record(record) for record in keys.vertex_records(vs_code, vs_agc)]
             ps = seeds.record(keys.pixel_record(ps_code, ps_agc, vs_agc, args.lod_stats_subgroup))
         except ValueError:
             counts['pairs with unsupported inputs'] += 1
             return
-        for words in palette:
-            for variant in _culling_variants(words) if culling else [words]:
-                seeds.pipeline(_with_shaders(variant, vs, ps))
+        for vs in vertex:
+            for words in palette:
+                for variant in _culling_variants(words) if culling else [words]:
+                    seeds.pipeline(_with_shaders(variant, vs, ps))
 
     if 'gfx' in stages:
         done = set()
@@ -326,9 +341,10 @@ def cmd_seeds(args):
         for vs_code, vs_agc, ps_code, ps_agc in inv.engine_pairs():
             graphics(vs_code, vs_agc, ps_code, ps_agc, 'engine', culling=False)
         for vs_code, vs_agc in inv.vertex_only():
-            vs = seeds.record(keys.vertex_record(vs_code, vs_agc))
-            for words in states.get('vertex-only', []):
-                seeds.pipeline(_with_shaders(words, vs, warmfile.NO_SHADER))
+            for record in keys.vertex_records(vs_code, vs_agc):
+                vs = seeds.record(record)
+                for words in states.get('vertex-only', []):
+                    seeds.pipeline(_with_shaders(words, vs, warmfile.NO_SHADER))
 
     if args.limit:
         # A smoke test: the first programs and the pipelines that only use them.
@@ -379,7 +395,7 @@ def _differences(rec, other):
 def cmd_recorded_seeds(args):
     """A recorded warmup cache as a seed file (records keep their specialization): compiled the same way,
     it gives the SPIR-V the game's own permutations translate to, for `coverage --recorded-compiled`."""
-    raw = recorded_file(args.recorded).read_bytes()
+    raw = recorded_file(args.recorded, args.game).read_bytes()
     identity = raw[:raw.index(b'\n') + 1]
     if identity.startswith(b'KytyShaderWarmup4:'):
         seed_identity = SEED_IDENTITY.replace(b'KytyShaderSeeds2:', b'KytyShaderSeeds3:', 1)
@@ -438,7 +454,7 @@ def cmd_coverage(args):
     if args.recorded_compiled:
         _spirv_coverage(args.compiled, args.recorded_compiled)
         return
-    recorded = warmfile.WarmFile(recorded_file(args.recorded)).load(verify_checksum=False)
+    recorded = warmfile.WarmFile(recorded_file(args.recorded, args.game)).load(verify_checksum=False)
     compiled = warmfile.WarmFile(Path(args.compiled)).load(verify_checksum=False)
     by_entry = collections.defaultdict(list)
     exact = set()

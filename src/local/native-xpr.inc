@@ -36,37 +36,38 @@
 
 extern "C" {
 // 0 off, 1 native XPR draws, 2 verification.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_mode {1};
 // Negative controls for the offline replay only: bit 0 zeroes the vertex
 // stage's flattened SRT in the upload, bit 1 skips the draw call.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_debug {0};
 // 1: objects are drawn in last frame's order, so the record that followed this
 // one last frame is prefetched while this draw runs.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_predict_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_predict_mode {1};
 // 1: native image proofs check the image's own registration (see NativeXprValidateResources).
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_image_proof_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_image_proof_mode {1};
 // 1: a store whose pipeline variant is not compiled yet hands it to the compile workers and
 // is skipped; the draw takes the normal path until a later store finds the variant ready.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_xpr_pipelines_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_xpr_pipelines_mode {1};
 // 1: relocation. Objects whose user data points at a new copy of the same tables every frame (a ring)
 // had keys new every frame, so no record; the pointer words (user data pairs the SRT reads through and
 // uses for nothing else) leave the key, and the record reads the same offsets from the new base.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_relocate_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_relocate_mode {1};
 // N > 0: at most N store requests a frame. Walking brings hundreds of meshes and LODs
 // into view at once; storing them all in one frame (about 16 us each) made it a hitch. The others ask again
 // in later frames (their draws take the normal path until then).
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_store_budget {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_store_budget {256};
 // N > 2: records stay N frames unused (2 before: a turn of the camera dropped every record behind it, and
 // turning back stored them all again within the store budget, thousands of normal draws a frame for seconds).
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_keep_frames {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_keep_frames {600};
 // 1: a relocated key holds the object's descriptor bases (read through the draw's pointers) before its use in
 // the frame: the instances of one mesh keep their records when the frame draws them in another order (a culled
 // instance shifted every later use onto another instance's record, which rebound its descriptors).
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_instance_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_instance_mode {1};
 // 1: table draws (src/local/table-xpr.inc) for the pairs that allow them.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_xpr_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_xpr_mode {2};
 // 1: table dispatches (src/local/table-xpr.inc) for the compute shaders that allow them.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_dispatch_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_dispatch_mode {1};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_indirect_mode {1};
 // Diagnostic shader selection only: rejected dispatches execute normally.
 // Each bit selects one bucket of the folded stable shader hash. All on by
 // default; an optional exact hash further restricts the selected buckets.
@@ -75,8 +76,27 @@ extern "C" {
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_dispatch_hash_hi {0};
 // N > 0: at most N table store requests a frame (each takes its draw to the normal path; the others draw from native
 // records meanwhile). A new area brings hundreds of pairs whose programs and pipelines compile in the background.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_store_budget {32};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_store_budget {0};
+// 1: a table set's image uses proven once are checked again only when their image or the registrations over their
+// pages changed (TableValidateSet); 2: all of them checked, those a proof held for that failed counted.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_set_proofs {1};
+// Table lookups that ask the last answer first (bits): 1 the pair cache's 4096 entries (else 256), 2 the pair's variant
+// found last, 4 the pair's image set before the last (TableTry, TableSet).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_mru {7};
+// 1: NativeXprStateKey hashes the context and the user configuration again only after a change of their registers;
+// 0: at every call; 2: as 1, each key checked against the full hash (STATE-KEY MISMATCH lines, counter
+// shortcut_mismatches).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_state_key_cache {1};
+// 1: NativeXprTargetsCurrent looks up no target slot while no image was erased, and proves the targets from the
+// registration log over their span; 0: every target looked up and proven again after each resolution epoch move; 2: as
+// 1, each shortcut checked against the full lookups (TARGETS-SHORTCUT MISMATCH lines, counter shortcut_mismatches).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_targets_shortcut {1};
 }
+// Keys that are XXH3 hashes already: their own bucket index (std::hash<uint64_t> is FNV-1a over the bytes on MSVC).
+struct HashedKey {
+	[[nodiscard]] size_t operator()(uint64_t key) const noexcept { return static_cast<size_t>(key); }
+};
+
 namespace {
 // word_patch value of a logged word whose change reaches nothing the evaluation produces.
 constexpr int32_t NativeXprIgnore = -2;
@@ -155,8 +175,9 @@ void NativeXprPrefetch(const std::vector<T>& values) {
 // The reader ReadShaderRawGuestMemory uses for every SRT word.
 uint32_t NativeXprReadGuestWord(uint64_t address) {
 	uint32_t value = 0;
-	if (!Libs::LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, &value, sizeof(value)))
+	if (!Libs::LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, &value, sizeof(value))) {
 		std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+	}
 	return value;
 }
 
@@ -198,7 +219,8 @@ struct RenderExecutor::NativeXprDrawState {
 	RenderState                      first_rendering; // as the stored draw began it
 	std::vector<Target>              targets;
 	LocalDrawRecording::DynamicState dynamic;
-	uint64_t                         dynamic_hash = 0;
+	uint64_t                         dynamic_hash = 0; // of the dynamic state's bytes: two states compare it first
+	ResolvedDynamicState             resolved;         // the dynamic state's Vulkan values (once, at capture)
 	// Metadata epoch under which no target had a pending fast clear.
 	mutable uint64_t                 meta_epoch = 0;
 	// Texture cache resolution epoch under which the targets were what a lookup finds (0: not yet).
@@ -207,6 +229,15 @@ struct RenderExecutor::NativeXprDrawState {
 	mutable uint64_t                 targets_checked = 0;
 	// Only registered targets participate in the texture cache's lifetime epoch.
 	bool                             targets_registered = true;
+	// TextureCache::EraseEpoch then, and the memory from the lowest target's first byte to the highest's (0, 0: not yet).
+	mutable uint64_t                 targets_erased = 0, targets_span_begin = 0, targets_span_end = 0;
+	// TextureCache::ImagesEpoch after the last table draw emitted the targets (UINT64_MAX: none): they stay in place
+	// while it does not move (RenderExecutor::TableDraw).
+	mutable uint64_t                 emitted_epoch = UINT64_MAX;
+	// The frame a draw last used it (NativeXprCollect lets one go that none used for NativeXprCache::StateKeepFrames).
+	mutable uint64_t                 used_frame = 0;
+	void Use(uint64_t frame) const { std::atomic_ref<uint64_t>(used_frame).store(frame, std::memory_order_relaxed); }
+	[[nodiscard]] uint64_t UsedFrame() const { return std::atomic_ref<uint64_t>(used_frame).load(std::memory_order_relaxed); }
 };
 
 // One object: its resources under the compiled programs it was translated with.
@@ -295,6 +326,8 @@ struct RenderExecutor::NativeXprRecord {
 	vk::DescriptorSet     set    = nullptr;
 	vk::DescriptorPool    pool   = nullptr;
 	vk::Buffer            upload = nullptr; // ring the dynamic bindings point into
+	// BufferCache::BdaTableGeneration when the sets got the BDA page table: the record goes once the table grew.
+	uint64_t              bda_generation = 0;
 	std::array<Stage, 2>  stages;
 	uint32_t              stage_count = 1;
 	vk::ShaderStageFlags  push_stages;
@@ -499,7 +532,7 @@ void NativeXprPrefetchArrays(const Record& record) {
 
 struct RenderExecutor::NativeXprCache {
 	vk::Device                                                        device;
-	std::unordered_map<uint64_t, std::unique_ptr<NativeXprRecord>>    records;
+	std::unordered_map<uint64_t, std::unique_ptr<NativeXprRecord>, HashedKey> records;
 	// Past this many records the sweep keeps only recently used ones (NativeXprCollect); at
 	// RecordsHardCap a store drops them all (NativeXprStore).
 	static constexpr size_t RecordsSoftCap = 49152, RecordsHardCap = 65536;
@@ -563,10 +596,10 @@ struct RenderExecutor::NativeXprCache {
 		index[at] = {};
 		--index_count;
 	}
-	std::unordered_map<uint64_t, std::unique_ptr<NativeXprDrawState>> states;
+	std::unordered_map<uint64_t, std::unique_ptr<NativeXprDrawState>, HashedKey> states;
 	// Invalidated records: their sets retire once the GPU passed retire_tick;
 	// their logged reads stay for learning until the key is stored again.
-	std::unordered_map<uint64_t, std::unique_ptr<NativeXprRecord>> stale;
+	std::unordered_map<uint64_t, std::unique_ptr<NativeXprRecord>, HashedKey> stale;
 	struct RetiredSet {
 		vk::DescriptorPool pool;
 		vk::DescriptorSet  set;
@@ -616,6 +649,11 @@ struct RenderExecutor::NativeXprCache {
 		const PipelineCache::Pipeline* pipeline   = nullptr;
 		uint64_t                       index_base = 0, index_bytes = 0;
 		vk::IndexType                  index_type = vk::IndexType::eUint16;
+		// The dynamic state the emissions recorded into `command` (valid in the same command and generation, when
+		// `dynamic_held`): another state records only the values that differ (NativeXprEmitDynamic).
+		ResolvedDynamicState           dynamic {};
+		vk::ImageAspectFlags           feedback {};
+		bool                           dynamic_held = false, feedback_held = false;
 	} emit;
 	// Programs the SRT trace cannot cover (no single linear plan): never retried.
 	std::unordered_set<const ShaderRecompiler::IR::CompiledShaderInfo*> untraceable;
@@ -643,7 +681,7 @@ struct RenderExecutor::NativeXprCache {
 		std::vector<Identity> identity;
 		bool                  identity_known = false;
 	};
-	std::unordered_map<uint64_t, PairStats> pairs;
+	std::unordered_map<uint64_t, PairStats, HashedKey> pairs;
 	// Keys that missed, with the frame of their latest miss. A record pays off only
 	// when its key comes again, so it is stored at the second sighting within the
 	// frames a record outlives unused: keys new every frame (user data pointing at
@@ -749,6 +787,12 @@ struct RenderExecutor::NativeXprCache {
 	std::vector<uint32_t> use_key;
 	size_t                suffix_at = 0; // where the words the try added start (tried_suffix)
 	uint64_t                                swept_frame = UINT64_MAX;
+	// Draw states leave when no draw used them for StateKeepFrames (NativeXprCollect: every StateSweepFrames, past
+	// StatesKept): their keys hold the render targets' addresses, and entering an area made a few thousand that were
+	// never used again (~3 KB each, ~25 MB a world change with what they hold).
+	static constexpr uint64_t StateSweepFrames = 600, StateKeepFrames = 3600;
+	static constexpr size_t   StatesKept       = 2048;
+	uint64_t                  states_swept_frame = UINT64_MAX;
 	// Draw-state key of the latest draw (native or normal), for clean draws.
 	uint64_t state_key       = 0;
 	bool     state_key_valid = false;
@@ -831,13 +875,48 @@ void RenderExecutor::NativeXprKey(CommandBuffer& buffer, std::vector<uint32_t>& 
 // Draw-state identity: the whole graphics context, the user configuration and
 // the graphics shader stage registers with the user-data layout (types and
 // counts) but not the user-data values, which identify the object instead.
+// The context (KBs) and the user configuration are hashed again only after the draw state observer saw a register of
+// theirs change (DrawStateObserver::Shadow::key_changes; the observer sees every packet this thread runs): the draws
+// that change state mostly change the shaders only. (Hashing both at every such draw was ~1.3% of the render thread at
+// Latria standing, ~2000 a frame.) The same key as hashing all of it.
 uint64_t RenderExecutor::NativeXprStateKey(CommandBuffer& buffer) const {
 	const auto& ctx = buffer.GetRegisters();
 	const auto& cfg = buffer.GetUserConfig();
 	const auto& vs  = buffer.GetShaders().GetVs();
 	const auto& ps  = buffer.GetShaders().GetPs();
-	auto hash = XXH3_64bits(&ctx, sizeof(ctx));
-	hash      = XXH3_64bits_withSeed(&cfg, sizeof(cfg), hash);
+	struct Held {
+		const void* ctx = nullptr;
+		const void* cfg = nullptr;
+		uint64_t    ctx_hash = 0, cfg_hash = 0;
+	};
+	thread_local Held held;
+	auto&      shadow  = DrawStateObserver::g_shadow;
+	const auto changes = std::exchange(shadow.key_changes, 0u);
+	const auto mode    = kyty_local_state_key_cache.load(std::memory_order_relaxed);
+	if (mode == 0) held = {};
+	if (held.ctx != &ctx || (changes & 1u) != 0) {
+		held.ctx      = &ctx;
+		held.ctx_hash = XXH3_64bits(&ctx, sizeof(ctx));
+		held.cfg      = nullptr; // (its hash starts from the context's)
+	}
+	if (held.cfg != &cfg || (changes & 4u) != 0) {
+		held.cfg      = &cfg;
+		held.cfg_hash = XXH3_64bits_withSeed(&cfg, sizeof(cfg), held.ctx_hash);
+	}
+	if (mode == 2) {
+		// (Verification: the context and the configuration hashed in full.)
+		if (const auto full = XXH3_64bits_withSeed(&cfg, sizeof(cfg), XXH3_64bits(&ctx, sizeof(ctx)));
+		    full != held.cfg_hash) {
+			static std::atomic<uint32_t> reports {0};
+			LiveCounters::Add(LiveCounters::ShortcutMismatches);
+			if (reports.fetch_add(1, std::memory_order_relaxed) < 32)
+				std::printf("STATE-KEY MISMATCH: changes %u, context %s\n", changes,
+				            held.ctx_hash == XXH3_64bits(&ctx, sizeof(ctx)) ? "same (configuration differs)" : "differs");
+			held.ctx_hash = XXH3_64bits(&ctx, sizeof(ctx));
+			held.cfg_hash = full;
+		}
+	}
+	auto hash = held.cfg_hash;
 	hash      = XXH3_64bits_withSeed(&vs.es_regs, sizeof(vs.es_regs), hash);
 	hash      = XXH3_64bits_withSeed(&vs.ls_regs, sizeof(vs.ls_regs), hash);
 	hash      = XXH3_64bits_withSeed(&vs.hs_regs, sizeof(vs.hs_regs), hash);
@@ -947,6 +1026,25 @@ void RenderExecutor::NativeXprRetire(std::unique_ptr<NativeXprRecord> record, bo
 	cache.stale[hash] = std::move(record);
 }
 
+// The draw states no draw used for StateKeepFrames leave. What holds one by its address forgets it: this executor's
+// emission and lookup, its table's last draw and its image sets' transits.
+void RenderExecutor::NativeXprSweepStates(NativeXprCache& cache, uint64_t frame) {
+	if (cache.states.size() <= NativeXprCache::StatesKept) return;
+	const size_t before = cache.states.size();
+	std::erase_if(cache.states, [&](const auto& item) {
+		return item.second->UsedFrame() + NativeXprCache::StateKeepFrames < frame;
+	});
+	if (cache.states.size() == before) return;
+	cache.emit           = {};
+	cache.last_state     = nullptr;
+	cache.last_state_key = 0;
+	m_native_xpr_verify  = {};
+	TableForgetStates();
+	if (SlowLog::HitchThreshold() > 0.0)
+		std::printf("[tsc %llu] XPR draw states %zu -> %zu\n", static_cast<unsigned long long>(__rdtsc()), before,
+		            cache.states.size());
+}
+
 // Once per frame: the retired sets the GPU is done with are kept for reuse or freed, one call per
 // pool.
 void RenderExecutor::NativeXprCollect() {
@@ -980,6 +1078,10 @@ void RenderExecutor::NativeXprCollect() {
 			NativeXprRetire(std::move(it->second), false);
 			it = cache.records.erase(it);
 		}
+	}
+	if (frame - cache.states_swept_frame >= NativeXprCache::StateSweepFrames) {
+		cache.states_swept_frame = frame;
+		NativeXprSweepStates(cache, frame);
 	}
 	if (cache.collected_frame == frame || cache.retired.empty()) return;
 	cache.collected_frame = frame;
@@ -1185,6 +1287,7 @@ const char* RenderExecutor::NativeXprBindResources(NativeXprRecord& record,
 		EXIT_IF(value == nullptr);
 		return {value->Handle(), 0, value->Size()};
 	};
+	record.bda_generation = BufferCache::BdaTableGeneration(); // (read before the table: BufferCache::GrowBdaTable)
 	const auto upload = buffers.GetShaderUploadBuffer().Handle();
 	std::array<NativeXprRecord::Stage, 2> data;
 	std::array<std::vector<std::vector<std::pair<uint32_t, uint32_t>>>, 2> positions;
@@ -1353,7 +1456,7 @@ bool RenderExecutor::NativeXprSwitchVariant(NativeXprRecord& record, uint64_t si
 	auto& textures = m_context.GetTextureCache();
 	for (const auto& dep: found->images) {
 		const auto* image = textures.m_slot_images.try_get(dep.id);
-		if (image == nullptr || image->serial != dep.serial || image->IsCpuDirty() ||
+		if (image == nullptr || image->serial != dep.serial || TextureCache::RefreshPending(*image, dep.desc) ||
 		    !textures.IsSampledImageCurrent(dep.id, dep.desc)) {
 			NativeXprRetireSet(found->pool, found->set);
 			record.variants.erase(found);
@@ -1612,6 +1715,27 @@ bool RenderExecutor::NativeXprRebind(NativeXprRecord&                           
 	                                    true) == nullptr;
 }
 
+// A draw state's dynamic state into `vk_buffer`: all of it in another command buffer or generation (what any other
+// path recorded is unknown), else the values that differ from what the table and native emissions recorded there.
+// (A state change recorded all ~13 values, most unchanged: ~2% of the GPU thread on the 1-1 walk, 0.8% now.)
+void RenderExecutor::NativeXprEmitDynamic(NativeXprCache& cache, vk::CommandBuffer vk_buffer,
+                                          const NativeXprDrawState& draw_state, bool same_command) {
+	auto&      emit = cache.emit;
+	const bool diff = same_command && emit.dynamic_held;
+	if (!diff) emit.dynamic = draw_state.resolved;
+	EmitGraphicsDynamicParams(vk_buffer, draw_state.resolved, diff ? &emit.dynamic : nullptr, VULKAN_HPP_DEFAULT_DISPATCHER);
+	emit.dynamic_held = true;
+	const auto& state = draw_state.dynamic;
+	if (state.feedback_enabled) {
+		if (!diff || !emit.feedback_held || emit.feedback != state.feedback_aspects)
+			vk_buffer.setAttachmentFeedbackLoopEnableEXT(state.feedback_aspects);
+		emit.feedback      = state.feedback_aspects;
+		emit.feedback_held = true;
+	} else if (!diff) {
+		emit.feedback_held = false;
+	}
+}
+
 // The draw state under `state_key`: the render targets as this draw left them (a reopened rendering loads),
 // their layouts and the dynamic state.
 void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRenderState& state,
@@ -1657,6 +1781,9 @@ void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRend
 	    rendering.depth_stencil_attachment.image_layout == vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
 	        ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eDepth}
 	        : vk::ImageAspectFlags {});
+	draw_state.resolved     = ResolveGraphicsDynamicParams(draw_state.dynamic.buffer, draw_state.dynamic.indexed_viewports,
+	                                                       draw_state.dynamic.colors, draw_state.dynamic.color_count,
+	                                                       draw_state.dynamic.depth);
 	// Entries stay at their address (emission tracking compares pointers); a
 	// replaced state must be emitted again.
 	auto& slot = cache.states[state_key];
@@ -1665,6 +1792,7 @@ void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRend
 	// Hash the final stored representation. The full byte comparison below
 	// still decides equality; a hash collision cannot suppress state updates.
 	slot->dynamic_hash = XXH3_64bits(&slot->dynamic, sizeof(slot->dynamic));
+	slot->Use(m_context.FrameNumber());
 	if (cache.emit.state == slot.get()) cache.emit.state = nullptr;
 }
 
@@ -2668,6 +2796,7 @@ bool RenderExecutor::NativeXprReevaluate(NativeXprRecord& record) {
 
 // Once per frame: is the record's content still what a fresh translation gives?
 bool RenderExecutor::NativeXprValidate(NativeXprRecord& record, uint64_t frame) {
+	if (record.bda_generation != BufferCache::BdaTableGeneration()) return false; // (the page table grew since)
 	auto& cache     = *m_native_xpr;
 	auto& resources = m_context.GetGpuResources();
 	// A guest mapping change forces the buffer and image proofs below; the words
@@ -2824,7 +2953,7 @@ bool RenderExecutor::NativeXprValidateResources(NativeXprRecord& record, uint64_
 		if (buffers_clean && !images_clean) {
 			images_clean = std::ranges::none_of(record.images, [&](const auto& dep) {
 				const auto* image = textures.m_slot_images.try_get(dep.id);
-				return image == nullptr || image->serial != dep.serial || image->IsCpuDirty();
+				return image == nullptr || image->serial != dep.serial || TextureCache::RefreshPending(*image, dep.desc);
 			});
 			if (images_clean) record.image_dirty_epoch = image_epoch;
 		}
@@ -2897,11 +3026,12 @@ bool RenderExecutor::NativeXprValidateResources(NativeXprRecord& record, uint64_
 		if (image == nullptr || image->serial != dep.serial) return rebind();
 		// The guest rewrote it (a texture streaming in): upload it as the normal path's FindTexture does,
 		// instead of dropping the record and storing it again.
-		if (image->IsCpuDirty()) {
+		if (TextureCache::RefreshPending(*image, dep.desc)) {
 			if (!image->registered || image->depth_id || image->binding.needs_rebind) return false;
 			(void)textures.FindTexture(dep.id, dep.desc);
 			image = textures.m_slot_images.try_get(dep.id);
-			if (image == nullptr || image->serial != dep.serial || image->IsCpuDirty()) return false;
+			if (image == nullptr || image->serial != dep.serial || TextureCache::RefreshPending(*image, dep.desc))
+				return false;
 		}
 		if (registrations_moved) {
 			if (per_image && image->registered && image->registrations == dep.registration &&
@@ -2948,7 +3078,9 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 	draw_state.meta_epoch = meta_epoch;
 	for (const auto& target: draw_state.targets) {
 		auto& image = textures.GetImage(target.id); // LRU, as acquisition does
-		if (image.backing.state.layout != target.layout)
+		// (The whole image's layout stands for its subresources while they share one state. Else (rendering to layer 0
+		// of four left the image's layout the target's, layers 1-3 sampled) the target's own subresources decide.)
+		if (image.CurrentState().layout != target.layout || !image.backing.subresource_states.empty())
 			image.Transit(target.layout, target.access, target.range, vk_buffer);
 	}
 	return true;
@@ -2958,8 +3090,13 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 // now), and a newer image with the same backing as a target is what the registers now select: the
 // normal path captures the state again.
 bool RenderExecutor::NativeXprTargetsCurrent(const NativeXprDrawState& draw_state) {
+	// KYTY_FG_HUDLESS: the game's composite into the flip image is drawn on the normal path (frame-gen-hudless.h).
+	if (FrameGen::HudlessCapturing())
+		for (const auto& target: draw_state.targets)
+			if (FrameGen::IsFlipTarget(target.requested.data.address)) return false;
 	auto&      textures = m_context.GetTextureCache();
-	const auto mode = [] {
+	const auto checked = textures.ResolutionEpoch();
+	const auto local_mode = [] {
 		static const int value = [] {
 			const auto* text = std::getenv("KYTY_NATIVE_TARGET_CHECK_CACHE");
 			return text != nullptr && text[0] == '1' && text[1] == '\0' ? 1
@@ -2967,13 +3104,22 @@ bool RenderExecutor::NativeXprTargetsCurrent(const NativeXprDrawState& draw_stat
 		}();
 		return value;
 	}();
-	const auto checked = textures.ResolutionEpoch();
-	const bool cache_eligible = mode != 0 && checked != 0 && draw_state.targets_registered;
+	const auto shortcut_mode = kyty_local_targets_shortcut.load(std::memory_order_relaxed);
+	const auto erased        = textures.EraseEpoch();
+	const bool shortcut      = shortcut_mode != 0 && draw_state.targets_registered;
+	const bool cache_eligible = checked != 0 && draw_state.targets_registered;
 	const bool memo_hit = cache_eligible && draw_state.targets_checked == checked;
-	// RegisterImage and UnregisterImage advance the epoch before a registered slot
-	// can be retired or reused. EmitTargets still performs the live GPU-ownership,
-	// serial, rebind and metadata checks; these are not covered by this memo.
-	if (memo_hit && mode == 1) return true;
+	const auto mismatch = [&](const char* what) {
+		static std::atomic<uint32_t> reports {0};
+		LiveCounters::Add(LiveCounters::ShortcutMismatches);
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 32)
+			std::printf("TARGETS-SHORTCUT MISMATCH: %s\n", what);
+	};
+	// A local mode-1 memo is opt-in. The table shortcut is independently enabled by its
+	// switch; mode 2 keeps both sets of validation diagnostics active.
+	if (memo_hit && draw_state.targets_erased == erased && local_mode == 1 && shortcut_mode != 2) return true;
+	if (memo_hit && draw_state.targets_erased == erased && shortcut && shortcut_mode == 1 && local_mode != 2)
+		return true;
 	const auto full_check = [&] {
 		for (const auto& target: draw_state.targets) {
 			const auto* image = textures.m_slot_images.try_get(target.id);
@@ -2990,25 +3136,70 @@ bool RenderExecutor::NativeXprTargetsCurrent(const NativeXprDrawState& draw_stat
 		}
 		return true;
 	};
-	const bool current = full_check();
-	if (memo_hit && mode == 2 && !current) {
-		EXIT("KYTY_NATIVE_TARGET_CHECK_CACHE=2: memoized target-current result disagreed with full validation\n");
-	}
-	if (memo_hit && mode == 2) {
-		// Only the verification mode reports coverage; normal draws pay no logging cost.
-		static uint64_t verified_hits = 0;
-		if (++verified_hits == 1 || verified_hits % 65536 == 0) {
-			std::printf("Native target check cache: verified hits=%" PRIu64 "\n", verified_hits);
+	// (A live id is the same object: an erase moves its slot's generation. The local
+	// serial checks below also catch an unexpected replacement during full validation.)
+	if (local_mode == 2 || !shortcut || draw_state.targets_erased != erased || draw_state.targets_epoch == 0) {
+		if (!full_check()) {
+			if (memo_hit && local_mode == 2)
+				EXIT("KYTY_NATIVE_TARGET_CHECK_CACHE=2: memoized target-current result disagreed with full validation\n");
+			draw_state.targets_checked = 0;
+			return false;
+		}
+	} else if (shortcut_mode == 2) {
+		for (const auto& target: draw_state.targets) {
+			const auto* image = textures.m_slot_images.try_get(target.id);
+			if (image == nullptr || image->serial != target.serial) {
+				mismatch("an erased target with no erase since the last check");
+				draw_state.targets_checked = 0;
+				return false;
+			}
 		}
 	}
-	if (!current) {
-		draw_state.targets_checked = 0;
-		return false;
+	// No registration over the targets' span since they were proven (the log's): each target's first page saw none,
+	// as IsTargetCurrent would find. (The epoch moves a few times a frame somewhere; each state used after it read its
+	// targets and their pages' stamps, ~1% of the render thread at Latria.)
+	if (shortcut && draw_state.targets_epoch != 0 && draw_state.targets_epoch != textures.ResolutionEpoch()) {
+		if (draw_state.targets_span_end == 0 && !draw_state.targets.empty()) {
+			draw_state.targets_span_begin = UINT64_MAX;
+			for (const auto& target: draw_state.targets) {
+				draw_state.targets_span_begin = std::min(draw_state.targets_span_begin, target.requested.data.address);
+				draw_state.targets_span_end   = std::max(draw_state.targets_span_end, target.requested.data.address + 1);
+			}
+		}
+		bool known = false;
+		if (draw_state.targets_span_end > draw_state.targets_span_begin &&
+		    !textures.RegistrationsOverlapSince(draw_state.targets_span_begin,
+		                                        draw_state.targets_span_end - draw_state.targets_span_begin,
+		                                        draw_state.targets_epoch, known) &&
+		    known) {
+			if (shortcut_mode == 2 || local_mode == 2)
+				for (const auto& target: draw_state.targets) {
+					auto epoch = draw_state.targets_epoch;
+					if (!textures.IsTargetCurrent(target.id, target.requested, epoch)) {
+						mismatch("a target not current with no registration over the span since");
+						return false;
+					}
+				}
+			draw_state.targets_epoch = checked;
+		}
 	}
-	if (cache_eligible) {
-		const auto validated = textures.ResolutionEpoch();
-		draw_state.targets_checked = validated != 0 && draw_state.targets_epoch == validated ? validated : 0;
+	if (draw_state.targets_epoch != textures.ResolutionEpoch()) {
+		uint64_t proven = UINT64_MAX;
+		for (const auto& target: draw_state.targets) {
+			auto epoch = draw_state.targets_epoch;
+			if (!textures.IsTargetCurrent(target.id, target.requested, epoch)) return false;
+			proven = std::min(proven, epoch);
+		}
+		draw_state.targets_epoch = proven != UINT64_MAX ? proven : textures.ResolutionEpoch();
 	}
+	if (memo_hit && local_mode == 2) {
+		// Verification mode deliberately pays for the full local validation on memo hits.
+		static uint64_t verified_hits = 0;
+		if (++verified_hits == 1 || verified_hits % 65536 == 0)
+			std::printf("Native target check cache: verified hits=%" PRIu64 "\n", verified_hits);
+	}
+	draw_state.targets_erased  = erased;
+	draw_state.targets_checked = cache_eligible && draw_state.targets_epoch == textures.ResolutionEpoch() ? checked : 0;
 	return true;
 }
 
@@ -3116,14 +3307,9 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 		// Another draw state with the same dynamic state is bound already.
 		emit.state = &draw_state;
 	}
-	if (!same_command || emit.state != &draw_state) {
-		const auto& state = draw_state.dynamic;
-		SetGraphicsDynamicParamsImpl(state.buffer, vk_buffer, state.indexed_viewports, state.colors,
-		                             state.color_count, state.depth, VULKAN_HPP_DEFAULT_DISPATCHER);
-		if (state.feedback_enabled) vk_buffer.setAttachmentFeedbackLoopEnableEXT(state.feedback_aspects);
-	}
+	if (!same_command || emit.state != &draw_state) NativeXprEmitDynamic(cache, vk_buffer, draw_state, same_command);
 	if (!same_command || emit.pipeline != &pipeline) {
-		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, BindPipelineHandle(pipeline));
 	}
 	vk_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline.pipeline_layout, 0, 1,
 	                             &record.set, offset_count, offsets.data());
@@ -3148,6 +3334,7 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	emit.generation  = buffer.GraphicsGeneration();
 	emit.state       = &draw_state;
 	emit.pipeline    = &pipeline;
+	draw_state.Use(m_context.FrameNumber());
 	emit.index_base  = index_base;
 	emit.index_bytes = index_bytes;
 	emit.index_type  = index_type;
@@ -3170,7 +3357,7 @@ bool RenderExecutor::NativeXprDraw(CommandBuffer& buffer, const NativeXprDrawArg
 	auto& cache = *m_native_xpr;
 	m_context.GetCommandScheduler().PopPendingOperations();
 	m_context.GetCommandScheduler().FlushIfDrained();
-	Common::LockGuard lock(m_context.GetMutex());
+	RenderLockGuard lock(m_context.GetMutex());
 
 	NativeXprKey(buffer, cache.key);
 	const auto hash  = XXH3_64bits(cache.key.data(), cache.key.size() * sizeof(uint32_t));
@@ -3179,6 +3366,7 @@ bool RenderExecutor::NativeXprDraw(CommandBuffer& buffer, const NativeXprDrawArg
 		return false;
 	}
 	auto&      record    = *found->second;
+	if (record.bda_generation != BufferCache::BdaTableGeneration()) return false; // (NativeXprTry makes it again)
 	const auto state_key = NativeXprStateKey(buffer);
 	const auto state_it  = cache.states.find(state_key);
 	const auto pipeline_it =
@@ -3214,12 +3402,13 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 	};
 	// A changed state leaves no key behind, even when this try stops before computing it.
 	if (!clean) cache.state_key_valid = false;
+	const bool indexed = direct == nullptr || direct->indexed;
 	if (buffer.IsInvalid() || (direct == nullptr ? commands.empty() : !commands.empty()) || commands.size() > 64 ||
-	    index_base == 0 || index_bytes == 0)
+	    (indexed && (index_base == 0 || index_bytes == 0)))
 		return false;
 	m_context.GetCommandScheduler().PopPendingOperations();
 	m_context.GetCommandScheduler().FlushIfDrained();
-	Common::LockGuard lock(m_context.GetMutex());
+	RenderLockGuard lock(m_context.GetMutex());
 	NativeXprCollect();
 
 	if (!clean || !cache.state_key_valid) {
@@ -3230,7 +3419,10 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 		const auto table = TableTry(buffer, commands, index_base, index_bytes, index_type, direct);
 		if (table == TableResult::Drawn) return true;
 		if (table == TableResult::Store) return LiveCounters::Add(LiveCounters::TableStores), false;
+		if (table == TableResult::Deferred) return false;
 	}
+	// A draw of vertices is drawn only the table way.
+	if (!indexed) return false;
 	NativeXprKey(buffer, cache.key);
 	// Relocation: the pair's pointer words leave the key, and which use of the rest in the frame this
 	// is joins it.

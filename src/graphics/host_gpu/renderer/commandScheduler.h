@@ -7,9 +7,12 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <atomic>
+#include <array>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <mutex>
+#include <span>
 
 #include <queue>
 
@@ -33,11 +36,13 @@ public:
 	void           Finish();
 	// Finish a complete dispatch; may submit, but never waits for the GPU.
 	void           CompleteDispatch();
+	// Finish `draws` complete draws; may submit (KYTY_DRAW_BATCH), but never waits for the GPU.
+	void           CompleteDraws(uint32_t draws);
 	// KYTY_FLUSH_ON_DRAIN: at a draw or dispatch entry, submits what is recorded once the GPU has finished every
 	// earlier submission (never waits).
 	void           FlushIfDrained();
 	// KYTY_FLUSH_DEFER: a flush nothing waits on (CommandProcessor::BufferFlushDeferrable) stays open while the GPU
-	// has kyty_local_flush_defer_mode submissions to run; FlushDeferred submits it before the GPU thread waits.
+	// has the configured backlog to run; FlushDeferred submits it before the GPU thread waits.
 	void           DeferrableFlush();
 	void           FlushDeferred();
 	[[nodiscard]] bool FlushPending() const noexcept { return m_flush_deferred; }
@@ -56,14 +61,19 @@ public:
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
-	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
+	[[nodiscard]] bool Active() const noexcept;
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
-	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
+	// Upload dirty pages in a prologue that runs before the open command buffer.
+	[[nodiscard]] vk::CommandBuffer UploadPrologue(uint64_t last_dirty, uint64_t written_serial);
+	void SetPrologueHook(std::function<void(vk::CommandBuffer)> hook) { m_prologue_hook = std::move(hook); }
+	[[nodiscard]] uint64_t CommandSerial() const noexcept { return m_command_serial; }
+	[[nodiscard]] uint64_t         CurrentTick() const noexcept;
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
+	static constexpr size_t MaxSubmitEntries = 8;
 
 private:
 	class CommandPool {
@@ -94,8 +104,14 @@ private:
 		uint64_t                     tick = 0;
 	};
 
+	struct SubmitEntry {
+		vk::CommandBuffer buffer         = nullptr;
+		uint32_t          timestamp_slot = UINT32_MAX;
+	};
+
 	struct SubmitJob {
-		vk::CommandBuffer buffer = nullptr;
+		std::array<vk::CommandBuffer, MaxSubmitEntries> buffers {};
+		uint32_t                                        buffer_count = 0;
 		SubmitInfo submit;
 		uint64_t tick = 0;
 		uint64_t upload_sequence = 0;
@@ -108,13 +124,17 @@ private:
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
+	uint64_t SubmitBuffers(std::span<const SubmitEntry> entries, SubmitInfo submit);
+	[[nodiscard]] SubmitEntry ClosePrologue();
+	[[nodiscard]] bool GpuBusy();
+	[[nodiscard]] bool BacklogAtLeast(uint64_t count);
 	void QueueSubmit(const SubmitJob& job);
 	void SubmitThread(std::stop_token stop);
 	void StopSubmitThread();
 	// A deferred flush done once the GPU is down to its last submission, asked every 16 units of `weight`
 	// (DeferrableFlush).
 	[[nodiscard]] bool     FlushedDeferred(uint32_t weight);
-	[[nodiscard]] uint64_t Backlog();
+	std::function<void(vk::CommandBuffer)> m_prologue_hook;
 
 	MasterSemaphore              m_master;
 	uint64_t                     m_last_pending_refresh = 0;
@@ -122,7 +142,11 @@ private:
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
+	CommandBuffer                m_prologue;
+	uint64_t                     m_command_clock  = 0;
+	uint64_t                     m_command_serial = 1;
 	uint32_t                     m_recorded_dispatches = 0;
+		uint32_t                     m_recorded_draws      = 0;
 	// KYTY_FLUSH_ON_DRAIN: draw and dispatch entries since the last submission, and the last drain check (QPC).
 	uint32_t                     m_drain_entries       = 0;
 	uint64_t                     m_last_drain_check    = 0;
@@ -136,6 +160,8 @@ private:
 	// Count of live entries in m_pending_operations, updated under
 	// m_operation_mutex and read lock-free as a "nothing to retire" hint.
 	std::atomic<uint32_t> m_pending_operation_count {0};
+	// The tick of m_pending_operations' oldest entry (UINT64_MAX: none), published with the count.
+	std::atomic<uint64_t> m_pending_front_tick {UINT64_MAX};
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;

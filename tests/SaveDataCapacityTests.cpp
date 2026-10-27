@@ -27,7 +27,16 @@ int main() {
 	std::filesystem::resize_file(data / "payload", 65536 * 100);
 	value = ReadSaveDataCapacity(data, meta);
 	Check(value->blocks == 100 && value->free_blocks == 0);
+	// Unreadable bookkeeping (text, or the zeros a power cut leaves) counts as none: the save still mounts.
 	std::ofstream(meta, std::ios::trunc) << "invalid";
-	Check(!ReadSaveDataCapacity(data, meta));
+	value = ReadSaveDataCapacity(data, meta);
+	Check(value && value->blocks == 100 && value->free_blocks == 0);
+	{
+		std::ofstream zeros(meta, std::ios::binary | std::ios::trunc);
+		zeros.write("\0\0\0\0", 4);
+	}
+	std::filesystem::resize_file(data / "payload", 1);
+	value = ReadSaveDataCapacity(data, meta);
+	Check(value && value->blocks == 48 && value->free_blocks == 47);
 	std::filesystem::remove_all(root);
 }

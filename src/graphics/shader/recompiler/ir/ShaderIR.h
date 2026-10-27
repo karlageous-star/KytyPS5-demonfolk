@@ -117,10 +117,12 @@ constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
 struct ImageResource {
 	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
-	// indirect_search_iterations of a portable table (PortableShaders): the search runs until its
+	// indirect_search_iterations of a portable table: the search runs until its
 	// range is empty, and indirect_mapping_offset names the flattened-SRT word that holds the
 	// offset of the key mapping.
 	static constexpr uint32_t RuntimeIndirectSearch = UINT32_MAX;
+	// max_array_index when no bound of an array image's layer coordinate was shown.
+	static constexpr uint32_t NoArrayIndexBound = UINT32_MAX;
 
 	uint32_t                      source            = 0;
 	uint32_t                      first_use_pc      = 0;
@@ -143,6 +145,10 @@ struct ImageResource {
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
+	// A sampled array image's largest layer the shader can read, counted from the view's base layer (ResourceTracking:
+	// every sample and gather of it takes its layer coordinate from values of a known range). Its view needs no layer
+	// past it (descriptors.cpp TextureViewInfo).
+	uint32_t                      max_array_index = NoArrayIndexBound;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;
@@ -420,11 +426,10 @@ struct BufferWord {
 	static constexpr uint32_t PackedLayouts = 12;
 };
 
-// Portable shader modules (KYTY_PORTABLE_SHADERS, default on; read once, fixed for the process):
-// what a module could only get from the descriptors the game binds at run time (a buffer's stride
-// and format, a null texture's type) no longer selects one, so the modules of a program can be
-// compiled ahead from the game files (tools/local/static-precompile). Buffers take those values
-// from their buffer words (BufferWord) in the shader data.
+// Portable shader modules (KYTY_PORTABLE_SHADERS, default on; read once, fixed for the process): what a module could
+// only get from descriptors the game binds at run time (a buffer's stride and format, a null texture's type) no longer
+// selects one, so the modules of a program can be compiled ahead from game files (tools/local/static-precompile).
+// Buffers take those values from their buffer words (BufferWord) in shader data.
 bool PortableShaders();
 bool PortableFeature(std::string_view feature); // KYTY_PORTABLE_DISABLE
 
@@ -562,25 +567,35 @@ struct ResourceBlock {
 
 // Table mode (Program::table_mode): the flattened SRT's slots, the V#s of the buffers the shader reads by device
 // address, and the T#s and S#s of its images and samplers. Slot s holds the dword at
-// ((high:low) & 0xffff'ffff'ffff) + (offset & ~3) + immediate, dword aligned; a descriptor is its words. An
-// operand is an immediate, a user data register or a lower slot. For each draw the renderer evaluates the slots
+// ((high:low) & 0xffff'ffff'ffff) + (offset & ~3) + immediate, dword aligned; a bounded slot is read through a V#
+// whose high and `records` are words 1 and 2, and reads past its range (NUM_RECORDS bytes or NUM_RECORDS times the
+// stride) fail evaluation as on the normal path. A descriptor is its words. An
+// operand is an immediate, a user data register, a lower slot or a shader-base address dword. For each draw the
+// renderer evaluates the slots
 // `cpu` marks (those the shader reads, `gpu`, the image and sampler words, which choose its descriptor set, and
 // what their addresses are read through) as the guest memory holds them then, and gives the shader a block: dword s
 // is slot s; from BufferDword(i), buffer i's device address (two dwords), size in dwords (0: none), buffer word
 // and stride, resolved from its V#. The shader reads the block through its device address (TableBlockDword).
 struct TablePlan {
 	struct Operand {
-		enum class Kind : uint8_t { Immediate, UserData, Slot };
+		// ShaderBaseLow/High: the low or high dword of the stage's code address plus `value` (a V# of constants the code
+		// embeds, addressed from s_getpc_b64; the renderer has the address from the registers).
+		enum class Kind : uint8_t { Immediate, UserData, Slot, ShaderBaseLow, ShaderBaseHigh };
 		Kind     kind  = Kind::Immediate;
-		uint32_t value = 0; // the immediate, the scalar register or the slot
+		uint32_t value = 0; // the immediate, the scalar register, the slot or the offset from the code address
+		bool     operator==(const Operand&) const = default;
 	};
 	struct Slot {
 		Operand low, high, offset;
 		int32_t immediate = 0; // dword aligned
+		Operand records;       // a bounded slot's V# word 2
+		bool    bounded = false;
+		bool    operator==(const Slot&) const = default;
 	};
 	struct Descriptor {
 		std::array<Operand, 8> words {};
 		uint32_t               count = 0;
+		bool                   operator==(const Descriptor&) const = default;
 	};
 	std::vector<Slot>                   slots;
 	std::vector<std::array<Operand, 4>> buffers;
@@ -589,6 +604,27 @@ struct TablePlan {
 	// Flat or global memory reads: the renderer readies their page table ranges at every use, from the block's slots
 	// and the user data (CompiledShaderInfo::bda_read_plan), as the normal path's PrepareBdaBindings does.
 	bool global_memory = false;
+	// Reads at offsets no slot fixes (a light's record by the index of its bit in a mask): loads by device address,
+	// through the page table, whose ranges the read plan readies (global_memory).
+	bool dynamic_reads = false;
+	// An image an address probe chooses (DescriptorSource::IndirectImage: records whose keys name T#s in a table, the
+	// key the shader's of one record): the renderer enumerates its candidates at every use as resource
+	// materialization does (EnumerateAddressProbe), binds them at the root's and its candidates' elements in an order
+	// of its own and writes the key mapping into the block at `mapping` ([count, (key, candidate)...] by key), which
+	// the shader searches (the root's indirect_mapping_offset: that block dword).
+	struct IndirectImage {
+		uint32_t                        root = 0; // the image whose indirect_resources are its elements
+		DescriptorSource::IndirectImage probe;
+		Operand                         records_low, records_high, heap_low, heap_high; // the tables' addresses
+		uint32_t                        mapping = 0;
+		bool                            operator==(const IndirectImage&) const = default;
+	};
+	// A table program's indirect image has this many elements (the root and its candidates: a draw or dispatch
+	// with fewer candidates binds null images past them), and its mapping room for this many keys.
+	static constexpr uint32_t IndirectCapacity      = 16;
+	static constexpr uint32_t IndirectMaxKeys       = 64;
+	static constexpr uint32_t IndirectMappingDwords = 1 + 2 * IndirectMaxKeys;
+	std::vector<IndirectImage> indirect;
 
 	// A buffer's dwords in the block: its device address (2), size in dwords, buffer word (IR::BufferWord, as
 	// IR::BufferDescriptorWord makes it) and stride, all from the V# the renderer resolved.
@@ -596,7 +632,10 @@ struct TablePlan {
 	[[nodiscard]] uint32_t BufferDword(size_t buffer) const {
 		return static_cast<uint32_t>(slots.size() + BufferDwords * buffer);
 	}
-	[[nodiscard]] uint32_t BlockDwords() const { return BufferDword(buffers.size()); }
+	[[nodiscard]] uint32_t BlockDwords() const {
+		return BufferDword(buffers.size()) + static_cast<uint32_t>(indirect.size()) * IndirectMappingDwords;
+	}
+	bool                   operator==(const TablePlan&) const = default;
 };
 
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
@@ -664,6 +703,14 @@ struct Program: ResourcePlan {
 	std::vector<std::unique_ptr<Block>> block_storage;
 	BlockList                           blocks;
 	uint32_t                      wave_size      = 64;
+	// A wave64 compute program whose lanes' results depend on no lane outside their 32-lane half
+	// (Frontend::IsWaveLaneLocal): a host with 32-wide subgroups runs it one GCN lane per invocation.
+	bool                          lane_local     = false;
+	// Its proof had a 64-thread group's two halves cooperate (Frontend::ProveWaveLaneLocal): these lane reads (pc)
+	// run wave-wide and these lane-mask branches (pc of the branch) are the wave's decision (IR::WaveFlags).
+	bool                          lane_cooperative = false;
+	std::vector<uint32_t>         cooperative_reads;
+	std::vector<uint32_t>         cooperative_branches;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
@@ -681,6 +728,11 @@ struct Program: ResourcePlan {
 	// page table at run time, user data from push constants; no flattened SRT, buffer or shader-data binding.
 	bool                          table_mode = false;
 	TablePlan                     table_plan;
+	// Table mode: each slot loaded where the shader reads it (Frontend::TranslatorFeatureTableSlotsAtUse), not all of
+	// them at the entry.
+	bool                          table_slots_at_use = false;
+	// Float min/max as host instructions (Frontend::TranslatorFeatureNativeFloatMinMax).
+	bool                          native_float_min_max = false;
 
 	std::optional<SpirvRequirements> spirv_requirements;
 };

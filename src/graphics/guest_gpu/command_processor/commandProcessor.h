@@ -85,6 +85,10 @@ public:
 	[[nodiscard]] uint32_t TryNativeXprDraws(std::span<const uint32_t> packets, bool clean);
 	// A DRAW_INDEX_2 / DRAW_INDEX_OFFSET_2 from a native record: the packet's dwords, or 0.
 	[[nodiscard]] uint32_t TryNativeDirectDraw(std::span<const uint32_t> packet);
+	// A DRAW_INDEX_AUTO of a triangle list or strip as a table draw: the packet's dwords, or 0.
+	[[nodiscard]] uint32_t TryNativeAutoDraw(std::span<const uint32_t> packet);
+	// A DRAW_INDEX_INDIRECT_MULTI of a count it holds, as that many DRAW_INDEX_INDIRECT: the packet's dwords, or 0.
+	[[nodiscard]] uint32_t TryNativeMultiDraw(std::span<const uint32_t> packet);
 	uint32_t TryDrawIndirectRun(std::span<const uint32_t> packets);
 	void DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
@@ -111,6 +115,8 @@ public:
 	                    uint32_t mode, uint64_t indirect_args = 0);
 	void DispatchIndirect(uint32_t data_offset, uint32_t mode);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
+	// An R_SUPER_RESOLUTION packet (graphics/guest_gpu/superResolution.h): the upscaler in place of Sony's.
+	void SuperResolution(const uint32_t* packet, uint32_t dwords);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 
 	void SetUserDataMarker(HW::UserSgprType type) { m_user_data_marker = type; }
@@ -186,7 +192,7 @@ private:
 	bool     m_ce_complete = false;
 
 	uint32_t m_const_ram[0x3000] = {0};
-	// All words at or above this limit remain zero between resets.
+	// Only [0, m_const_ram_used) may be nonzero; words at or above this limit remain zero between resets.
 	uint32_t m_const_ram_used = 0;
 
 	FlipInfo  m_flip;

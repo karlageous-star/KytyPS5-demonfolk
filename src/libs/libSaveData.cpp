@@ -9,13 +9,17 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/saveDataMountSlots.h"
+#include "libs/saveDataBackup.h"
 #include "libs/saveDataCapacity.h"
+#include "libs/saveDataInfo.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
 #include <cstring>
+#include <ctime>
 #include <deque>
+#include <fstream>
 #include <vector>
 
 namespace Libs {
@@ -300,6 +304,102 @@ static std::filesystem::path capacity_metadata(std::string_view name) {
 	       (std::string(name) + ".blocks");
 }
 
+// The texts and user parameter the game gave a slot (SaveDataSetParam), kept beside the capacity bookkeeping: the
+// system's save data list shows them (SaveDataDialog), and SaveDataGetParam and searches report them as the PS5 does.
+struct StoredParam {
+	char     title[128];
+	char     sub_title[128];
+	char     detail[1024];
+	uint32_t user_param;
+};
+
+static std::filesystem::path param_metadata(std::string_view name) {
+	return std::filesystem::path(SAVE_DATA_DIR) / ".kyty-param" / get_title_id() / (std::string(name) + ".param");
+}
+
+static StoredParam read_param(std::string_view name) {
+	StoredParam   param {};
+	std::ifstream file(param_metadata(name), std::ios::binary);
+	if (!file.read(reinterpret_cast<char*>(&param), sizeof(param))) param = {};
+	param.title[sizeof(param.title) - 1]         = '\0';
+	param.sub_title[sizeof(param.sub_title) - 1] = '\0';
+	param.detail[sizeof(param.detail) - 1]       = '\0';
+	return param;
+}
+
+// (Written beside it, flushed, then renamed over it: a crash leaves the old or the new one, not zeros. Issue #73.)
+static void write_param(std::string_view name, const StoredParam& param) {
+	std::error_code ec;
+	const auto      path = param_metadata(name);
+	std::filesystem::create_directories(path.parent_path(), ec);
+	auto temporary = path;
+	temporary += ".tmp";
+	{
+		std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+		file.write(reinterpret_cast<const char*>(&param), sizeof(param));
+		if (!file) return;
+	}
+	Backup::FlushFile(temporary);
+	std::filesystem::rename(temporary, path, ec);
+}
+
+// Issue #73 (libs/saveDataBackup.h): a slot's files, and the folder of its backups.
+static Backup::SlotFiles slot_files(std::string_view name) {
+	return {std::filesystem::path(SAVE_DATA_DIR) / get_title_id() / std::string(name), param_metadata(name),
+	        capacity_metadata(name)};
+}
+
+static std::filesystem::path backup_root(std::string_view name) {
+	return std::filesystem::path(SAVE_DATA_DIR) / ".kyty-backup" / get_title_id() / std::string(name);
+}
+
+// The slot's files flushed to disk, and a backup of them made when they changed since the last one.
+static void keep_safe(std::string_view name) {
+	static bool noted = false;
+	const auto  slot  = slot_files(name);
+	Backup::FlushSlot(slot);
+	if (const auto made = Backup::Make(slot, backup_root(name), std::time(nullptr)); made && !noted) {
+		noted = true;
+		std::printf("Save data: each save is also kept in %s (the last %zu, at least %d minutes apart)\n",
+		            backup_root(name).parent_path().string().c_str(), Backup::Generations,
+		            static_cast<int>(Backup::ReplaceSeconds / 60));
+	}
+}
+
+// A slot left broken by a crash (a file of zeros) gets its newest good backup back before the game reads it.
+static void repair(std::string_view name) {
+	const auto slot = slot_files(name);
+	if (!Backup::Broken(slot)) return;
+	const auto root = backup_root(name);
+	if (const auto restored = Backup::Restore(slot, root, std::time(nullptr))) {
+		std::printf("Save data: %.*s had a file of zeros (as a crash while saving leaves it): its backup %s is put back; "
+		            "the broken files are kept in %s\n",
+		            static_cast<int>(name.size()), name.data(), restored->c_str(), root.string().c_str());
+	} else {
+		std::printf("Save data: %.*s has a file of zeros (as a crash while saving leaves it) and no good backup in %s\n",
+		            static_cast<int>(name.size()), name.data(), root.string().c_str());
+	}
+	std::fflush(stdout);
+}
+
+// A slot's modification time (time_t) as the PS5 reports it: the time of its last write, here its newest file.
+static int64_t save_data_mtime(const std::filesystem::path& directory) {
+	int64_t newest = 0;
+	for (const auto& entry: Common::File::GetDirEntries(directory)) {
+		if (entry.is_file) {
+			newest = std::max(newest, static_cast<int64_t>(
+			                              Common::File::GetLastWriteTimeUTC(directory / entry.name).ToUnix()));
+		}
+	}
+	return newest;
+}
+
+SaveSlotInfo GetSaveSlotInfo(std::string_view dir_name) {
+	const auto param = read_param(dir_name);
+	return {param.title, param.sub_title, param.detail,
+	        save_data_mtime(std::filesystem::path(SAVE_DATA_DIR) / get_title_id() / std::string(dir_name))};
+}
+
 static int mount_save_data(int slot, std::string_view dir_name, const std::string& directory,
                            uint32_t status, SaveDataMountResult* result) {
 	const std::string mount_point = SaveDataMountSlots::MountPoint(static_cast<size_t>(slot));
@@ -392,37 +492,80 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 		}
 	}
 
-	std::sort(dir_list.begin(), dir_list.end(), [](const std::string& a, const std::string& b) {
-		return std::strcmp(a.c_str(), b.c_str()) < 0;
-	});
-
-	if (cond->order == SaveDataSortOrder::Descent) {
-		std::vector<std::string> reversed;
-		for (size_t i = dir_list.size(); i > 0; i--) {
-			reversed.push_back(dir_list[i - 1]);
+	// Sorted by the key the game asks for, ties by name. Games pick the slot to continue from this order or from
+	// the reported times (Demon's Souls' Continue: the newest PlayerProfile); sorting by name only made it load
+	// PlayerProfile0 whichever character was played last (issue #26).
+	struct Slot {
+		std::string name;
+		int64_t     mtime;
+		uint64_t    blocks;
+		uint64_t    free_blocks;
+		bool        capacity;
+		StoredParam param;
+	};
+	std::vector<Slot> slots;
+	for (const auto& name: dir_list) {
+		const auto directory = std::filesystem::path(root) / name;
+		const auto capacity  = ReadSaveDataCapacity(directory, capacity_metadata(name));
+		slots.push_back({name, save_data_mtime(directory), capacity ? capacity->blocks : 0,
+		                 capacity ? capacity->free_blocks : 0, capacity.has_value(), read_param(name)});
+	}
+	std::sort(slots.begin(), slots.end(), [key = cond->key](const Slot& a, const Slot& b) {
+		uint64_t va = 0;
+		uint64_t vb = 0;
+		switch (key) {
+			case SaveDataSortKey::Mtime:
+				va = static_cast<uint64_t>(a.mtime);
+				vb = static_cast<uint64_t>(b.mtime);
+				break;
+			case SaveDataSortKey::Blocks:
+				va = a.blocks;
+				vb = b.blocks;
+				break;
+			case SaveDataSortKey::FreeBlocks:
+				va = a.free_blocks;
+				vb = b.free_blocks;
+				break;
+			case SaveDataSortKey::UserParam:
+				va = a.param.user_param;
+				vb = b.param.user_param;
+				break;
+			default: break; // DirName
 		}
-		dir_list = reversed;
+		return va != vb ? va < vb : std::strcmp(a.name.c_str(), b.name.c_str()) < 0;
+	});
+	if (cond->order == SaveDataSortOrder::Descent) {
+		std::reverse(slots.begin(), slots.end());
 	}
 
-	auto max_count =
-	    (result->dir_names_num < dir_list.size() ? result->dir_names_num : dir_list.size());
+	auto max_count = (result->dir_names_num < slots.size() ? result->dir_names_num : slots.size());
 
-	result->hit_num = static_cast<uint32_t>(dir_list.size());
+	result->hit_num = static_cast<uint32_t>(slots.size());
 	result->set_num = static_cast<uint32_t>(max_count);
 
+	std::printf("SaveData: search %s by key %" PRIu32 "%s: %zu slots, first %s\n",
+	            cond->dir_name != nullptr && cond->dir_name->data[0] != '\0' ? cond->dir_name->data : "<all>",
+	            static_cast<uint32_t>(cond->key), cond->order == SaveDataSortOrder::Descent ? " descending" : "",
+	            slots.size(), slots.empty() ? "-" : slots.front().name.c_str());
+
 	for (size_t i = 0; i < max_count; i++) {
+		const auto& slot = slots[i];
 		std::snprintf(result->dir_names[i].data, sizeof(result->dir_names[i].data), "%s",
-		              dir_list[i].c_str());
+		              slot.name.c_str());
 		if (result->params != nullptr) {
-			result->params[i] = {};
+			auto& param = result->params[i];
+			param       = {};
+			std::memcpy(param.title, slot.param.title, sizeof(param.title));
+			std::memcpy(param.sub_title, slot.param.sub_title, sizeof(param.sub_title));
+			std::memcpy(param.detail, slot.param.detail, sizeof(param.detail));
+			param.user_param = slot.param.user_param;
+			param.mtime      = slot.mtime;
 		}
 		if (result->infos != nullptr) {
-			result->infos[i]             = {};
-			const auto capacity = ReadSaveDataCapacity(std::filesystem::path(root) / dir_list[i],
-			                                               capacity_metadata(dir_list[i]));
-			if (!capacity) { return SAVE_DATA_ERROR_INTERNAL; }
-			result->infos[i].blocks = capacity->blocks;
-			result->infos[i].free_blocks = capacity->free_blocks;
+			result->infos[i] = {};
+			if (!slot.capacity) { return SAVE_DATA_ERROR_INTERNAL; }
+			result->infos[i].blocks      = slot.blocks;
+			result->infos[i].free_blocks = slot.free_blocks;
 		}
 	}
 
@@ -481,6 +624,10 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		created = true;
 
 		EXIT_NOT_IMPLEMENTED((!Common::File::IsDirectoryExisting(mount_dir)));
+	}
+
+	if (!created) {
+		repair(dir_name);
 	}
 
 	const auto metadata = capacity_metadata(dir_name);
@@ -647,11 +794,13 @@ int KYTY_SYSV_ABI SaveDataUmount2(uint32_t mode, const SaveDataMountPoint* mount
 		return SAVE_DATA_ERROR_NOT_FOUND;
 	}
 
+	const std::string dir_name = g_mount_slots.Directory(static_cast<size_t>(slot));
+	LibKernel::FileSystem::Umount(point);
+	g_mount_slots.Release(static_cast<size_t>(slot));
+	keep_safe(dir_name);
 	if ((mode & SAVE_DATA_UMOUNT_MODE_BACKUP_ASYNC) != 0) {
 		queue_save_data_event(SAVE_DATA_EVENT_TYPE_UMOUNT_BACKUP_END, 0, nullptr, nullptr);
 	}
-	LibKernel::FileSystem::Umount(point);
-	g_mount_slots.Release(static_cast<size_t>(slot));
 
 	return OK;
 }
@@ -683,6 +832,12 @@ int KYTY_SYSV_ABI SaveDataCommit(const SaveDataCommitParam* param) {
 	     "\t commit_mode = %" PRIu32 "\n",
 	     param->resource, param->commit_mode);
 
+	{
+		Common::LockGuard lock(g_mount_mutex);
+		for (size_t slot = 0; slot < SaveDataMountSlots::COUNT; slot++) {
+			if (g_mount_slots.IsMounted(slot)) keep_safe(g_mount_slots.Directory(slot));
+		}
+	}
 	if ((param->commit_mode & SAVE_DATA_COMMIT_MODE_BACKUP_ASYNC) != 0) {
 		queue_save_data_event(SAVE_DATA_EVENT_TYPE_COMMIT_BACKUP_END, 0, nullptr, nullptr);
 	}
@@ -728,11 +883,30 @@ int KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32
 	     "\t param_buf_size = %" PRIu64 "\n",
 	     mount_point->data, param_type, param_buf_size);
 
+	// The mounted slot's modification time and the texts and user parameter the game last set (SetParam).
+	int64_t     mtime = 0;
+	StoredParam stored {};
+	{
+		Common::LockGuard lock(g_mount_mutex);
+		const int         slot = g_mount_slots.Find(mount_point->data);
+		if (slot != SaveDataMountSlots::FULL) {
+			const std::string name = g_mount_slots.Directory(static_cast<size_t>(slot));
+			mtime                  = save_data_mtime(std::filesystem::path(SAVE_DATA_DIR) / get_title_id() / name);
+			stored                 = read_param(name);
+		}
+	}
+
 	if (param_type == 0) {
 		if (param_buf_size < sizeof(SaveDataParam)) {
 			return SAVE_DATA_ERROR_PARAMETER;
 		}
-		std::memset(param_buf, 0, sizeof(SaveDataParam));
+		auto* param = static_cast<SaveDataParam*>(param_buf);
+		std::memset(param, 0, sizeof(SaveDataParam));
+		std::memcpy(param->title, stored.title, sizeof(param->title));
+		std::memcpy(param->sub_title, stored.sub_title, sizeof(param->sub_title));
+		std::memcpy(param->detail, stored.detail, sizeof(param->detail));
+		param->user_param = stored.user_param;
+		param->mtime      = mtime;
 		if (got_size != nullptr) {
 			*got_size = sizeof(SaveDataParam);
 		}
@@ -740,6 +914,15 @@ int KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32
 	}
 
 	std::memset(param_buf, 0, param_buf_size);
+	const auto copy = [&](const void* field, size_t size) { std::memcpy(param_buf, field, std::min(size, param_buf_size)); };
+	switch (param_type) {
+		case 1: copy(stored.title, sizeof(stored.title)); break;
+		case 2: copy(stored.sub_title, sizeof(stored.sub_title)); break;
+		case 3: copy(stored.detail, sizeof(stored.detail)); break;
+		case 4: copy(&stored.user_param, sizeof(stored.user_param)); break;
+		case 5: copy(&mtime, sizeof(mtime)); break;
+		default: break;
+	}
 	if (got_size != nullptr) {
 		*got_size = param_buf_size;
 	}
@@ -830,6 +1013,10 @@ int KYTY_SYSV_ABI SaveDataBackup(const SaveDataBackup* backup) {
 	     backup->user_id, backup->title_id != nullptr ? backup->title_id->data : "<default>",
 	     backup->dir_name->data);
 
+	{
+		Common::LockGuard lock(g_mount_mutex);
+		keep_safe(std::string(backup->dir_name->data, strnlen(backup->dir_name->data, sizeof(backup->dir_name->data))));
+	}
 	queue_save_data_event(SAVE_DATA_EVENT_TYPE_BACKUP_END, backup->user_id, backup->title_id,
 	                      backup->dir_name);
 
@@ -847,17 +1034,55 @@ int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32
 	     "\t param_buf_size = %" PRIu64 "\n",
 	     mount_point->data, param_type, param_buf_size);
 
-	if (param_type == 0) {
-		const auto* p = static_cast<const SaveDataParam*>(param_buf);
-
-		LOGF("\t title      = %s\n"
-		     "\t sub_title  = %s\n"
-		     "\t detail     = %s\n"
-		     "\t user_param = %u\n",
-		     p->title, p->sub_title, p->detail, p->user_param);
-	} else {
-		LOGF("\t unsupported param_type, accepting as no-op\n");
+	if (param_buf == nullptr) {
+		return SAVE_DATA_ERROR_PARAMETER;
 	}
+	std::string name;
+	{
+		Common::LockGuard lock(g_mount_mutex);
+		const int         slot = g_mount_slots.Find(mount_point->data);
+		if (slot == SaveDataMountSlots::FULL) {
+			return SAVE_DATA_ERROR_PARAMETER;
+		}
+		name = g_mount_slots.Directory(static_cast<size_t>(slot));
+	}
+	// Kept for the slot (read_param): the system's list shows them, GetParam and searches report them.
+	auto       stored = read_param(name);
+	const auto text   = [&](char* field, size_t size, const char* source, size_t source_size) {
+		std::memset(field, 0, size);
+		std::memcpy(field, source, std::min(size - 1, strnlen(source, source_size)));
+	};
+	switch (param_type) {
+		case 0: {
+			if (param_buf_size < sizeof(SaveDataParam)) {
+				return SAVE_DATA_ERROR_PARAMETER;
+			}
+			const auto* p = static_cast<const SaveDataParam*>(param_buf);
+			LOGF("\t title      = %s\n"
+			     "\t sub_title  = %s\n"
+			     "\t detail     = %s\n"
+			     "\t user_param = %u\n",
+			     p->title, p->sub_title, p->detail, p->user_param);
+			text(stored.title, sizeof(stored.title), p->title, sizeof(p->title));
+			text(stored.sub_title, sizeof(stored.sub_title), p->sub_title, sizeof(p->sub_title));
+			text(stored.detail, sizeof(stored.detail), p->detail, sizeof(p->detail));
+			stored.user_param = p->user_param;
+			break;
+		}
+		case 1: text(stored.title, sizeof(stored.title), static_cast<const char*>(param_buf), param_buf_size); break;
+		case 2:
+			text(stored.sub_title, sizeof(stored.sub_title), static_cast<const char*>(param_buf), param_buf_size);
+			break;
+		case 3: text(stored.detail, sizeof(stored.detail), static_cast<const char*>(param_buf), param_buf_size); break;
+		case 4:
+			if (param_buf_size < sizeof(stored.user_param)) {
+				return SAVE_DATA_ERROR_PARAMETER;
+			}
+			std::memcpy(&stored.user_param, param_buf, sizeof(stored.user_param));
+			break;
+		default: LOGF("\t unsupported param_type, accepting as no-op\n"); return OK;
+	}
+	write_param(name, stored);
 
 	return OK;
 }

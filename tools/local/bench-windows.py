@@ -25,7 +25,10 @@ SAVES = ROOT / '_SaveData'
 BASELINE = Path(os.environ.get('KYTY_BENCH_BASELINE') or ROOT / '_Build/walk-fps-20260914/save-baseline')
 STATE = ROOT / '_Build/windows-bench'
 LIVE_FILE = STATE / 'live-commands.txt'
-ENTRIES = ('PPSA01341', '.kyty-capacity')
+# The save and the emulator's bookkeeping for it: the slots' capacity, texts (.kyty-param) and backups (.kyty-backup,
+# libs/saveDataBackup.h): a run's backups of the bench save must not stay among the user's, where a broken save
+# would get the bench save back.
+ENTRIES = ('PPSA01341', '.kyty-capacity', '.kyty-param', '.kyty-backup')
 
 
 def digest(root):
@@ -53,11 +56,20 @@ def prepare():
     backup = STATE / f'user-save-{stamp}'
     backup.mkdir(parents=True)
     manifest = {'stamp': stamp, 'backup': str(backup), 'entries': {}}
-    for name in ENTRIES:
-        source = SAVES / name
-        if source.exists():
-            manifest['entries'][name] = digest(source) if source.is_dir() else None
-            source.rename(backup / name)  # a move on the same volume: nothing is deleted
+    moved = []
+    try:
+        for name in ENTRIES:
+            source = SAVES / name
+            if source.exists():
+                manifest['entries'][name] = digest(source) if source.is_dir() else None
+                source.rename(backup / name)  # a move on the same volume: nothing is deleted
+                moved.append(name)
+    except OSError:
+        # (A folder another program holds, e.g. 10-20 .kyty-capacity: the ones moved go back, the user's save in place.)
+        for name in reversed(moved):
+            (backup / name).rename(SAVES / name)
+        backup.rmdir()
+        raise
     for name in ENTRIES:
         if (BASELINE / name).exists():
             shutil.copytree(BASELINE / name, SAVES / name)

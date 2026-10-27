@@ -1,3 +1,5 @@
+#include "common/archive.h"
+#include "common/assert.h"
 #include "common/common.h"
 #include "common/dateTime.h"
 #include "common/debug.h"
@@ -12,6 +14,7 @@
 
 #include <charconv>
 #include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 
 using namespace Common;
@@ -27,6 +30,9 @@ static std::string GetBuildString() {
 #else
 	std::string type = "????";
 #endif
+#if defined(KYTY_STEAM_DECK)
+	type += " (Steam Deck)";
+#endif
 
 	std::string compiler =
 	    Debug::GetCompiler() + "-" + Debug::GetLinker() + "-" + Debug::GetBitness();
@@ -40,9 +46,9 @@ static std::string GetBuildString() {
 
 static void PrintUsage() {
 	::printf("%s\n", GetBuildString().c_str());
-	::printf("kyty_emulator --game <dir|elf> [options]\n\n");
+	::printf("kyty_emulator --game <dir|elf|zar> [options]\n\n");
 	::printf("Options:\n");
-	::printf("  --game <dir|elf>                     Game directory or ELF to load.\n");
+	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive (.zar) to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
@@ -55,6 +61,7 @@ static void PrintUsage() {
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
+	::printf("  --hdr                                Enable HDR10 output when supported.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
@@ -162,6 +169,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
+		if (arg == "--hdr") {
+			options.config.hdr_enabled = true;
+			continue;
+		}
+
 		if (arg == "--playgo-hack") {
 			options.config.playgo_hack_enabled = true;
 			continue;
@@ -194,6 +206,15 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			if (Common::File::IsDirectoryExisting(value)) {
 				options.app0_dir = value;
 				options.elf      = "/app0/eboot.bin";
+			} else if (Common::IsSupportedArchive(value) && Common::File::IsFileExisting(value)) {
+				// A game folder packed into a ZArchive: mounted read-only, read without extracting it.
+				const auto root = Common::MakeArchivePath(value);
+				if (!Common::File::IsFileExisting(root / "eboot.bin")) {
+					::printf("Not a game archive (no eboot.bin at its root, or not a ZArchive): %s\n", value.c_str());
+					return false;
+				}
+				options.app0_dir = root;
+				options.elf      = "/app0/eboot.bin";
 			} else if (Common::File::IsFileExisting(value)) {
 				options.app0_dir = Common::DirectoryWithoutFilename(value);
 				if (options.app0_dir.empty()) {
@@ -201,7 +222,7 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				}
 				options.elf = "/app0/" + Common::FilenameWithoutDirectory(value);
 			} else {
-				::printf("--game must point to an existing directory or ELF: %s\n", value.c_str());
+				::printf("--game must point to an existing directory, ELF, or .zar: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--game-patch") {
@@ -311,10 +332,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--keymap") {
 			const auto split = value.find('=');
 			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {
-				::printf("invalid keymap: %s\n", value.c_str());
-				return false;
+				// (Skipped as hostInput.cpp skips a mapping it cannot use: the game still starts.)
+				::printf("Input mapping skipped: %s (not <control>=<key>)\n", value.c_str());
+			} else {
+				options.config.keymap.push_back(value);
 			}
-			options.config.keymap.push_back(value);
 		} else {
 			::printf("unknown option: %s\n", arg.c_str());
 			return false;
@@ -331,9 +353,31 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 int main(int argc, char* argv[]) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	LocalPlatform::ReleaseRedirectedConsole();
+	LocalPlatform::AsyncStdout();
+	Common::SetExitDrain(LocalPlatform::DrainStdout);
+	// (Registered first, run last: the game's window closes with quick_exit.)
+	std::atexit(LocalPlatform::DrainStdout);
+	std::at_quick_exit(LocalPlatform::DrainStdout);
+#endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	// AMD on Linux (RADV): the transfer-only queue family, which RADV shows only when asked to, carries the readbacks of
+	// GPU work already done (KYTY_READBACK_QUEUE); without it each waited behind the whole graphics queue. Walking at 1-1
+	// on an RX 9070 XT: 44.2 -> 56.3 fps and the 0.1% lows 20 -> 27-29 (dreamerk24m); an RX 9060 XT +19% at the lowest
+	// preset (the2ndday; issue #80). Asked for before the driver loads (Mesa 26 reads RADV_EXPERIMENTAL, older Mesa
+	// RADV_PERFTEST; other drivers neither), unless the variable is set already. KYTY_RADV_TRANSFER_QUEUE=0: not asked.
+	if (const char* ask = std::getenv("KYTY_RADV_TRANSFER_QUEUE"); ask == nullptr || ask[0] != '0') {
+		setenv("RADV_EXPERIMENTAL", "transfer_queue", 0);
+		setenv("RADV_PERFTEST", "transfer_queue", 0);
+	}
 #endif
 	VirtualMemory::Init();
 	InitializeThreads();
+	// KYTY_ALLOC_TRACE=<sizes> (diagnostics, e.g. "112,64,16-256" or "1048576-33554432;2888": ',' or ';' between, sizes
+	// of 1 MiB and more as up to 16 ranges): the stacks of heap blocks of those sizes from the start (live `alloctrace
+	// dump <path>` writes the live ones); the live `alloctrace start` misses what loading made.
+	if (const char* sizes = std::getenv("KYTY_ALLOC_TRACE"); sizes != nullptr && *sizes != '\0')
+		std::printf("Allocation trace from start-up (%s): %s\n", sizes,
+		            LocalPlatform::StartAllocTrace(sizes) ? "on" : "unavailable");
 
 	RunOptions options;
 	bool       show_help = false;
@@ -353,6 +397,7 @@ int main(int argc, char* argv[]) {
 		return 0;
 	}
 
+	LocalPlatform::StartHeapTrimmer();
 	Run(options);
 
 	return 0;

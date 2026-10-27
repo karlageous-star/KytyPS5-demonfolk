@@ -28,8 +28,83 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(xbyak zydis)
 
+# ZArchive (.zar): random-access reads of compressed game dumps (upstream's pinned revisions and reader patch). The
+# library and its zstd dependency; zarchive_tool (not built by default) packs a game folder into a .zar.
+set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ZSTD_LEGACY_SUPPORT OFF CACHE BOOL "" FORCE)
+set(ZSTD_MULTITHREAD_SUPPORT OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+	zstd
+	GIT_REPOSITORY https://github.com/facebook/zstd.git
+	GIT_TAG f8745da6ff1ad1e7bab384bd1f9d742439278e99
+	GIT_SHALLOW FALSE
+	SOURCE_SUBDIR build/cmake
+)
+FetchContent_Declare(
+	zarchive_source
+	GIT_REPOSITORY https://github.com/Exzap/ZArchive.git
+	GIT_TAG d2c717730092c7bf8cbb033b12fd4001b7c4d932
+	GIT_SHALLOW FALSE
+	PATCH_COMMAND "${GIT_EXECUTABLE}" apply --ignore-whitespace
+		"${CMAKE_CURRENT_SOURCE_DIR}/patches/zarchive-reader.patch"
+	SOURCE_SUBDIR kyty-library-only
+)
+FetchContent_MakeAvailable(zstd zarchive_source)
+
+# Opus: the DualSense's Bluetooth link carries the pad speaker as Opus packets inside HID reports (there is no
+# USB audio endpoint over Bluetooth), so src/libs/dualSenseBluetooth.cpp encodes them with this.
+set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+	opus
+	GIT_REPOSITORY https://github.com/xiph/opus.git
+	GIT_TAG ddbe48383984d56acd9e1ab6a090c54ca6b735a6 # v1.5.2
+	GIT_SHALLOW FALSE
+)
+FetchContent_MakeAvailable(opus)
+
+add_library(zarchive STATIC
+	"${zarchive_source_SOURCE_DIR}/src/zarchivereader.cpp"
+	"${zarchive_source_SOURCE_DIR}/src/zarchivewriter.cpp"
+	"${zarchive_source_SOURCE_DIR}/src/sha_256.c"
+)
+add_library(ZArchive::zarchive ALIAS zarchive)
+target_include_directories(zarchive SYSTEM PUBLIC "${zarchive_source_SOURCE_DIR}/include")
+target_include_directories(zarchive PRIVATE "${zstd_SOURCE_DIR}/lib")
+target_link_libraries(zarchive PRIVATE libzstd_static)
+target_compile_features(zarchive PRIVATE cxx_std_20)
+if(MSVC)
+	target_compile_options(zarchive PRIVATE /W0)
+else()
+	target_compile_options(zarchive PRIVATE -w)
+endif()
+
+add_executable(zarchive_tool EXCLUDE_FROM_ALL "${zarchive_source_SOURCE_DIR}/src/main.cpp")
+target_link_libraries(zarchive_tool PRIVATE zarchive)
+target_compile_features(zarchive_tool PRIVATE cxx_std_20)
+set_target_properties(zarchive_tool PROPERTIES OUTPUT_NAME zarchive)
+if(MSVC)
+	target_compile_options(zarchive_tool PRIVATE /W0)
+else()
+	target_compile_options(zarchive_tool PRIVATE -w)
+endif()
+
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 add_subdirectory(SDL2)
+# SDL without its C library (SDL_LIBC off, its MSVC default) is compiled with /Gs1048576: no stack probe for a frame
+# under 1 MiB, as it has no __chkstk of its own. Each SDL function carries that probe size, and one that ThinLTO inlines
+# into the emulator's code hands it to the caller (LLVM's adjustCallerStackProbeSize, for a caller without its own):
+# the caller's frame then skips the stack's guard page. The DualSense Bluetooth sender thread's 16 KiB frame did, and
+# the process ended at start-up with 0xC0000005 and no word in the log (the fault cannot be delivered on that stack).
+# The emulator links the C runtime, whose __chkstk serves SDL too.
+if(MSVC AND NOT SDL_LIBC AND TARGET SDL2-static)
+	get_target_property(sdl_compile_options SDL2-static COMPILE_OPTIONS)
+	list(REMOVE_ITEM sdl_compile_options "/Gs1048576")
+	set_target_properties(SDL2-static PROPERTIES COMPILE_OPTIONS "${sdl_compile_options}")
+endif()
 
 add_library(Vulkan-Headers INTERFACE)
 add_library(Vulkan::Headers ALIAS Vulkan-Headers)
@@ -67,6 +142,11 @@ add_library(spirv-tools ALIAS SPIRV-Tools-static)
 add_library(spirv-tools-opt ALIAS SPIRV-Tools-opt)
 
 add_subdirectory(xxHash/build/cmake)
+
+# AMD FidelityFX SDK 1.1.4 sources (FSR 3 upscaling, and frame interpolation on Linux) for Linux and Windows builds.
+if (LINUX OR WIN32)
+	add_subdirectory(fidelityfx)
+endif()
 
 set(FMT_DOC OFF CACHE BOOL "" FORCE)
 set(FMT_INSTALL OFF CACHE BOOL "" FORCE)
@@ -109,7 +189,9 @@ if (NOT TARGET FFmpeg::ffmpeg)
 endif()
 
 file(GLOB LIBATRAC9_SOURCES LibAtrac9/C/src/*.c)
-add_library(LibAtrac9 STATIC ${LIBATRAC9_SOURCES})
+# Its decinit.c from overrides/: the shared tables initialized once (the submodule stays at an upstream commit).
+list(FILTER LIBATRAC9_SOURCES EXCLUDE REGEX "/decinit\\.c$")
+add_library(LibAtrac9 STATIC ${LIBATRAC9_SOURCES} overrides/LibAtrac9/decinit.c)
 target_include_directories(LibAtrac9 PUBLIC LibAtrac9/C/src)
 find_package(Threads REQUIRED)
 target_link_libraries(LibAtrac9 PRIVATE Threads::Threads)

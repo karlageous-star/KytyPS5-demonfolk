@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+#include "graphics/host_gpu/renderer/cache/tickClock.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -16,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <map>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
@@ -31,8 +33,13 @@ class CommandScheduler;
 class RenderExecutor;
 struct TextureCacheTestAccess;
 
+[[nodiscard]] uint64_t KytyGcLiveBudgetValue(const GraphicContext& graphics);
+
 class TextureCache {
 public:
+	// Every image as a tab-separated row (live "images <path>").
+	void WriteReport(const char* path);
+
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	struct ImageDesc {
@@ -49,10 +56,16 @@ public:
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
-	// `may_fail` (a sampled texture's lookup, KYTY_POOL_IMAGE_SHARE): no image when the GPU cannot make one (its memory
+// `may_fail` (a sampled texture's lookup, KYTY_POOL_IMAGE_SHARE): no image when the GPU cannot make one (its memory
 	// full, or more layers or bytes than the format allows), an invalid id, and none tried again for that memory for a
 	// while.
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false, bool may_fail = false);
+	// An image of exactly this guest texture is registered (what FindImage takes first; no lookup side effects).
+	[[nodiscard]] bool          HoldsImage(const ImageInfo& info);
+	// The layers of a one-level array a sampled view reads, `info` (slices one after another: descriptors.cpp
+	// HoldLayerRange), held by an image of other layers too: `info` becomes that image's and `first` the view's first
+	// layer in it. See the definition.
+	void                        HoldLayers(ImageInfo& info, uint32_t& first);
 	// Addresses that gained their first registered image, in registration
 	// order: a caller that proved "no image starts here" at StartEpoch() E only
 	// needs the addresses logged after E.
@@ -64,14 +77,27 @@ public:
 	[[nodiscard]] uint64_t ResolutionEpoch() const {
 		return m_resolution_epoch.load(std::memory_order_acquire);
 	}
+	// Moves whenever an image's slot is erased (EraseSlot, the only place): an id allocated when it was E is still
+	// allocated while it is E.
+	[[nodiscard]] uint64_t EraseEpoch() const { return m_erase_epoch.load(std::memory_order_acquire); }
 	// Only reuses discovery. FindTexture still refreshes contents and selects the current view.
 	[[nodiscard]] bool TryReuseSampledImage(ImageId id, const ImageDesc& desc, uint64_t& epoch);
 	// TryReuseSampledImage without the resolution-epoch proof, for caches that must
 	// survive image registrations elsewhere (native XPR records): the owner is
 	// still registered, not being rebound, and has the same backing and resources.
 	// Also for a storage binding (an image a record's programs only write); a sampled image may have
-	// DCC metadata (whose pending fast clears FindTexture applies: the caller checks IsMetaCleared).
-	[[nodiscard]] bool IsSampledImageCurrent(ImageId id, const ImageDesc& desc);
+	// DCC metadata (whose pending fast clears FindTexture applies: the caller checks IsMetaCleared), and with
+	// `storage_dcc` one written as storage too.
+	[[nodiscard]] bool IsSampledImageCurrent(ImageId id, const ImageDesc& desc, bool storage_dcc = false);
+	// The view's levels and layers lie in the image `desc` describes. FindImage moves a view into a larger image it found
+	// (its first level and layer in that image), so a description it was given is not a request of its own any more.
+	[[nodiscard]] static bool ViewFitsImage(const ImageDesc& desc);
+	// A depth image sampled through a view of its memory (FindImage takes it through ResolveDepthOverlap, a 32-bit
+	// float view of a D32S8 image having no format of the same class, or through its stencil plane's association): the
+	// lookup finds it again while no image was registered or unregistered over the view's pages since `epoch` (the same
+	// owners, whose descriptions do not change), and its use needs nothing of FindTexture but the LRU while no CPU,
+	// GPU-buffer or stencil-plane write is pending.
+	[[nodiscard]] bool IsSampledDepthCurrent(ImageId id, const ImageDesc& desc, uint64_t epoch);
 	// Whether a render target lookup of `requested` (FindImage, any format) still finds `id`: nothing
 	// registered over its first page since `epoch`, or no newer image with the requested backing there
 	// (it would take precedence). `epoch` moves to the current one when it holds.
@@ -79,7 +105,18 @@ public:
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
+	// The image starting at `address` with a `width`x`height` backing (of `format`, unless undefined), the one used
+	// last if several are; `count`: how many images start there (frame generation's interface canvas, frame-gen.cpp).
+	[[nodiscard]] ImageId FindImageAt(uint64_t address, uint32_t width, uint32_t height,
+	                                  vk::Format format = vk::Format::eUndefined, uint32_t* count = nullptr);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
+	// Whether FindTexture with `desc` uploads anything first: guest bytes the CPU wrote, a GPU buffer write over them or
+	// over the stencil plane. A sampled view of a texture whose levels below it stay dirty (RefreshTextureLevels) needs
+	// its own levels' bytes only. Caller holds no lock (the render thread's images).
+	[[nodiscard]] static bool RefreshPending(const Image& image, const ImageDesc& desc) {
+		if (image.IsBufferModified() || image.IsStencilModified() || image.IsMaybeCpuDirty()) return true;
+		return image.IsDefinitelyCpuDirty() && DirtyForView(image, desc);
+	}
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
@@ -87,12 +124,17 @@ public:
 		TouchImage(image);
 		return image;
 	}
+	// The image, or null when `id` names no live image (an erased one a record kept): not touched.
+	[[nodiscard]] Image*        TryGetImage(ImageId id) noexcept { return m_slot_images.try_get(id); }
 	void MarkGpuWritten(ImageId id);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
-	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size, const char* source = "");
+	// `fill`: the GPU wrote the range with that one 32-bit value (a compute fill): the images over it note it
+	// (Image::MarkBufferFilled).
+	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size, const char* source = "",
+	                                           const uint32_t* fill = nullptr);
 	[[nodiscard]] bool HasTrackedDataOverlap(uint64_t address, uint64_t size);
 	// An image over the range holds data the GPU wrote to it (a download of the range must come
 	// from the image, not from the buffer).
@@ -108,6 +150,12 @@ public:
 	[[nodiscard]] uint64_t MetaEpoch() const {
 		return m_meta_epoch.load(std::memory_order_acquire);
 	}
+	// Moves with any image's barrier state or GPU-written state, registration, metadata or CPU-written bytes: images
+	// found in place (a table draw's targets and set) stay so while it does not.
+	[[nodiscard]] uint64_t ImagesEpoch() const {
+		return ImageStateEpoch() + m_resolution_epoch.load(std::memory_order_acquire) +
+		       m_meta_epoch.load(std::memory_order_acquire) + Image::CpuDirtyEpoch();
+	}
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice,
 	                                 uint32_t* fill_value = nullptr, bool* fill_known = nullptr);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
@@ -120,19 +168,53 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
+	// KYTY_TEXTURE_OFFLOAD(_PROBE) (texture-offload.h): the guest bytes of clean sampled textures probed for touches, or
+	// dropped from RAM after a download checked to give them back exactly (RunGarbageCollector).
+	void OffloadScan(uint64_t tick);
+	// KYTY_FILE_OFFLOAD (file-offload.h): APR-read pages still equal to their files probed, or
+	// dropped (OffloadScan).
+	void OffloadFiles();
+	// Render thread: the dropped bytes over [vaddr, vaddr + size) downloaded back from their images (texture-offload.h;
+	// `touch`: TextureOffload::Touch; `async`: written back by the offload worker when the GPU is done, touches waiting
+	// till then). Takes m_lock unless the caller holds it.
+	void RestoreOffloaded(uint64_t vaddr, uint64_t size, uint8_t touch, bool async = false);
+	struct OffloadCheck;
+	struct OffloadRestore;
+	std::vector<std::unique_ptr<OffloadRestore>> m_offload_restores;   // asynchronous restores (until done)
+	bool                                         m_offload_unsubmitted = false; // one is not submitted yet
+	std::unordered_set<uint64_t>                 m_offload_differ_kinds; // image kinds a check found to differ
+	std::unordered_map<uint64_t, uint64_t>      m_offload_clean;    // image serial -> the first scan it was clean at
+	std::unordered_map<uint64_t, bool>          m_offload_exact;    // image serial -> its download gave its guest bytes
+	std::unordered_set<uint64_t>                m_offload_checking; // image serials a check downloads
+	std::vector<std::unique_ptr<OffloadCheck>> m_offload_checks;
+	// RunGarbageCollector's line on the PC's memory, when it moved.
+	void LogPcMemory(uint64_t tick);
+	// The images no draw or dispatch used for a while go (RunGarbageCollector, once a flip).
+	void RetireStaleImages(uint64_t tick);
 	// The latest tick of a GPU-written image's download that will write guest memory overlapping
 	// the range once the GPU completes it (on the priority thread); 0 when none is pending.
 	[[nodiscard]] uint64_t PendingDownloadTick(uint64_t address, uint64_t size);
 	// Whether a pending image download holds a page of the range (TryDownloadImage).
 	[[nodiscard]] bool HasPendingDownload(uint64_t address, uint64_t size);
 	// Once per guest flip (the unit of NumFramesBeforeRemoval).
-	void AdvanceFrame() noexcept { m_frame.fetch_add(1, std::memory_order_relaxed); }
+	void AdvanceFrame() noexcept {
+		m_frame.fetch_add(1, std::memory_order_relaxed);
+		AdvanceTrimFrame();
+	}
+	// GPU flips have their own trim age; m_frame remains the CPU-flip age used by upstream image lookup.
+	void AdvanceTrimFrame() noexcept { m_trim_frame.fetch_add(1, std::memory_order_relaxed); }
 	[[nodiscard]] uint64_t CurrentFrame() const noexcept { return m_frame.load(std::memory_order_relaxed); }
+	// The collector's runs (one a flip): the LRU's clock. The GPU thread's.
+	[[nodiscard]] uint64_t GcTick() const noexcept { return m_gc_tick; }
 
 private:
 	enum class TransferDirection { Upload, Download };
 	struct TextureTransferPlan;
 	struct DownloadPlan;
+	// (The texture offload's checks and restores: detiled in video memory, then one linear copy to `host`; the
+	// scratch buffer returned.)
+	std::unique_ptr<Buffer> StageOffloadDownloads(std::vector<std::pair<Image*, DownloadPlan>>& images,
+	                                              const std::vector<uint64_t>& offsets, uint64_t total, Buffer& host);
 
 	struct MetaDataInfo {
 		// A guest metadata-fill dispatch may initialize DCC before its render target is bound.
@@ -161,18 +243,46 @@ private:
 	using ImageEpochTable = MultiLevelPageTable<uint64_t, 20, 40, 10>;
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info, bool may_fail = false);
-	// Frees room for an image that must exist, which the GPU could not make (InsertImage). Caller holds m_lock.
+// Frees room for an image that must exist, which the GPU could not make (InsertImage). Caller holds m_lock.
 	size_t                    ReclaimImageMemory(uint64_t bytes, bool all);
-	// Images the GPU could not make (InsertImage's `may_fail`): their memory is not asked for again for a while.
+	// Images the GPU could not make (InsertImage's `may_fail`): their memory is not asked for again for FailedRetryTicks
+	// collector runs, and meanwhile the collector takes images unused for a shorter time (RunGarbageCollector).
 	struct FailedImage {
 		uint64_t address = 0, size = 0, tick = 0;
 	};
 	std::vector<FailedImage>  m_failed_images;
+uint64_t                  m_failed_tick = 0; // (+1: 0 is none)
 	[[nodiscard]] bool        RecentlyFailed(const ImageInfo& info) const;
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
-	void                      DeleteImage(ImageId id, bool now = false);
+void                      DeleteImage(ImageId id, bool now = false);
+	// DeleteImage's halves: out of every index (false: it was not registered), then destroyed once no recorded work
+	// can read it.
+	[[nodiscard]] bool        DetachImage(ImageId id, bool now = false);
+	void                      RetireImage(ImageId id);
+	// A deleted image destroyed, its slot erased (RetireImage's, once nothing uses it).
+	void                      EraseSlot(ImageId id);
+	// An image a depth overlap replaced, out of every index but kept (one an address, the collector's run it was parked
+	// at): ResolveDepthOverlap takes it back when the memory is asked for in its description again, instead of making
+	// another image (the game takes one surface as a depth target and as a color target in turn every frame).
+	struct ParkedImage {
+		ImageId  id;
+		uint64_t tick = 0;
+	};
+	std::unordered_map<uint64_t, ParkedImage> m_parked;
+	// Views of one allocation in shapes neither holds (a texture pool sampled as 256 layers of 11 levels and as 1649
+	// layers of one: another layer pitch), both only sampled: images of their own side by side (GuestTexture), where an
+	// image for one freed the other's (a draw sampling both re-uploaded GBs per pass, 10-11). Their count: a write
+	// binding at an address with some frees the others there (FreeGuestAliases), which would go stale.
+	uint64_t                  m_guest_aliases = 0;
+	bool                      m_alias_insert  = false;
+	[[nodiscard]] static bool GuestTexture(const Image& image);
+	[[nodiscard]] static bool GuestTextureRequest(BindingType type, const ImageInfo& info);
+	void                      NoteGuestAlias(const ImageInfo& requested, Image& kept);
+	void                      FreeGuestAliases(ImageId written);
+	void                      ParkImage(ImageId id);
+	[[nodiscard]] ImageId     TakeParkedImage(const ImageInfo& info);
 	void                      FreeImage(ImageId id, const char* site = "");
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);
@@ -188,12 +298,33 @@ private:
 	                                        uint64_t granule);
 	void               UntrackImagePages(Image& image, uint64_t begin, uint64_t end);
 	void               RetrackHoles(Image& image);
+	// The holes' pages inside [begin, end) only (page-aligned); the others stay released.
+	void               RetrackHoles(Image& image, uint64_t begin, uint64_t end);
 	void               FinishRefresh(Image& image);
-	// mixed: the CPU's and the GPU's changed ranges, from the image's buffer (KYTY_PARTIAL_MIXED_UPLOAD, a small image).
-	[[nodiscard]] bool UploadImagePartial(Image& image, bool from_buffer = false, bool mixed = false);
-	[[nodiscard]] bool UploadDepthPartial(Image& image);
+// mixed: the CPU's and the GPU's changed ranges, from the image's buffer (KYTY_PARTIAL_MIXED_UPLOAD, a small image).
+	[[nodiscard]] bool UploadImagePartial(Image& image, bool from_buffer = false, bool mixed = false,
+	                                     uint64_t window_begin = 0, uint64_t window_end = UINT64_MAX);
+	[[nodiscard]] bool UploadDepthPartial(Image& image, uint32_t first_layer = 0,
+	                                      uint32_t last_layer = UINT32_MAX);
 	void               UpdatePartialHashes(Image& image, bool all);
 	[[nodiscard]] bool CheckPartialHashes(const Image& image);
+	// The subresources over these ranges, in <=64 MiB pieces when the bdd3ff1b mixed-upload path uses them.
+	[[nodiscard]] bool UploadImageRanges(Image& image, const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
+	// Chenxiao's bounded range path; the one-argument full upload is separately preflighted below.
+	[[nodiscard]] bool UploadImageChunked(Image& image, const std::vector<std::pair<uint64_t, uint64_t>>* only);
+	[[nodiscard]] bool UploadImageSubresources(Image& image, const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
+	// A depth target binding's refresh of the layers its view covers; false: RefreshImage's.
+	[[nodiscard]] bool RefreshDepthLayers(ImageId id, const ImageViewInfo& view);
+	// RefreshPending of a CPU-dirty image: dirty where the binding reads.
+	[[nodiscard]] static bool DirtyForView(const Image& image, const ImageDesc& desc);
+	// Images a sampled view may refresh in its levels only (RefreshTextureLevels).
+	[[nodiscard]] static bool LevelRefreshCandidate(const Image& image);
+	// The guest bytes [begin, end) of the view's levels and every level sharing them, when that leaves levels out whose
+	// pages are theirs alone; false: the view needs the whole image.
+	[[nodiscard]] static bool ViewLevelBytes(const Image& image, const ImageViewInfo& view, uint64_t& begin,
+	                                         uint64_t& end);
+	// A sampled view's refresh of its levels (the others stay dirty); false: RefreshImage's.
+	[[nodiscard]] bool RefreshTextureLevels(ImageId id, const ImageViewInfo& view);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
 	void                      TrackImageDownload(ImageId id, Image& image);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
@@ -210,13 +341,14 @@ private:
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
+	[[nodiscard]] ImageId       ResolveBlockTexelOverlap(const ImageInfo& requested, ImageId cached_id);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
 	void                        PrepareDccClear(ImageId id, const ImageDesc& desc);
 	void                        InitializeImage(ImageId id);
-	[[nodiscard]] bool           UploadImageChunked(Image& image);
-	// The subresources over `ranges` alone, of an image of any size, a piece at a time (the mixed refresh; false: not taken).
-	[[nodiscard]] bool UploadImageRanges(Image& image, const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
+// Full uploads use the preflighted bounded depth/color chunker.
+	[[nodiscard]] bool          UploadImageChunked(Image& image);
+	[[nodiscard]] bool          RefillUpload(Image& image);
 	[[nodiscard]] TextureTransferPlan
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
 	[[nodiscard]] const TextureTransferPlan& CachedUploadPlan(Image& image, BindingType binding);
@@ -230,7 +362,8 @@ private:
 	void DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, DownloadPlan plan);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
-	void CommitGpuWrite(Image& image);
+	// `keep_partial`: the image stays dirty in the ranges a scoped refresh left (RefreshDepthLayers).
+	void CommitGpuWrite(Image& image, bool keep_partial = false);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, const vk::ImageSubresourceRange& range,
 	                const vk::ClearValue& clear);
@@ -277,6 +410,7 @@ private:
 	std::atomic<uint64_t>                             m_start_epoch {1};
 	std::vector<std::pair<uint64_t, uint64_t>>        m_start_log; // (epoch, address)
 	std::atomic<uint64_t>                             m_resolution_epoch {1};
+	std::atomic<uint64_t>                             m_erase_epoch {1};
 	// Null textures: a 1x1 image per format and type (1D, 2D or 3D).
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
@@ -288,6 +422,12 @@ private:
 		std::shared_ptr<TextureTransferPlan> plan;
 	};
 	std::unordered_map<uint64_t, UploadPlanCache> m_upload_plans;
+	// Plans for Chenxiao's subresource/range uploads, cached by image serial.
+	struct PartialPlan {
+		BindingType                          binding {};
+		std::shared_ptr<TextureTransferPlan> plan;
+	};
+	std::unordered_map<uint64_t, PartialPlan> m_partial_plans;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	std::atomic<uint64_t>                             m_meta_epoch {1};
 	// The m_surface_metas keys as bits of a 1024-bit filter: a clear bit proves an address holds
@@ -308,10 +448,17 @@ private:
 	}
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
-	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
-	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
+	uint64_t                                          m_logged_video_memory = 0; // RunGarbageCollector's log line
+	uint64_t                                          m_logged_shared_memory = 0;
+	uint64_t                                          m_logged_working_set   = 0; // (and its line on the PC's memory)
+	uint64_t                                          m_logged_private       = 0;
+	bool                                              m_logged_short_of_ram  = false;
 	uint64_t         m_gc_tick                = 0;
+	TickClock        m_tick_clock;                 // the collectors count ages in time
+	uint64_t         m_scene_generation       = 0; // RetireStaleImages: the world the game is in (SceneTags), entered
+	uint64_t         m_scene_tick             = 0; // at this tick
 	std::atomic<uint64_t> m_frame {0};
+	std::atomic<uint64_t> m_trim_frame {0};
 	uint64_t              m_trimmed_bytes = 0; // KYTY_TEXTURE_RAM_TRIM total
 	uint64_t              m_target_trimmed_bytes = 0; // KYTY_TARGET_RAM_TRIM total
 	bool                  m_ram_short            = false; // under 2 GiB of system memory available (KYTY_RAM_SHORT_GC)
@@ -341,6 +488,19 @@ private:
 	ImageEpochTable    m_registration_pages;
 	void               StampRegistrationPages(const Image& image, uint64_t epoch);
 	[[nodiscard]] bool RegistrationsSince(uint64_t address, uint64_t size, uint64_t epoch) const;
+	// The latest registrations and unregistrations, in order: the epoch each moved m_resolution_epoch to (one each) and
+	// the image's memory. Whether any after `epoch` reached [address, address + size)'s stamp pages; `known` false when
+	// the log no longer reaches back to it (RegistrationsSince answers then).
+	struct RegistrationEntry {
+		uint64_t epoch = 0, begin = 0, end = 0;
+	};
+	std::vector<RegistrationEntry> m_registration_log;
+	[[nodiscard]] bool RegistrationsOverlapSince(uint64_t address, uint64_t size, uint64_t epoch, bool& known) const;
+	// FindTexture's PrepareDccClear with this view's metadata would change only the fields a color target binding
+	// fills (its clear word: no reader but the comparison that moves the meta epoch): the image's DCC surface is the
+	// view's and the metadata record there is DCC's (an unknown or pending one it would make DCC). A pending fast clear
+	// is the caller's check.
+	[[nodiscard]] bool SameDccSurface(const Image& image, const ImageMetadataInfo& metadata) const;
 	// KYTY_IMAGE_GRANULES: a bit per 64 KiB granule that a registered image covered
 	// since the last rebuild (a superset); region queries skip the page walk on a miss.
 	// Allocated with the cache (never moved): MayHaveImagesRead reads it without m_lock.

@@ -56,6 +56,7 @@ bool CommandBuffer::IsInvalid() const {
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	FlushCopyRun();
 	FlushCopyBatch();
 	DrainTransferChain();
 	if (m_compute_access_pending) {
@@ -69,8 +70,78 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 
 vk::CommandBuffer CommandBuffer::ChainHandle() const {
 	EXIT_IF(IsInvalid() || m_rendering);
+	FlushCopyRun();
 	FlushCopyBatch();
 	DrainTransferChain();
+	return m_buffer;
+}
+
+void CommandBuffer::FlushRunTail() const {
+	if (m_run_tail.empty()) return;
+	VulkanMemoryBarrier between {};
+	between.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	between.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer, {}, 1, &between,
+	                         0, nullptr, 0, nullptr);
+	for (const auto& tail: m_run_tail) {
+		const vk::BufferCopy copy {tail.source_offset, tail.destination_offset, tail.size};
+		m_buffer.copyBuffer(tail.source, tail.destination, 1, &copy);
+	}
+	m_run_tail.clear();
+	// (The host reads the snapshots after the submission completes.)
+	VulkanMemoryBarrier host {};
+	host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 1, &host, 0,
+	                         nullptr, 0, nullptr);
+}
+
+void CommandBuffer::CopyAfterRun(vk::Buffer source, uint64_t source_offset, vk::Buffer destination,
+                                 uint64_t destination_offset, uint64_t size) const {
+	EXIT_IF(IsInvalid() || m_rendering || m_copy_run.empty());
+	const VkBuffer src = source, dst = destination;
+	m_run_tail.push_back({src, dst, source_offset, destination_offset, size});
+	// A later copy of the run that writes what this reads, or touches what this writes, starts a new run first.
+	m_copy_run.push_back({src, source_offset, source_offset + size, false});
+	m_copy_run.push_back({dst, destination_offset, destination_offset + size, true});
+}
+
+void CommandBuffer::FlushCopyRun() const {
+	if (m_copy_run.empty()) return;
+	m_copy_run.clear();
+	FlushRunTail();
+	VulkanMemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after,
+	                         0, nullptr, 0, nullptr);
+}
+
+vk::CommandBuffer CommandBuffer::CopyRunHandle(vk::Buffer source, uint64_t source_offset, vk::Buffer destination,
+                                               uint64_t destination_offset, uint64_t size) const {
+	EXIT_IF(IsInvalid() || m_rendering);
+	const auto meets = [](const CopyRunRange& range, VkBuffer buffer, uint64_t begin, uint64_t end) {
+		return range.buffer == buffer && begin < range.end && range.begin < end;
+	};
+	const VkBuffer src = source, dst = destination;
+	bool           opens = m_copy_run.empty();
+	for (const auto& range: m_copy_run)
+		if ((range.written && meets(range, src, source_offset, source_offset + size)) ||
+		    meets(range, dst, destination_offset, destination_offset + size)) {
+			opens = true;
+			break;
+		}
+	if (opens) {
+		// Everything before (the previous run too) ahead of the run's copies.
+		const auto          native = Handle();
+		VulkanMemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+		before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 1,
+		                       &before, 0, nullptr, 0, nullptr);
+	}
+	m_copy_run.push_back({src, source_offset, source_offset + size, false});
+	m_copy_run.push_back({dst, destination_offset, destination_offset + size, true});
 	return m_buffer;
 }
 
@@ -303,6 +374,7 @@ void CommandBuffer::RecordChainAccess(std::span<const ChainAccess> accesses, boo
 
 vk::CommandBuffer CommandBuffer::HandleForFullBarrier() const {
 	EXIT_IF(IsInvalid());
+	FlushCopyRun();
 	FlushCopyBatch(); // its copies before the caller's barrier
 	// The caller records a full AllCommands memory dependency immediately.
 	m_transfer_pending = false;
@@ -335,6 +407,9 @@ static void ReplayBegin(std::span<const LocalVulkanRecording::Segment> segments,
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
 	InvalidateGraphicsState();
+	m_barrier_work = UINT64_MAX;
+	m_copy_run.clear();
+	m_run_tail.clear();
 	// Not Handle(): nothing may be recorded before the buffer begins.
 	const vk::CommandBuffer buffer = m_buffer;
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -471,6 +546,21 @@ void CommandBuffer::EndRendering() const {
 	Handle().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
+}
+
+void CommandBuffer::ResumeRendering(const RenderState& state) const {
+	RenderState load = state;
+	for (uint32_t i = 0; i < load.num_color_attachments; i++) {
+		load.color_attachments[i].is_clear = false;
+	}
+	load.depth_stencil_attachment.depth_clear   = false;
+	load.depth_stencil_attachment.stencil_clear = false;
+	BeginRendering(load);
+	m_render_state = state;
+}
+
+bool CommandBuffer::RenderingWith(const RenderState& state) const {
+	return m_rendering && SameRendering(m_render_state, state);
 }
 
 } // namespace Libs::Graphics

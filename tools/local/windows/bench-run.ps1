@@ -1,17 +1,18 @@
-param([string]$Label = 'run', [int]$Rounds = 3, [string]$Exe = '', [switch]$NoAot, [string[]]$Extra = @(),
+param([string]$Label = 'run', [int]$Rounds = 3, [string]$Exe = '', [string[]]$Extra = @(),
       [switch]$KeepRunning, [string]$PresentMode = '', [int]$Vblank = 0, [string[]]$Set = @(),
-      [string]$Patch = '', [switch]$Fullscreen, [switch]$ShotOnly, [switch]$NoWalk,
-      [int]$StartupSeconds = 100, [int]$StartupAttempts = 3, [switch]$NoPrecompile, [string]$Config = '')
+      [string]$Patch = '', [switch]$Fullscreen, [switch]$Hdr, [switch]$ShotOnly, [switch]$NoWalk,
+      [int]$StartupSeconds = 100, [int]$StartupAttempts = 3, [switch]$NoPrecompile, [string]$Config = '',
+      [string]$Game = '', [switch]$LoadGame)
 # End to end: fresh baseline save, launch, skip to the game, walk the fixed path once the HUD
 # is really up, measure. Screen states are told apart by pixel statistics.
 $S = $PSScriptRoot
 $root = (Resolve-Path "$PSScriptRoot\..\..\..").Path
 Set-Location $root
+# Screenshots and the start-up states go to _Build\bench.
+$out = "$root\_Build\bench"
+New-Item -ItemType Directory -Force $out | Out-Null
 function Key([string]$key, [int]$ms = 250) { powershell -NoProfile -File "$S\key.ps1" -Key $key -HoldMs $ms | Out-Null }
-function Shot([string]$name) { powershell -NoProfile -File "$S\screen.ps1" -Out "$S\$name" -Scale 0.25 | Out-Null; "$S\$name" }
-# The game image alone, 640x360 (screen.ps1 -Client): positions below are in that image, whatever
-# the display's resolution or the window's place.
-function ClientShot([string]$name) { powershell -NoProfile -File "$S\screen.ps1" -Out "$S\$name" -Client | Out-Null; "$S\$name" }
+function Shot([string]$name) { powershell -NoProfile -File "$S\screen.ps1" -Out "$out\$name" -Scale 0.25 | Out-Null; "$out\$name" }
 Add-Type -AssemblyName System.Drawing
 # In-process capture and input for the start-up loop: a PowerShell process per screenshot or key
 # (compiling its helper each time) took seconds, so cinematics played long before a skip.
@@ -44,7 +45,8 @@ public class BenchWin {
     i[0].ki.dwFlags = 8u | (up ? 2u : 0u);
     SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
   }
-  // The client area (the game image) scaled to 640x360, or null.
+  // The client area (the game image) scaled to 640x360, or null: State's positions are in that image, whatever the
+  // display's resolution or the window's place.
   public static Bitmap Client(IntPtr h) {
     RECT r; POINT o = new POINT();
     if (!GetClientRect(h, out r) || !ClientToScreen(h, ref o) || r.Right <= 0 || r.Bottom <= 0) return null;
@@ -64,7 +66,7 @@ function Press([string]$key, [int]$ms = 150) {
 	$w = Window; if (!$w -or ![BenchWin]::Focus($w.MainWindowHandle)) { $script:unfocused++; return }
 	$ime = [BenchWin]::ImmGetDefaultIMEWnd($w.MainWindowHandle)
 	if ($ime -ne [IntPtr]::Zero) { [BenchWin]::SendMessage($ime, 0x283, [IntPtr]6, [IntPtr]::Zero) | Out-Null }
-	$code = if ($key -eq 'enter') { 0x0D } else { [int][char]$key.ToUpper() }
+	$code = if ($key -eq 'enter') { 0x0D } elseif ($key -eq 'down') { 0x28 } else { [int][char]$key.ToUpper() }
 	[BenchWin]::Key([uint16]$code, $false); Start-Sleep -Milliseconds $ms; [BenchWin]::Key([uint16]$code, $true)
 }
 function State($source) {
@@ -81,6 +83,14 @@ function State($source) {
 		# In game: 109 slot and 151 bar pixels (the full-screen captures this replaced also counted
 		# red desktop icons next to the window).
 		if ($red -gt 70 -and $bar -gt 100) { return 'hud' }
+		# A character in soul form (half health, a short bar: 35 slot and 12 bar pixels) has the green
+		# stamina bar under it (180 pixels; none in the menus, prompt, fog or cinematics).
+		$stamina = 0
+		if ($red -gt 20) {
+			for ($y = 2; $y -lt 30; $y += 1) { for ($x = 10; $x -lt 200; $x += 1) {
+				$c = $bmp.GetPixel($x, $y); if ($c.G -gt 80 -and $c.G -gt 1.5 * $c.R -and $c.G -gt 1.3 * $c.B) { $stamina++ } } }
+		}
+		if ($stamina -gt 120) { return 'hud' }
 		# Offline prompt: black screen with a lit box in the middle. Menu: green-tinted.
 		$dark = 0; $total = 0; $sr = 0; $sg = 0; $sb = 0; $center = 0; $sat = 0
 		for ($y = 0; $y -lt 360; $y += 4) { for ($x = 0; $x -lt 640; $x += 4) {
@@ -122,15 +132,24 @@ python tools\local\bench-windows.py reset
 if ($LASTEXITCODE -ne 0) { 'baseline save not installed: run python tools\local\bench-windows.py prepare'; exit 1 }
 $params = @{}
 if ($Exe) { $params['Exe'] = $Exe }
-if ($NoAot) { $params['NoAot'] = $true }
 if ($PresentMode) { $params['PresentMode'] = $PresentMode }
 if ($Vblank -gt 0) { $params['Vblank'] = $Vblank }
 if ($Set.Count) { $params['Set'] = $Set }
 if ($Patch) { $params['Patch'] = $Patch }
 if ($Fullscreen) { $params['Fullscreen'] = $true }
+if ($Hdr) { $params['Hdr'] = $true }
 if ($Config) { $params['Config'] = $Config } # another launch config (run-windows.ps1 -Config)
+# -Game <folder>: another game (version) for this run; game-path.txt keeps the folder remembered before
+# it (run-windows.ps1 remembers a -Game).
+$gameFile = "$root\game-path.txt"
+$remembered = if (Test-Path $gameFile) { [IO.File]::ReadAllBytes($gameFile) }
+function Restore-GamePath {
+	if (!$Game) { return }
+	if ($remembered) { [IO.File]::WriteAllBytes($gameFile, $remembered) } else { Remove-Item $gameFile -ErrorAction SilentlyContinue }
+}
+if ($Game) { $params['Game'] = $Game }
 # -NoPrecompile: the driver cache as it is (first-encounter measurements with KYTY_SHADER_WARMUP=0).
-if (!$NoPrecompile) { & "$root\run-windows.ps1" -Precompile -Width 1280 -Height 720 @params *> $null }
+if (!$NoPrecompile) { & "$root\run-windows.ps1" -Precompile -Width 1280 -Height 720 @params *> $null; Restore-GamePath }
 $env:KYTY_LIVE_FILE = "$root\_Build\windows-bench\live-commands.txt"
 # The HUD is up about 60 s after launch: a start-up still short of it after -StartupSeconds is stuck
 # (seen once in the attract loop), so it starts again from a fresh baseline save.
@@ -145,6 +164,7 @@ if ($attempt -gt 1) {
 }
 foreach ($pair in $Extra) { $k, $v = $pair -split '=', 2; Set-Item "env:$k" $v }
 & "$root\run-windows.ps1" @params 6>&1 | Select-Object -Last 1
+Restore-GamePath
 foreach ($pair in $Extra) { Remove-Item ("env:" + ($pair -split '=', 2)[0]) -ErrorAction SilentlyContinue }
 
 $start = Get-Date
@@ -177,12 +197,16 @@ while (((Get-Date) - $start).TotalSeconds -lt $StartupSeconds) {
 	if ($state -ne $last) { $log.Add(("{0,6:N1} s {1}" -f ((Get-Date) - $start).TotalSeconds, $state)); $last = $state }
 	if ($state -eq 'hud') { break }
 	if ($state -eq 'prompt') { Press j; $answered = $true; Start-Sleep -Milliseconds 1500; continue }
+	# -LoadGame: the main menu's Load Game (its second item) instead of Continue, once.
+	if ($state -eq 'menu' -and $LoadGame -and !$script:loadChosen) { Start-Sleep -Milliseconds 1500; Press s 300; Start-Sleep -Milliseconds 1500; $script:loadChosen = $true; continue }
 	if ($state -eq 'menu') { Press j; Start-Sleep -Milliseconds 1500; continue }
 	# A cinematic, or before the prompt the title: Options opens the skip prompt (or leaves the
 	# title), Cross held confirms (250 ms let go just before its bar filled). After the prompt only
 	# a cinematic is skipped (Options elsewhere would open the in-game menu): a letterboxed picture,
 	# or the dim colourless one that follows the loading fog (skipped at most 3 times, 4 s apart,
 	# so a fade into the game is never taken for it).
+	# -LoadGame: in the save list that follows, the second save (one move down) before it is chosen.
+	if ($LoadGame -and $answered -and !$script:listMoved -and $state -eq 'cinematic') { Press s 200; Start-Sleep -Milliseconds 700; $script:listMoved = $true }
 	if ($state -eq 'fog') { $fogSeen = $true }
 	$early = $answered -and $fogSeen -and $state -eq 'mono' -and $earlySkips -lt 3 -and
 	         ((Get-Date) - $lastSkip).TotalSeconds -ge 4
@@ -194,7 +218,7 @@ while (((Get-Date) - $start).TotalSeconds -lt $StartupSeconds) {
 	}
 	Start-Sleep -Milliseconds 500
 }
-$log | Set-Content "$S\bench-states.txt" -Encoding ascii
+$log | Set-Content "$out\bench-states.txt" -Encoding ascii
 if ($state -eq 'hud') { break }
 "no HUD after $StartupSeconds s (attempt $attempt, last state $state, window not in front $($script:unfocused)x; states: $($log -join ' | '))"
 }
@@ -203,7 +227,7 @@ if ($state -ne 'hud') { "no HUD in $StartupAttempts start-ups"; exit 1 }
 Start-Sleep 10
 if (!$NoWalk) { Key w 10000; Start-Sleep 10 }
 Shot 'scene.png' | Out-Null
-if ($ShotOnly) { powershell -NoProfile -File "$S\screen.ps1" -Out "$S\scene-$Label.png" -Scale 0.25 | Out-Null; "screenshot: $S\scene-$Label.png"; if (!$KeepRunning) { Stop-Process -Name kyty_emulator -Force -ErrorAction SilentlyContinue }; return }
+if ($ShotOnly) { powershell -NoProfile -File "$S\screen.ps1" -Out "$out\scene-$Label.png" -Scale 0.25 | Out-Null; "screenshot: $out\scene-$Label.png"; if (!$KeepRunning) { Stop-Process -Name kyty_emulator -Force -ErrorAction SilentlyContinue }; return }
 $commands = (1..$Rounds | ForEach-Object { "measure 20 $Label-$_" }) -join ' ; '
 python tools\local\bench-windows.py live $commands | Select-String 'LIVE_MEASURE' | ForEach-Object { $_.Line }
 if (!$KeepRunning) { Stop-Process -Name kyty_emulator -Force -ErrorAction SilentlyContinue }

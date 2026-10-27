@@ -154,6 +154,7 @@ LIB_DEFINE(InitAudio_1_AudioOut2) {
 	LIB_FUNC("gatEUKG+Ea4", AudioOut2::AudioOut2PortGetState);
 	LIB_FUNC("bkBN+CMLwRc", AudioOut2::AudioOut2GetSystemState);
 	LIB_FUNC("xywYcRB7nbQ", AudioOut2::AudioOut2UserCreate);
+	LIB_FUNC("iE8trxPKnAg", AudioOut2::AudioOut2UserGetSupportedAttributes);
 	LIB_FUNC("IaZXJ9M79uo", AudioOut2::AudioOut2UserDestroy);
 	LIB_FUNC("G1YOKDJYX2Y", AudioOut2::AudioOut2GetSpeakerArrayMemorySize);
 	LIB_FUNC("+k91hoTuoA8", AudioOut2::AudioOut2SpeakerArrayCreate);

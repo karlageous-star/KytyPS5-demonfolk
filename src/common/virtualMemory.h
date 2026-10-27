@@ -38,6 +38,14 @@ bool     FreeRange(uint64_t address, uint64_t size);
 bool     Protect(uint64_t address, uint64_t size, Mode mode, Mode* old_mode = nullptr);
 bool     FlushInstructionCache(uint64_t address, uint64_t size);
 
+// The GPU trackers' protection of guest views (Protect elsewhere). Linux with KYTY_UFFD_WP=1: their write watch (Read)
+// of a view registered by WriteWatchMapped is a userfaultfd write protection, not an mprotect (no VMA split or merge,
+// ~45% cheaper a protect-fault-unprotect cycle); a write to such a page raises SIGBUS with the write error bit.
+bool ProtectWriteWatch(uint64_t address, uint64_t size, Mode mode);
+// A view of the guest's shared backing mapped at [address, address + size) with `mode`, or unmapped.
+void WriteWatchMapped(uint64_t address, uint64_t size, Mode mode);
+void WriteWatchUnmapped(uint64_t address, uint64_t size);
+
 } // namespace VirtualMemory
 
 } // namespace Common

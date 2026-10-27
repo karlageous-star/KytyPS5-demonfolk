@@ -10,6 +10,7 @@
 #include "common/stringUtils.h"
 
 #include <cerrno>
+#include <cstring>
 #include <cstdlib>
 #include <dirent.h>
 #include <fcntl.h>
@@ -51,6 +52,9 @@ struct sys_file_t {
 #define KYTY_STAT_ATIME_NS(st) ((st).st_atim.tv_nsec)
 #define KYTY_STAT_MTIME_NS(st) ((st).st_mtim.tv_nsec)
 #endif
+
+// (SysFileTakeLastError.)
+static thread_local uint32_t g_last_error = 0;
 
 static std::filesystem::path get_internal_name(const std::filesystem::path& name) {
 	return name.is_absolute() ? name : (std::filesystem::path(".") / name);
@@ -120,6 +124,7 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read)
 void SysFileWrite(const void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_written) {
 	if (f.type == SYS_FILE_FILE) {
 		size_t w = fwrite(data, 1, size, f.f);
+		if (w < size) g_last_error = static_cast<uint32_t>(errno);
 		if (bytes_written != nullptr) {
 			*bytes_written = w;
 		}
@@ -164,6 +169,7 @@ sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
 	ret->f = fopen(real_name_str.c_str(), "w+");
 
 	if (ret->f == nullptr) {
+		g_last_error = static_cast<uint32_t>(errno);
 		printf("can't create file: %s\n", real_name_str.c_str());
 	}
 
@@ -226,7 +232,8 @@ sys_file_t* SysFileOpenW(const std::filesystem::path& file_name, sys_file_cache_
 	FILE* f = fopen(real_name_str.c_str(), "r+");
 
 	if (f == nullptr) {
-		ret->type = SYS_FILE_ERROR;
+		g_last_error = static_cast<uint32_t>(errno);
+		ret->type    = SYS_FILE_ERROR;
 	} else {
 		ret->type = SYS_FILE_FILE;
 	}
@@ -353,6 +360,21 @@ uint64_t SysFileTell(sys_file_t& f) {
 
 bool SysFileIsError(sys_file_t& f) {
 	return f.type == SYS_FILE_ERROR || (f.type == SYS_FILE_FILE && f.f == nullptr);
+}
+
+bool SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size) {
+	auto real_name     = get_internal_name(name);
+	auto real_name_str = real_name.string();
+
+	struct stat s {};
+
+	if (0 != stat(real_name_str.c_str(), &s)) {
+		return false;
+	}
+
+	*is_file = !S_ISDIR(s.st_mode); // NOLINT
+	*size    = *is_file ? static_cast<uint64_t>(s.st_size) : 0;
+	return true;
 }
 
 bool SysFileIsDirectoryExisting(const std::filesystem::path& path) {
@@ -529,19 +551,6 @@ bool SysFileSetLastAccessTimeUtc(const std::filesystem::path& name, SysFileTimeS
 	times.modtime = s.st_mtime;
 
 	return !(0 != utime(real_name_str.c_str(), &times));
-
-	//	if (0 != stat(n.data(), &s))
-	//	{
-	//		return false;
-	//	}
-	//
-	//	times.actime += times.actime - s.st_atime;
-	//	times.modtime += times.modtime - s.st_mtime;
-	//
-	//	if (0 != utime(n.data(), &times))
-	//	{
-	//		return false;
-	//	}
 }
 
 bool SysFileSetLastWriteTimeUtc(const std::filesystem::path& name, SysFileTimeStruct& write) {
@@ -563,19 +572,6 @@ bool SysFileSetLastWriteTimeUtc(const std::filesystem::path& name, SysFileTimeSt
 	times.modtime = write.time;
 
 	return !(0 != utime(real_name_str.c_str(), &times));
-
-	//	if (0 != stat(n.data(), &s))
-	//	{
-	//		return false;
-	//	}
-	//
-	//	times.actime += times.actime - s.st_atime;
-	//	times.modtime += times.modtime - s.st_mtime;
-	//
-	//	if (0 != utime(n.data(), &times))
-	//	{
-	//		return false;
-	//	}
 }
 
 bool SysFileSetLastAccessAndWriteTimeUtc(const std::filesystem::path& name,
@@ -598,19 +594,6 @@ bool SysFileSetLastAccessAndWriteTimeUtc(const std::filesystem::path& name,
 	times.modtime = write.time;
 
 	return !(0 != utime(real_name_str.c_str(), &times));
-
-	//	if (0 != stat(n.data(), &s))
-	//	{
-	//		return false;
-	//	}
-	//
-	//	times.actime += times.actime - s.st_atime;
-	//	times.modtime += times.modtime - s.st_mtime;
-	//
-	//	if (0 != utime(n.data(), &times))
-	//	{
-	//		return false;
-	//	}
 }
 
 // Recursively collect regular files.
@@ -704,6 +687,16 @@ bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::
 	}
 
 	return 0 == rename(real_src.string().c_str(), real_dst.string().c_str());
+}
+
+uint32_t SysFileTakeLastError() {
+	const auto error = g_last_error;
+	g_last_error     = 0;
+	return error;
+}
+
+std::string SysFileErrorText(uint32_t error) {
+	return std::strerror(static_cast<int>(error));
 }
 
 void SysFileRemoveReadonly(const std::filesystem::path& name) {

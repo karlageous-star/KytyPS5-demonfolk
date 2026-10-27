@@ -21,11 +21,43 @@ static void AppendInstructionWords(std::vector<uint32_t>& section, const uint32_
 	section.insert(section.end(), words + 1, words + words_num);
 }
 
+namespace {
+// The big sections of the thread's last module and the module Build made of them (Recycle), their capacity kept for the
+// next one: grown from empty, a program's were reallocated ~1 MiB at a time, memory the system had to zero-fill each
+// time (the shader prefetch's threads: ~2 GB a minute). Only the larger of two is kept, up to 8 MiB each.
+struct SectionPool {
+	std::vector<uint32_t> debug, annotations, declarations, functions, module;
+};
+thread_local SectionPool t_sections;
+constexpr size_t         PooledWordsLimit = (size_t {8} << 20u) / sizeof(uint32_t);
+
+void Adopt(std::vector<uint32_t>& section, std::vector<uint32_t>& pooled, size_t reserve) {
+	section = std::move(pooled);
+	section.clear();
+	section.reserve(reserve);
+}
+
+void GiveBack(std::vector<uint32_t>& section, std::vector<uint32_t>& pooled) {
+	if (section.capacity() > pooled.capacity() && section.capacity() <= PooledWordsLimit) pooled = std::move(section);
+}
+} // namespace
+
 Builder::Builder(uint32_t version): m_version(version) {
-	m_debug.reserve(InitialSpirvSectionReserve);
-	m_annotations.reserve(InitialSpirvSectionReserve);
-	m_declarations.reserve(InitialSpirvSectionReserve);
-	m_functions.reserve(InitialSpirvFunctionSectionReserve);
+	Adopt(m_debug, t_sections.debug, InitialSpirvSectionReserve);
+	Adopt(m_annotations, t_sections.annotations, InitialSpirvSectionReserve);
+	Adopt(m_declarations, t_sections.declarations, InitialSpirvSectionReserve);
+	Adopt(m_functions, t_sections.functions, InitialSpirvFunctionSectionReserve);
+}
+
+Builder::~Builder() {
+	GiveBack(m_debug, t_sections.debug);
+	GiveBack(m_annotations, t_sections.annotations);
+	GiveBack(m_declarations, t_sections.declarations);
+	GiveBack(m_functions, t_sections.functions);
+}
+
+void Builder::Recycle(std::vector<uint32_t>&& module) {
+	GiveBack(module, t_sections.module);
 }
 
 uint32_t Builder::AllocateId() {
@@ -149,6 +181,12 @@ void Builder::DefineGlobalVariable(uint32_t id, uint32_t pointer_type, uint32_t 
 	AddType({59u, pointer_type, id, storage_class});
 }
 
+uint32_t Builder::DefineInitializedVariable(uint32_t pointer_type, uint32_t storage_class, uint32_t initializer) {
+	const auto id = AllocateId();
+	AddType({59u, pointer_type, id, storage_class, initializer});
+	return id;
+}
+
 void Builder::AppendString(std::vector<uint32_t>& words, const char* text) {
 	const auto len        = text != nullptr ? std::strlen(text) : 0;
 	const auto word_count = (len + 1u + 3u) / 4u;
@@ -267,7 +305,8 @@ void Builder::PatchDeferredPhi(DeferredPhi phi, size_t incoming, uint32_t value,
 std::vector<uint32_t> Builder::Build() const {
 	EXIT_IF(m_unpatched_phi_incomings != 0);
 
-	std::vector<uint32_t> module;
+	std::vector<uint32_t> module = std::move(t_sections.module);
+	module.clear();
 	module.reserve(5u + m_capabilities.size() + m_extensions.size() + m_ext_inst_imports.size() +
 	               m_memory_model.size() + m_entry_points.size() + m_execution_modes.size() +
 	               m_debug.size() + m_annotations.size() + m_declarations.size() +

@@ -12,6 +12,10 @@ endif()
 
 add_library(common STATIC ${common_src} ${common_headers})
 
+if(LINUX)
+	set_property(SOURCE assert.cpp hostException.cpp APPEND PROPERTY COMPILE_OPTIONS -fexceptions)
+endif()
+
 target_include_directories(common
 	PUBLIC ${KYTY_SOURCE_DIR}
 	PRIVATE
@@ -26,6 +30,7 @@ target_link_libraries(common
 		cpuinfo
 		kyty_git_version
 		spdlog::spdlog
+		ZArchive::zarchive
 )
 
 get_property(inc_headers TARGET common PROPERTY INCLUDE_DIRECTORIES)

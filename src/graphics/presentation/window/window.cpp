@@ -14,6 +14,7 @@
 #include "SDL_rwops.h"
 #include "SDL_stdinc.h"
 #include "SDL_surface.h"
+#include "SDL_syswm.h"
 #include "SDL_thread.h"
 #include "SDL_touch.h"
 #include "SDL_video.h"
@@ -24,6 +25,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/stringUtils.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
@@ -32,7 +34,11 @@
 #include "loader/demonsSoulsWarp.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
+#include "debug-snapshot.h"
+#include "local-platform.h"
+#include "perf-overlay.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/startupProgress.h"
@@ -43,10 +49,12 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -193,6 +201,7 @@ constexpr uint32_t KYTY_SDL_BUTTON_X2MASK = SDL_BUTTON_X2MASK; // NOLINT(hicpp-s
 namespace {
 
 std::unique_ptr<WindowContext> g_window;
+std::atomic<uint32_t>          g_output_width {0}, g_output_height {0}; // WindowOutputSize
 
 } // namespace
 
@@ -229,6 +238,10 @@ static void ToggleDesktopFullscreen() {
 	    fullscreen ? 0u : static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
 	if (SDL_SetWindowFullscreen(g_window->window, mode) != 0) {
 		LOGF("Toggle fullscreen failed: %s\n", SDL_GetError());
+	} else if (g_window->presenter != nullptr) {
+		// (A full screen of the window's own size changes nothing a present reports; FSR's frame generation swapchain
+		// then kept presenting to the window it had: the picture froze, issue #174.)
+		g_window->presenter->RequestSwapchainRecreate();
 	}
 }
 
@@ -245,10 +258,29 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (key.down) {
 		switch (key.key_code) {
-			case SDLK_SPACE: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
-			case SDLK_F1:
+			// Space pauses and resumes, unless the keymap gives it to the game; the Pause key always does.
+			case SDLK_SPACE:
+				if (!HostInputMapsKey(SDLK_SPACE)) SetPause(game, !game.paused.load(std::memory_order_acquire));
+				break;
+			case SDLK_PAUSE: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
+			// F9: a debug snapshot of the picture shown (src/local/debug-snapshot.h), the game paused; F9 again resumes.
+			case SDLK_F9:
 				if (!key.repeat) {
-					RenderDocRequestCapture();
+					if (!game.paused.load(std::memory_order_acquire)) {
+						const auto folder = DebugSnapshot::Take(g_window != nullptr ? g_window->window : nullptr);
+						SetPause(game, true);
+						Loader::DemonsSoulsWarp::ShowNotice(folder.empty() ? "Snapshot failed; paused (F9 resumes)"
+						                                                   : "Paused: snapshot " + folder + " (F9 resumes)",
+						                                    5);
+					} else {
+						SetPause(game, false);
+					}
+				}
+				break;
+			// F8: the emulator's overlay off, the frame rate, detailed, off... (it starts as the launcher's Overlay).
+			case SDLK_F8:
+				if (!key.repeat) {
+					PerfOverlay::CycleLevel();
 				}
 				break;
 			case SDLK_F11:
@@ -256,14 +288,6 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 					ToggleDesktopFullscreen();
 				}
 				break;
-			// Debug warp (loader/demonsSoulsWarp.h): F9/F10 pick a spawn point, F8 arms or cancels.
-			case SDLK_F8:
-				if (!key.repeat) {
-					Loader::DemonsSoulsWarp::ToggleSelected();
-				}
-				break;
-			case SDLK_F9: Loader::DemonsSoulsWarp::Select(-1); break;
-			case SDLK_F10: Loader::DemonsSoulsWarp::Select(1); break;
 			case SDLK_RETURN:
 			case SDLK_KP_ENTER:
 				if (!key.repeat && (key.mod & KMOD_ALT) != 0) {
@@ -340,10 +364,62 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 #endif
 }
 
+// The PS button (an Xbox pad's Guide button) held for two seconds quits, as Close Game on the PS5's home screen (issue
+// #203: pads and Steam Big Picture had no way out): the game has no use for it, and a short press does nothing. With
+// KYTY_PAD_QUIT=backstart (or both) so do Back and Start held together (an Xbox pad's View and Menu, a PlayStation pad's
+// Create and Options), for a pad whose Guide button Steam or Windows' Game Bar takes; not by default, since some pads
+// switch their own mode (XInput, Switch) on that hold. off: neither. A pad that leaves cancels its holds.
+static SDL_TimerID g_quit_hold = 0, g_quit_combo = 0;
+
+static uint32_t QuitAfterHold(uint32_t /*interval*/, void* what) {
+	LOGF("Controller: %s held for 2 s, quitting\n", static_cast<const char*>(what));
+	SDL_Event quit {};
+	quit.type = SDL_QUIT;
+	(void)SDL_PushEvent(&quit);
+	return 0;
+}
+
+static bool PadQuits(bool combo) {
+	static const std::string_view mode = [] {
+		const char* value = std::getenv("KYTY_PAD_QUIT");
+		return std::string_view(value != nullptr ? value : "guide");
+	}();
+	return combo ? mode == "backstart" || mode == "both" : mode != "off" && mode != "backstart";
+}
+
+static void CancelQuitHolds() {
+	for (auto* timer: {&g_quit_hold, &g_quit_combo}) {
+		if (*timer != 0) (void)SDL_RemoveTimer(*timer);
+		*timer = 0;
+	}
+}
+
 static void GameEventController([[maybe_unused]] const EventController& f) {
 	// (A new mapping for a connected controller, e.g. from Steam: its buttons arrive mapped from then on.)
 	if (f.remapped) {
 		return;
+	}
+
+	if (f.removed) CancelQuitHolds();
+	if (f.button == SDL_CONTROLLER_BUTTON_GUIDE && (f.down || f.up) && PadQuits(false)) {
+		if (f.down && g_quit_hold == 0)
+			g_quit_hold = SDL_AddTimer(2000, QuitAfterHold, const_cast<char*>("the PS button"));
+		if (f.up && g_quit_hold != 0) {
+			(void)SDL_RemoveTimer(g_quit_hold);
+			g_quit_hold = 0;
+		}
+	}
+	if ((f.button == SDL_CONTROLLER_BUTTON_BACK || f.button == SDL_CONTROLLER_BUTTON_START) && (f.down || f.up) &&
+	    PadQuits(true)) {
+		auto*      pad  = SDL_GameControllerFromInstanceID(f.id);
+		const bool both = f.down && pad != nullptr && SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK) != 0 &&
+		                  SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START) != 0;
+		if (both && g_quit_combo == 0)
+			g_quit_combo = SDL_AddTimer(2000, QuitAfterHold, const_cast<char*>("Back and Start"));
+		if (f.up && g_quit_combo != 0) {
+			(void)SDL_RemoveTimer(g_quit_combo);
+			g_quit_combo = 0;
+		}
 	}
 
 #ifdef KYTY_DBG_INPUT
@@ -377,7 +453,13 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	}
 
 	if (f.down || f.up) {
-		const auto button = ControllerButtonToPadButton(f.button);
+		auto button = ControllerButtonToPadButton(f.button);
+		// A pad without a touchpad (an Xbox pad's View, others' Back or Select) presses it with that button (issue #197:
+		// otherwise the game's touchpad menu was out of reach); a PlayStation pad's Create button stays the system's.
+		if (f.button == SDL_CONTROLLER_BUTTON_BACK) {
+			const auto type = SDL_GameControllerGetType(SDL_GameControllerFromInstanceID(f.id));
+			if (type != SDL_CONTROLLER_TYPE_PS4 && type != SDL_CONTROLLER_TYPE_PS5) button = Controller::PAD_BUTTON_TOUCH_PAD;
+		}
 		if (button != 0) {
 			Controller::SetButton(f.id, button, f.down);
 		}
@@ -625,6 +707,9 @@ void WindowContext::ProcessEvent(double time_s) {
 			mb.timestamp_seconds = time_s;
 
 			GameEventMouse(mb);
+			// (Notches away from the user count as up whatever the system's scroll direction.)
+			if (event->wheel.which != SDL_TOUCH_MOUSEID)
+				HostInputMouseWheel(event->wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -event->wheel.y : event->wheel.y);
 
 			break;
 		}
@@ -783,6 +868,21 @@ void WindowContext::RunOnMainThread(std::function<void()> task) {
 	}
 }
 
+void WindowContext::PostToMainThread(std::function<void()> task) {
+	if (Common::Thread::IsMainThread()) {
+		task();
+		return;
+	}
+	{
+		Common::LockGuard lock(main_task_mutex);
+		main_tasks.push_back(std::move(task));
+		++main_tasks_queued;
+	}
+	SDL_Event event {};
+	event.type = SDL_USEREVENT;
+	SDL_PushEvent(&event);
+}
+
 void WindowContext::DrainMainThreadTasks() {
 	std::vector<std::function<void()>> tasks;
 	{
@@ -842,7 +942,8 @@ static void WindowCreate(WindowContext& context) {
 	SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
 #endif
 
-	if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
+	// (The timers: the PS button's hold to quit, QuitAfterHold.)
+	if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_TIMER) < 0) {
 		EXIT("%s\n", SDL_GetError());
 	}
 	HostInputInit();
@@ -890,9 +991,10 @@ static void WindowCreate(WindowContext& context) {
 		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
 	}
 #endif
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 	// KYTY_FRAMEGEN: Streamline must be initialized before SDL loads Vulkan with the window, and
-	// then becomes that loader (the instance and device are created through it).
+	// then becomes that loader (the instance and device are created through it). Linux: KYTY_UPSCALER=dlss loads
+	// the NGX bridge (libkyty_dlss.so) here, before the instance it adds extensions to.
 	Libs::Graphics::FrameGen::Initialize();
 #endif
 	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, KYTY_SDL_WINDOWPOS_CENTERED,
@@ -902,7 +1004,11 @@ static void WindowCreate(WindowContext& context) {
 		EXIT("%s\n", SDL_GetError());
 	}
 
-	SDL_SetWindowResizable(context.window, SDL_FALSE);
+	// Resizable, so the title bar's maximize button is enabled: Windows greys it out for a
+	// fixed-size window. Only the presented image follows the window - the guest keeps rendering
+	// at its own resolution, the swapchain takes the new client size and the present blit scales
+	// the frame into it (KYTY_PRESENT_ASPECT=fit keeps the aspect ratio instead of stretching).
+	SDL_SetWindowResizable(context.window, SDL_TRUE);
 	context.UpdateIcon();
 	// SDL2 starts text input with the video subsystem, which keeps the IME attached to the
 	// window: with a Japanese/Chinese IME on, letter keys (the default Cross, WASD...) never
@@ -911,7 +1017,10 @@ static void WindowCreate(WindowContext& context) {
 }
 
 uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {
-	auto flags = static_cast<uint32_t>(SDL_WINDOW_VULKAN);
+	// SDL_WINDOW_RESIZABLE is what makes the maximize button usable on Windows; the size the
+	// window opens at still comes from --screen-width/--screen-height.
+	auto flags = static_cast<uint32_t>(SDL_WINDOW_VULKAN) |
+	             static_cast<uint32_t>(SDL_WINDOW_RESIZABLE);
 	if (fullscreen) {
 		flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
 	}
@@ -932,9 +1041,27 @@ Presenter& WindowInit(uint32_t width, uint32_t height) {
 	StartupProgressShow(window->window);
 	window->CreateVulkan();
 	StartupProgressHide();
+	// The size the game is shown at: the display's in full screen (the window may not have it yet), else the window's
+	// drawable size (its swapchain's). Demon's Souls' render size follows it (loader/demonsSoulsRenderSize.h).
+	int output_width = 0, output_height = 0;
+	if (Config::FullscreenEnabled()) {
+		SDL_DisplayMode mode {};
+		if (SDL_GetDesktopDisplayMode(std::max(SDL_GetWindowDisplayIndex(window->window), 0), &mode) == 0) {
+			output_width  = mode.w;
+			output_height = mode.h;
+		}
+	}
+	if (output_width <= 0 || output_height <= 0) SDL_Vulkan_GetDrawableSize(window->window, &output_width, &output_height);
+	g_output_width.store(static_cast<uint32_t>(std::max(output_width, 0)), std::memory_order_relaxed);
+	g_output_height.store(static_cast<uint32_t>(std::max(output_height, 0)), std::memory_order_relaxed);
 	auto& presenter = *window->presenter;
 	g_window        = std::move(window);
 	return presenter;
+}
+
+void WindowOutputSize(uint32_t* width, uint32_t* height) {
+	*width  = g_output_width.load(std::memory_order_relaxed);
+	*height = g_output_height.load(std::memory_order_relaxed);
 }
 
 void WindowRun() {
@@ -942,6 +1069,16 @@ void WindowRun() {
 	EXIT_IF(g_window == nullptr);
 
 	g_window->Run();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// The focus back to the window that had it before the game (KYTY_RETURN_FOCUS), before the caches are saved.
+	if (SDL_SysWMinfo info {}; g_window->window != nullptr) {
+		SDL_VERSION(&info.version);
+		if (SDL_GetWindowWMInfo(g_window->window, &info) == SDL_TRUE && info.subsystem == SDL_SYSWM_WINDOWS)
+			LocalPlatform::ReturnFocus(info.info.win.window);
+	}
+#endif
+	g_window->render_context->GetPipelineCache().StopWarmup();
+	g_window->render_context->GetPipelineCache().ReportSession();
 	g_window->render_context->GetPipelineCache().Save();
 }
 
@@ -989,7 +1126,7 @@ struct WindowIcon {
 
 static void WindowLoadPngIcon(const std::string& path, WindowIcon* icon) {
 	Common::File f;
-	if (!f.Open(path, Common::File::Mode::Read)) {
+	if (!f.Open(Common::PathFromUtf8(path), Common::File::Mode::Read)) { // (UTF-8: SystemContentGetIconPath)
 		EXIT("Can't open icon file %s\n", path.c_str());
 	}
 
@@ -1028,7 +1165,7 @@ void WindowContext::UpdateIcon() {
 	}
 }
 
-void WindowContext::UpdateTitle() {
+void WindowContext::UpdateTitle(uint32_t presented, const char* generator) {
 	static char title[128];
 	static char title_id[12];
 	static char app_ver[12];
@@ -1041,7 +1178,9 @@ void WindowContext::UpdateTitle() {
 	static uint64_t fps_start   = Common::Timer::QueryPerformanceCounter();
 	static uint64_t frame_num   = 0;
 	static uint64_t fps_frames  = 0;
+	static uint64_t fps_shown   = 0; // images shown, generated ones included
 	static double   current_fps = 0.0;
+	static double   shown_fps   = 0.0;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -1055,19 +1194,36 @@ void WindowContext::UpdateTitle() {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	frame_num++;
 	fps_frames++;
+	fps_shown += presented;
 	if (now - fps_start >= frequency) {
 		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
 		              static_cast<double>(now - fps_start);
+		shown_fps   = static_cast<double>(fps_shown) * static_cast<double>(frequency) / static_cast<double>(now - fps_start);
 		fps_start   = now;
 		fps_frames  = 0;
+		fps_shown   = 0;
 	}
 
+	// Twice a second at most, and never waiting for the main thread (PostToMainThread): the title is set while the
+	// present thread goes on.
+	static uint64_t title_at = 0;
+	if (now - title_at < frequency / 2 || title_posted.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+	title_at = now;
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	auto text = fmt::format(
 	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
+	// (The game's frame rate first, the rate shown with the generated frames after it.)
+	if (generator != nullptr && shown_fps > current_fps + 0.5) {
+		text += fmt::format(" ({}: {:.0f})", generator, shown_fps);
+	}
+	if (const auto waypoints = Loader::DemonsSoulsWarp::RecordedWaypoints(); waypoints != 0) {
+		text += fmt::format(", waypoints: {}", waypoints);
+	}
 
 	// Game buffers or images in system memory, or video memory past its budget (Windows then moves allocations out of
 	// it): the GPU reads those over the bus. Said next to the fps while it lasts.
@@ -1080,7 +1236,10 @@ void WindowContext::UpdateTitle() {
 		text += " | PAUSED (Space to resume)";
 	}
 
-	RunOnMainThread([this, text = std::move(text)] { SDL_SetWindowTitle(window, text.c_str()); });
+	PostToMainThread([this, text = std::move(text)] {
+		SDL_SetWindowTitle(window, text.c_str());
+		title_posted.store(false, std::memory_order_release);
+	});
 }
 
 } // namespace Libs::Graphics

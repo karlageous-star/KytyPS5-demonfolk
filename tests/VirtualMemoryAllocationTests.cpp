@@ -32,6 +32,9 @@
 #endif
 #endif
 
+// (memory.cpp: how a partial unmap of a Windows view goes, 0 split, 1 parked, 2 parked no-access.)
+extern "C" volatile std::atomic_uint32_t kyty_local_park_unmaps;
+
 namespace {
 
 using Libs::LibKernel::Memory::VirtualQueryInfo;
@@ -1370,6 +1373,96 @@ void TestDirectPartialProtectUnmapPreservesNeighbors() {
 	ExpectUnmapped(test, base);
 	ExpectUnmapped(test, base + SceKernelPageSize * 2);
 
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// Partial unmaps of one direct mapping, each way kyty_local_park_unmaps goes (on Windows the range parked in the view):
+// the pages around keep their bytes and backing entries, a fixed map over an unmapped page gets its own bytes (the view
+// split first), and once nothing of the view stays mapped the whole range is free again, mapped again in one piece.
+void TestPartialUnmapParkSplitRelease() {
+	namespace Memory   = Libs::LibKernel::Memory;
+	const char* test   = "PartialUnmapParkSplitRelease";
+	constexpr auto page = SceKernelPageSize;
+	constexpr auto size = SceKernelPageSize * 4;
+	const auto     mode = kyty_local_park_unmaps.load();
+	for (const uint32_t park: {0u, 1u, 2u}) {
+		kyty_local_park_unmaps.store(park);
+		int64_t phys = 0, other = 0;
+		CheckOk(test,
+		        Memory::KernelAllocateDirectMemory(SceKernelDirectMemoryStart, Memory::KernelGetDirectMemorySize(), size,
+		                                           page, SceKernelMtypeC, &phys),
+		        "KernelAllocateDirectMemory");
+		CheckOk(test,
+		        Memory::KernelAllocateDirectMemory(SceKernelDirectMemoryStart, Memory::KernelGetDirectMemorySize(), page,
+		                                           page, SceKernelMtypeC, &other),
+		        "KernelAllocateDirectMemory(other)");
+		void* addr = nullptr;
+		CheckOk(test, Memory::KernelMapNamedDirectMemory(&addr, size, SceKernelProtCpuRw, 0, phys, page, "park"),
+		        "KernelMapNamedDirectMemory");
+		const auto base = reinterpret_cast<uint64_t>(addr);
+		auto       word = [base](uint64_t index) { return reinterpret_cast<volatile uint64_t*>(base + page * index); };
+		for (uint64_t i = 0; i < 4; i++) *word(i) = 0x5041524b00000000ull + i; // "PARK" + i
+
+		// Two partial unmaps of the one view.
+		CheckOk(test, Memory::KernelMunmap(base + page, page), "KernelMunmap(page 1)");
+		CheckOk(test, Memory::KernelMunmap(base + page * 2, page), "KernelMunmap(page 2)");
+		uint64_t value = 0;
+		Check(test,
+		      !Memory::TryReadBacking(base + page, &value, sizeof(value)) &&
+		          !Memory::TryReadBacking(base + page * 2, &value, sizeof(value)),
+		      "an unmapped page kept its backing entry");
+		Check(test, *word(0) == 0x5041524b00000000ull && *word(3) == 0x5041524b00000003ull,
+		      "the pages around a partial unmap lost their bytes");
+		Check(test, Memory::TryReadBacking(base + page * 3, &value, sizeof(value)) && value == 0x5041524b00000003ull,
+		      "the pages around a partial unmap lost their backing entries");
+		Check(test, Memory::TestPlaceholderRangeIsFree(base + page, page * 2), "the unmapped pages are not free");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		MEMORY_BASIC_INFORMATION info {};
+		Check(test,
+		      VirtualQuery(reinterpret_cast<const void*>(base + page), &info, sizeof(info)) != 0 &&
+		          (info.State == MEM_COMMIT) == (park != 0),
+		      park != 0 ? "an unmapped page was not left in its view" : "an unmapped page stayed in its view");
+#endif
+
+		// A fixed map of other memory over page 1.
+		void* fixed = reinterpret_cast<void*>(base + page);
+		CheckOk(test, Memory::KernelMapNamedDirectMemory(&fixed, page, SceKernelProtCpuRw, SceKernelMapFixed, other, page,
+		                                                 "park_fixed"),
+		        "KernelMapNamedDirectMemory(fixed over an unmapped page)");
+		Check(test, reinterpret_cast<uint64_t>(fixed) == base + page, "the fixed map moved");
+		*word(1) = 0x4f54484552000000ull; // "OTHER"
+		Check(test, *word(0) == 0x5041524b00000000ull && *word(3) == 0x5041524b00000003ull,
+		      "a map over an unmapped page lost the bytes around it");
+		Check(test, Memory::TryReadBacking(base + page, &value, sizeof(value)) && value == 0x4f54484552000000ull,
+		      "the map over an unmapped page reads other bytes");
+
+		// The rest unmapped a part at a time; then the whole range is free and mapped again in one piece.
+		CheckOk(test, Memory::KernelMunmap(base + page * 3, page), "KernelMunmap(page 3)");
+		CheckOk(test, Memory::KernelMunmap(base, page), "KernelMunmap(page 0)");
+		CheckOk(test, Memory::KernelMunmap(base + page, page), "KernelMunmap(page 1)");
+		Check(test, Memory::TestPlaceholderRangeIsFree(base, size), "the unmapped range is not free");
+		void* again = reinterpret_cast<void*>(base);
+		CheckOk(test, Memory::KernelMapNamedDirectMemory(&again, size, SceKernelProtCpuRw, SceKernelMapFixed, phys, page,
+		                                                 "park_again"),
+		        "KernelMapNamedDirectMemory(again)");
+		Check(test, *word(2) == 0x5041524b00000002ull && *word(3) == 0x5041524b00000003ull,
+		      "direct memory lost its bytes across the unmaps");
+
+		// Only partial unmaps until nothing is left: the last one releases the view.
+		CheckOk(test, Memory::KernelMunmap(base + page, page * 2), "KernelMunmap(pages 1-2)");
+		CheckOk(test, Memory::KernelMunmap(base, page), "KernelMunmap(page 0)");
+		CheckOk(test, Memory::KernelMunmap(base + page * 3, page), "KernelMunmap(page 3)");
+		Check(test, Memory::TestPlaceholderRangeIsFree(base, size), "the released range is not free");
+		again = reinterpret_cast<void*>(base);
+		CheckOk(test, Memory::KernelMapNamedDirectMemory(&again, size, SceKernelProtCpuRw, SceKernelMapFixed, phys, page,
+		                                                 "park_released"),
+		        "KernelMapNamedDirectMemory(released)");
+		Check(test, *word(0) == 0x5041524b00000000ull, "direct memory lost its bytes across the release");
+		CheckOk(test, Memory::KernelMunmap(base, size), "KernelMunmap");
+		CheckOk(test, Memory::KernelReleaseDirectMemory(phys, size), "KernelReleaseDirectMemory");
+		CheckOk(test, Memory::KernelReleaseDirectMemory(other, page), "KernelReleaseDirectMemory(other)");
+	}
+	kyty_local_park_unmaps.store(mode);
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -2790,6 +2883,7 @@ int main(int argc, char** argv) {
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
+	RunTest(TestPartialUnmapParkSplitRelease);
 	RunTest(TestDirectMapValidationBeforeOwnerMutation);
 	RunTest(TestDirectReleaseRollbackRestoresOwnerMapping);
 	RunTest(TestDirectReleaseContracts);

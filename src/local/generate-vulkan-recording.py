@@ -117,7 +117,10 @@ def generate(registry, header):
             args.append('copied_' + n)
         names.append(name)
         mark_id = MARK_IDS.get(name[:-3] if name.endswith('KHR') else name)
-        mark = (f'LiveTrace::VulkanMark(commandBuffer, {mark_id}, {"true" if mark_id < 10 else "false"}); '
+        # (A barrier's mark names the code that recorded it.)
+        caller = (', reinterpret_cast<uint64_t>(__builtin_return_address(0))'
+                  if name.startswith('vkCmdPipelineBarrier') else '')
+        mark = (f'LiveTrace::VulkanMark(commandBuffer, {mark_id}, {"true" if mark_id < 10 else "false"}{caller}); '
                 if mark_id is not None and ret == 'void' else '')
         signature = ', '.join(decl(p) for p in params)
         # KYTY_BARRIER_MERGE: vkCmdPipelineBarrier's body is Record_vkCmdPipelineBarrier; its wrapper (after it) may hold

@@ -8,26 +8,37 @@
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "kernel/memory.h"
+#include "loader/guestCode.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 
-#include <cstdio>
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <span>
-#include <cstdlib>
 #include <string>
 #include <thread>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <xbyak/xbyak_util.h>
 #endif
 
+// KYTY_SPIN_BACKOFF_US=<n> (live kyty_local_spin_backoff_us, default 50): the workers' TSC helper waits this long
+// during each otherwise-busy spin round; 0 retains the game's original spin.
+extern "C" {
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_spin_backoff_us {[] {
+	const char* value = std::getenv("KYTY_SPIN_BACKOFF_US");
+	return value != nullptr && value[0] != '\0' ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 50u;
+}()};
+}
+
 namespace Loader::DemonsSoulsIdle {
 namespace {
 constexpr uint64_t     PageSize = 0x4000, CaveOffset = 0x8000000;
-uint64_t               cave = 0, site = 0, wait_site = 0;
-std::array<uint8_t, 5> installed_call {}, original_call {}, installed_wait {};
+uint64_t               cave = 0, site = 0, wait_site = 0, spin_site = 0;
+std::array<uint8_t, 5> installed_call {}, original_call {}, installed_wait {}, spin_installed {}, spin_original {};
 
 void KYTY_SYSV_ABI WaitForWork() {
 	Common::Thread::SleepMicroWithoutSpinning(50);
@@ -35,6 +46,11 @@ void KYTY_SYSV_ABI WaitForWork() {
 
 void KYTY_SYSV_ABI YieldMainWait() {
 	std::this_thread::yield();
+}
+
+void KYTY_SYSV_ABI SpinBackoff() {
+	if (const auto us = kyty_local_spin_backoff_us.load(std::memory_order_relaxed); us != 0)
+		Common::Thread::SleepMicroWithoutSpinning(us);
 }
 
 bool Readable(uint64_t address, uint64_t size) {
@@ -49,6 +65,22 @@ bool Readable(uint64_t address, uint64_t size) {
 // bytes after its displacement, landing on the poll's prologue up to its RIP-relative displacement.
 // Only a single such site counts.
 bool FindSites(const Program& program, uint64_t* call, uint64_t* poll) {
+	// The structured pattern covers the 01.005.000 and 01.007.000 worker loops when their fixed RVAs differ.
+	if (const auto match = GuestCode::FindUnique(program, GuestCode::Pattern(IdleCall))) {
+		const uint64_t candidate_call = *match + IdleCallAt;
+		int32_t        displacement = 0;
+		std::memcpy(&displacement, reinterpret_cast<const void*>(candidate_call + 1), sizeof(displacement));
+		const uint64_t candidate_poll = candidate_call + 5 + static_cast<int64_t>(displacement);
+		const GuestCode::Pattern prologue(PollPrologue);
+		const uint64_t           base = program.base_vaddr, end = base + program.mapped_size;
+		if (base <= UINT64_MAX - program.mapped_size && end >= prologue.Size() && candidate_poll >= base &&
+		    candidate_poll <= end - prologue.Size() && Readable(candidate_poll, prologue.Size()) &&
+		    prologue.Matches(reinterpret_cast<const uint8_t*>(candidate_poll))) {
+			*call = candidate_call;
+			*poll = candidate_poll;
+			return true;
+		}
+	}
 	const std::span<const uint8_t> tail(CallBytes.data() + 5, CallBytes.size() - 5);
 	const std::span<const uint8_t> prologue(PollBytes.data(), PollBytes.size() - 1);
 	const std::boyer_moore_horspool_searcher searcher(tail.begin(), tail.end());
@@ -76,6 +108,23 @@ bool FindSites(const Program& program, uint64_t* call, uint64_t* poll) {
 		}
 	}
 	return found == 1;
+}
+
+// The worker wait's TSC helper call (when its caller and helper match the audited pattern).
+uint64_t FindSpinCall(const Program& program) {
+	const auto found = GuestCode::FindUnique(program, GuestCode::Pattern(SpinCall));
+	if (!found) return 0;
+	const uint64_t call = *found + SpinCallAt;
+	int32_t        displacement = 0;
+	std::memcpy(&displacement, reinterpret_cast<const void*>(call + 1), sizeof(displacement));
+	const uint64_t helper = call + 5 + static_cast<int64_t>(displacement);
+	const GuestCode::Pattern body(TscHelper);
+	const uint64_t           base = program.base_vaddr, end = base + program.mapped_size;
+	return base <= UINT64_MAX - program.mapped_size && end >= body.Size() && helper >= base &&
+	               helper <= end - body.Size() && Readable(helper, body.Size()) &&
+	               body.Matches(reinterpret_cast<const uint8_t*>(helper))
+	           ? call
+	           : 0;
 }
 } // namespace
 
@@ -126,6 +175,13 @@ void Install(Program* program) {
 	Xbyak::CodeGenerator code(PageSize, reinterpret_cast<void*>(allocated));
 	EmitThunk(code, reinterpret_cast<const void*>(poll),
 	          reinterpret_cast<const void*>(&WaitForWork));
+	const uint64_t spin_call = FindSpinCall(*program);
+	uint64_t       spin_thunk = 0;
+	if (spin_call != 0) {
+		code.align(16);
+		spin_thunk = reinterpret_cast<uint64_t>(code.getCurr());
+		EmitSpinThunk(code, reinterpret_cast<const void*>(&SpinBackoff));
+	}
 	// KYTY_DS_MAIN_WAIT_YIELD=1: the main thread's job wait yields its CPU each round (demonsSoulsIdle.h).
 	uint64_t wait_call = 0, wait_thunk = 0;
 	if (const char* yield = std::getenv("KYTY_DS_MAIN_WAIT_YIELD"); usa && yield != nullptr && *yield == '1') {
@@ -180,7 +236,32 @@ void Install(Program* program) {
 			Common::VirtualMemory::FlushInstructionCache(wait_call, installed_wait.size());
 		}
 	}
-	InstallEmptyPoll(program);
+	if (spin_call != 0) {
+		spin_installed[0] = 0xe8;
+		const auto spin_disp = static_cast<int32_t>(spin_thunk - (spin_call + 5));
+		std::memcpy(spin_installed.data() + 1, &spin_disp, sizeof(spin_disp));
+		std::memcpy(spin_original.data(), reinterpret_cast<const void*>(spin_call), spin_original.size());
+		std::memcpy(reinterpret_cast<void*>(spin_call), spin_installed.data(), spin_installed.size());
+		if (Common::VirtualMemory::FlushInstructionCache(spin_call, spin_installed.size())) {
+			spin_site = spin_call;
+			std::printf("Demon's Souls job wait: the spin's TSC read at eboot+0x%llx backs off %u us (live "
+			            "kyty_local_spin_backoff_us)\n",
+			            static_cast<unsigned long long>(spin_call - program->base_vaddr),
+			            kyty_local_spin_backoff_us.load(std::memory_order_relaxed));
+		} else {
+			std::memcpy(reinterpret_cast<void*>(spin_call), spin_original.data(), spin_original.size());
+			Common::VirtualMemory::FlushInstructionCache(spin_call, spin_original.size());
+		}
+	}
+	// Both USA opt-ins replace eboot+0x86eb39. Keep the main-wait yield if it was installed; the
+	// empty-poll patch must not allocate a process-lifetime thunk for a site it cannot own.
+	const char* empty_poll = std::getenv("KYTY_DS_EMPTY_POLL_BACKOFF");
+	if (wait_site != 0 && wait_site == program->base_vaddr + MainWaitOffsetUsa && empty_poll != nullptr &&
+	    std::strcmp(empty_poll, "1") == 0) {
+		std::printf("Demon's Souls empty poll: shares its site with the main-wait yield; keeping the main-wait yield\n");
+	} else {
+		InstallEmptyPoll(program);
+	}
 #endif
 }
 
@@ -205,8 +286,15 @@ void Clear() {
 		std::memcpy(reinterpret_cast<void*>(site), original_call.data(), bytes.size());
 		Common::VirtualMemory::FlushInstructionCache(site, bytes.size());
 	}
+	if (spin_site != 0) {
+		std::memcpy(bytes.data(), reinterpret_cast<const void*>(spin_site), bytes.size());
+		if (bytes == spin_installed) {
+			std::memcpy(reinterpret_cast<void*>(spin_site), spin_original.data(), bytes.size());
+			Common::VirtualMemory::FlushInstructionCache(spin_site, bytes.size());
+		}
+	}
 	Libs::LibKernel::Memory::FreeGuestMemory(cave, PageSize);
-	cave = site = 0;
+	cave = site = spin_site = 0;
 }
 bool HasProcessLifetimePatch() {
 #if defined(__x86_64__) || defined(_M_X64)

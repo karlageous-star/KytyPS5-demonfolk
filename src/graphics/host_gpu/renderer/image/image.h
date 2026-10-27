@@ -7,7 +7,9 @@
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
 #include <algorithm>
+#include <atomic>
 #include <compare>
+#include <immintrin.h>
 #include <limits>
 #include <optional>
 #include <span>
@@ -59,6 +61,10 @@ struct ImageBinding {
 void BeginTransitGroup() noexcept;
 void EndTransitGroup() noexcept;
 
+// Moves whenever an image's barrier state (layout, access) is set: what was found in place holds while it does not.
+[[nodiscard]] uint64_t ImageStateEpoch() noexcept;
+void                   MoveImageStateEpoch() noexcept;
+
 class TransitGroup final {
 public:
 	TransitGroup() noexcept { BeginTransitGroup(); }
@@ -91,6 +97,9 @@ public:
 		       range.base_level == 0 && range.level_count == info.resources.levels && range.base_layer == 0 &&
 		       range.layer_count == info.resources.layers;
 	}
+	// A parked image taken back for `image_info` (TextureCache::TakeParkedImage, the same Vulkan image): the state the
+	// constructor gives a new one, but for its Vulkan image, views and barrier state (and serial: the same object).
+	void PrepareReuse(const ImageInfo& image_info);
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
 	[[nodiscard]] const Barriers& GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
@@ -98,6 +107,12 @@ public:
 	                                   std::optional<ImageSubresourceRange> range);
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
 	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
+	// The whole-image barrier state the next transition starts from.
+	[[nodiscard]] const VulkanImageState& CurrentState() const;
+	// The barrier state set to `state` (each subresource's: `subresources`, unless empty), with the barriers there
+	// from the image's.
+	void RestoreState(const VulkanImageState& state, const std::vector<VulkanImageState>& subresources,
+	                  vk::CommandBuffer command_buffer);
 	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	            uint64_t size);
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
@@ -119,9 +134,11 @@ public:
 			m_maybe_hash_valid = false;
 			DropPartialDirty();
 			NoteCpuDirty();
+			++validity;
 		} else if (ImagePageRangesOverlap(info.data.address, info.data.size, vaddr, size)) {
 			m_maybe_cpu_dirty = true;
 			NoteCpuDirty();
+			++validity;
 		}
 	}
 
@@ -143,15 +160,52 @@ public:
 		}
 		AddRange(m_dirty_ranges, begin, end);
 		NoteCpuDirty();
+		++validity;
 	}
 	[[nodiscard]] bool IsPartiallyCpuDirty() const noexcept { return m_cpu_dirty && m_partial_dirty; }
 	[[nodiscard]] const std::vector<std::pair<uint64_t, uint64_t>>& CpuDirtyRanges() const noexcept {
 		return m_dirty_ranges;
 	}
+	// A whole-image CPU-dirty state as the one dirty range it amounts to (a refresh of part of it completes that part:
+	// TextureCache::RefreshTextureLevels).
+	void NarrowCpuDirty() {
+		if (!m_cpu_dirty || m_partial_dirty || m_maybe_cpu_dirty) {
+			EXIT("image cannot narrow its dirty state\n");
+		}
+		m_partial_dirty = true;
+		m_dirty_ranges.assign(1, {info.data.address, info.data.End()});
+		++validity;
+	}
 	// The whole image must be uploaded again (the image stopped watching all of its pages).
 	void DropPartialDirty() noexcept {
 		m_partial_dirty = false;
 		m_dirty_ranges.clear();
+		++validity;
+	}
+	// A refresh of [begin, end) only (the layers one binding covers): the other ranges stay dirty.
+	void RefreshRangeComplete(uint64_t begin, uint64_t end) {
+		if (!IsPartiallyCpuDirty() || m_maybe_cpu_dirty || begin >= end) {
+			EXIT("image cannot complete a partial refresh\n");
+		}
+		SubtractRange(m_dirty_ranges, begin, end);
+		if (m_dirty_ranges.empty()) {
+			RefreshComplete();
+		}
+	}
+	// Removes [begin, end) from sorted, disjoint ranges.
+	static void SubtractRange(std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t begin,
+	                          uint64_t end) {
+		std::vector<std::pair<uint64_t, uint64_t>> kept;
+		kept.reserve(ranges.size() + 1);
+		for (const auto& [range_begin, range_end]: ranges) {
+			if (range_end <= begin || range_begin >= end) {
+				kept.emplace_back(range_begin, range_end);
+				continue;
+			}
+			if (range_begin < begin) kept.emplace_back(range_begin, begin);
+			if (end < range_end) kept.emplace_back(end, range_end);
+		}
+		ranges = std::move(kept);
 	}
 	// Sorted, disjoint [begin, end) ranges; merges adjacent and overlapping ones.
 	static void AddRange(std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t begin,
@@ -175,6 +229,7 @@ public:
 		if (!m_cpu_dirty) {
 			m_maybe_cpu_dirty = true;
 			NoteCpuDirty();
+			++validity;
 		}
 	}
 	[[nodiscard]] bool NeedsMaybeCpuHash() const {
@@ -208,52 +263,108 @@ public:
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
-	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
+	void               MarkGpuModified() noexcept {
+		if (!m_gpu_modified) ++validity; // (a texture GPU work writes refreshes whole: TextureCache::LevelRefreshCandidate)
+		m_gpu_modified = true;
+	}
+	void               ClearGpuModified() noexcept {
+		m_gpu_modified = false;
+		MoveImageStateEpoch();
+	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
-	// GPU buffer writes changed guest bytes of the image, which ones unknown.
-	void MarkBufferModified() noexcept {
+	// Bytes GPU work wrote through a buffer: all of the image (where it is not known), or [begin, end) ranges of it, which
+	// TextureCache::InitializeImage uploads alone (BufferModifiedRanges: sorted, merged; empty when all of it).
+	void               MarkBufferModified() noexcept {
 		m_buffer_modified = true;
 		m_buffer_whole    = true;
 		m_buffer_ranges.clear();
+		m_buffer_fill     = BufferFill::Mixed;
+		++validity;
+		MoveImageStateEpoch();
 	}
-	// GPU buffer writes changed the image's guest bytes [begin, end): kept as ranges until the image is
-	// refreshed, so a write over part of it (or over an aliased smaller image) refreshes only that part
-	// (TextureCache::UploadImagePartial from the buffer). Too many ranges count as the whole image.
-	void MarkBufferModified(uint64_t begin, uint64_t end) noexcept {
-		if (!m_buffer_modified) {
-			m_buffer_modified = true;
-			m_buffer_whole    = false;
-			m_buffer_ranges.clear();
+	void MarkBufferModified(uint64_t begin, uint64_t end) {
+		AddBufferRange(begin, end);
+		m_buffer_fill = BufferFill::Mixed;
+	}
+	// The same from a compute fill of one 32-bit value: while every buffer write since the last upload was a fill of that
+	// value and they cover all of the image, BufferFilledWith gives the value (InitializeImage clears to it).
+	void MarkBufferFilled(uint64_t begin, uint64_t end, uint32_t value) {
+		const bool first = !m_buffer_modified;
+		AddBufferRange(begin, end);
+		if (first) {
+			m_buffer_fill       = BufferFill::Value;
+			m_buffer_fill_value = value;
+		} else if (m_buffer_fill != BufferFill::Value || m_buffer_fill_value != value) {
+			m_buffer_fill = BufferFill::Mixed;
 		}
-		if (m_buffer_whole || begin >= end) {
-			m_buffer_whole = true;
-			return;
-		}
-		AddRange(m_buffer_ranges, begin, end);
-		// (More in a large image with KYTY_PARTIAL_MIXED_UPLOAD, an image uploaded a piece at a time anyway (256 MiB and up,
-		// TextureCache's ChunkedUploadMin): where the whole is GBs, a texture pool's range over memory the GPU writes in
-		// many places, issue #49. Otherwise a few.)
-		const bool large_ranges = kyty_local_partial_mixed_upload_mode.load(std::memory_order_relaxed) != 0 &&
-		                          info.data.size >= (uint64_t {256} << 20u);
-		if (m_buffer_ranges.size() > (large_ranges ? 256u : 32u)) {
-			m_buffer_whole = true;
-			m_buffer_ranges.clear();
-		}
+	}
+	[[nodiscard]] std::optional<uint32_t> BufferFilledWith() const noexcept {
+		if (!m_buffer_modified || m_buffer_fill != BufferFill::Value || m_buffer_whole || m_buffer_ranges.size() != 1 ||
+		    m_buffer_ranges.front().first > info.data.address || m_buffer_ranges.front().second < info.data.End())
+			return std::nullopt;
+		return m_buffer_fill_value;
+	}
+	[[nodiscard]] const std::vector<std::pair<uint64_t, uint64_t>>& BufferModifiedRanges() const noexcept {
+		return m_buffer_ranges;
 	}
 	void ClearBufferModified() noexcept {
 		m_buffer_modified = false;
 		m_buffer_whole    = false;
 		m_buffer_ranges.clear();
+		m_buffer_fill = BufferFill::None;
+		m_buffer_fill_value = 0;
 	}
-	// The buffer-written ranges, when known (empty: the whole image or none).
+	// Compatibility view used by partial uploads; empty means whole-image/unknown.
 	[[nodiscard]] const std::vector<std::pair<uint64_t, uint64_t>>& BufferDirtyRanges() const noexcept {
-		return m_buffer_whole ? s_no_ranges : m_buffer_ranges;
+		return m_buffer_ranges;
 	}
 
+private:
+	void AddBufferRange(uint64_t begin, uint64_t end) {
+		if (!m_buffer_modified) {
+			m_buffer_whole = false;
+			m_buffer_ranges.clear();
+		}
+		m_buffer_modified = true;
+		if (begin >= end) {
+			m_buffer_whole = true;
+			m_buffer_ranges.clear();
+		} else if (!m_buffer_whole) {
+			auto at = std::lower_bound(m_buffer_ranges.begin(), m_buffer_ranges.end(), begin,
+			                           [](const auto& range, uint64_t value) { return range.second < value; });
+			auto last = at;
+			while (last != m_buffer_ranges.end() && last->first <= end) {
+				begin = std::min(begin, last->first);
+				end   = std::max(end, last->second);
+				++last;
+			}
+			at = m_buffer_ranges.erase(at, last);
+			m_buffer_ranges.insert(at, {begin, end});
+			// (Past a few, all of it: what a whole upload costs. More in an image uploaded a piece at a time anyway (256 MiB
+			// and up, TextureCache's ChunkedUploadMin), where the whole is GBs: a texture pool's range over memory the GPU
+			// writes in many places, issue #49.)
+			const bool partial_mixed =
+			    kyty_local_partial_mixed_upload_mode.load(std::memory_order_relaxed) != 0;
+			const size_t range_limit = info.data.size >= (uint64_t {256} << 20u)
+			                               ? (partial_mixed ? 256u : 16u)
+			                               : (partial_mixed ? 32u : 16u);
+			if (m_buffer_ranges.size() > range_limit) {
+				m_buffer_whole = true;
+				m_buffer_ranges.clear();
+			}
+		}
+		++validity;
+		MoveImageStateEpoch();
+	}
+
+public:
 	[[nodiscard]] bool IsStencilModified() const noexcept { return m_stencil_modified; }
-	void               MarkStencilModified() noexcept { m_stencil_modified = true; }
+	void               MarkStencilModified() noexcept {
+		m_stencil_modified = true;
+		++validity;
+		MoveImageStateEpoch();
+	}
 	void               ClearStencilModified() noexcept { m_stencil_modified = false; }
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
@@ -270,33 +381,58 @@ public:
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 
+	// Unique per image object: a deleted image's slot id goes to later images. (First, with validity: on the line of
+	// the slot's liveness, which a lookup reads anyway.)
+	uint64_t         serial             = 0;
+	// Moves with each change of what a use of the image was proven by (RenderExecutor::TableValidateSet): bytes the CPU
+	// wrote or may have written, a GPU buffer or stencil-plane write over them, the first GPU write or use as a target or
+	// storage (a texture used so refreshes whole), its metadata, a stencil association. Registrations over its pages are
+	// stamped instead (TextureCache::RegistrationsSince). (Atomic: the fault handler's threads move it too.)
+	std::atomic<uint64_t> validity {0};
 	ImageInfo        info;
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
+	bool             guest_alias    = false; // TextureCache::GuestTexture: another view of its memory is an image too
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
 	// Page-aligned ranges inside the tracked pages the image stopped watching after partial
 	// CPU writes; always inside CpuDirtyRanges while the image is partially dirty.
 	std::vector<std::pair<uint64_t, uint64_t>> untracked_holes;
-	// KYTY_PARTIAL_IMAGE_DIRTY=2: guest data hashes per partial-dirty granule at the last upload.
-	std::vector<uint64_t> partial_hashes;
 	ImageId          depth_id {};
 	uint64_t         frame_accessed_last = 0; // TextureCache::AdvanceFrame count at the last use
 	size_t           lru_id             = 0;
 	// Transit group that last set the whole-image state; see BeginTransitGroup.
 	uint64_t         transit_group      = 0;
-	// Unique per image object: a deleted image's slot id goes to later images.
-	uint64_t         serial             = 0;
 	// TextureCache frame of the last full upload (KYTY_TEXTURE_RAM_TRIM cooldown; UINT64_MAX: never).
 	uint64_t         frame_uploaded_last = UINT64_MAX;
 	// TextureCache frame (+1) its guest pages last left the working set as a GPU-written target (KYTY_TARGET_RAM_TRIM).
 	uint64_t         frame_target_trimmed = 0;
+	// The staging copy of the last whole-image upload (null: none or not refillable) and the command buffer it was
+	// recorded in (CommandScheduler::CommandSerial): TextureCache::InitializeImage.
+	const Buffer*    staged_ring        = nullptr;
+	uint64_t         staged_offset      = 0;
+	uint64_t         staged_serial      = 0;
+	// The barrier state (backing.state, backing.subresource_states, transit_group): changed under this lock.
+	struct StateLock {
+		explicit StateLock(const Image& owner) noexcept: image(owner) {
+			while (image.state_busy.exchange(true, std::memory_order_acquire)) _mm_pause();
+		}
+		~StateLock() { image.state_busy.store(false, std::memory_order_release); }
+		KYTY_CLASS_NO_COPY(StateLock);
+		const Image& image;
+	};
+	mutable std::atomic<bool> state_busy {false};
 	// RegisterImage calls on this object: a proof names one registration.
 	uint32_t         registrations      = 0;
+	// TextureCache::ViewLevelBytes's last answer: the view's levels (base | count << 8; UINT32_MAX: none yet) and their
+	// bytes [level_begin, level_end) (level_end 0: the view needs the whole image).
+	mutable uint32_t level_view         = UINT32_MAX;
+	mutable uint64_t level_begin        = 0;
+	mutable uint64_t level_end          = 0;
 
 private:
 	friend struct ImageTestAccess;
@@ -318,12 +454,14 @@ private:
 	bool              m_maybe_hash_valid = false;
 	bool              m_gpu_modified     = false;
 	bool              m_buffer_modified  = false;
+	bool              m_buffer_whole     = false; // (with m_buffer_modified: where is not known)
+	std::vector<std::pair<uint64_t, uint64_t>> m_buffer_ranges;
+	enum class BufferFill : uint8_t { None, Value, Mixed };
+	BufferFill        m_buffer_fill       = BufferFill::None;
+	uint32_t          m_buffer_fill_value = 0;
 	bool              m_stencil_modified  = false;
 	bool              m_partial_dirty     = false;
-	bool              m_buffer_whole      = false;
 	std::vector<std::pair<uint64_t, uint64_t>> m_dirty_ranges;
-	std::vector<std::pair<uint64_t, uint64_t>> m_buffer_ranges;
-	inline static const std::vector<std::pair<uint64_t, uint64_t>> s_no_ranges {};
 };
 
 namespace ImageOps {

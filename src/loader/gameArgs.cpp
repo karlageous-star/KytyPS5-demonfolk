@@ -1,6 +1,9 @@
 #include "loader/gameArgs.h"
 
+#include "common/emulatorConfig.h"
+#include "common/file.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
+#include "loader/demonsSoulsSuperResolution.h"
 #include "loader/systemContent.h"
 
 #include <cctype>
@@ -11,39 +14,19 @@
 #include <iterator>
 #include <mutex>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace Loader::GameArgs {
 namespace {
 
-// The "name=value" entries of a list separated by ';' or ',', each trimmed of its spaces.
-std::vector<std::string> Entries(const std::string& list) {
-	std::vector<std::string> out;
-	for (size_t at = 0; at < list.size();) {
-		auto end = list.find_first_of(";,", at);
-		if (end == std::string::npos) end = list.size();
-		const auto first = list.find_first_not_of(' ', at);
-		const auto last  = list.find_last_not_of(' ', end - 1);
-		if (first != std::string::npos && first < end && last >= first) out.push_back(list.substr(first, last - first + 1));
-		at = end + 1;
-	}
-	return out;
-}
-
-// The name of an entry: what is before its '=', without the spaces before the '='.
-std::string NameOf(const std::string& entry) {
-	auto       name = entry.substr(0, entry.find('='));
-	const auto last = name.find_last_not_of(' ');
-	return last == std::string::npos ? std::string() : name.substr(0, last + 1);
-}
-
-// KYTY_GRAPHICS_PRESET=medium|low|lowest|high (unset: low, the owner's default since 10-18; high: the game's own
-// settings, nothing changes). Demon's Souls' own console variables for
-// what a frame draws. Low and Lowest are the Graphics Low and Lowest presets of the chenxiao launcher: the level of
-// detail as for a 720 or 480-line picture (r_forceViewportHeightForPixelSizeCalc), sun shadows to 125 or 60 m
-// (sunShadowMaxDistance, 250 by default), and Lowest also without ambient shadowing or spot light shadows. Medium is
-// between the game's settings and Low: detail as for 900 lines, sun shadows to 180 m. r_forceShadowLOD is never set:
-// it draws objects without their shadow meshes, so they vanish (the cart and the barricades at the Gates of Boletaria).
+// One "+name=value" line per console variable: Demon's Souls' defaults and graphics preset, then those of
+// KYTY_GAME_CONVARS (';' or ',' between entries), whose names replace the defaults'. The default: no XPR index-buffer culling, a GPU pass that culls
+// every object's triangles (~2800 compute dispatches a frame at Boletaria 1-1) before drawing them; the PC GPU draws
+// them all instead, the image unchanged (Boletaria 1-1 standing 34.30 -> 36.48 fps; doIndexBufferCulling=true: back).
+// Above a 60 Hz vblank also gameMinDeltaTime=0.004 (as run_ds.sh gives it): the game steps by at least a frame of its
+// target rate each frame, so every frame past 60 fps played it that much faster (whatever started the emulator).
 struct Preset {
 	const char* name;
 	const char* convars;
@@ -55,10 +38,14 @@ constexpr Preset presets[] = {
 	           "r_enableAmbientShadowing=false;r_enableSpotShadows=false"},
 };
 
-// The entries of the chosen preset (low when unset; none for high, or when the game is not Demon's Souls). Called once, from
-// ExtraLines, so the choice is logged once.
+std::string NameOf(const std::string& entry) {
+	auto       name = entry.substr(0, entry.find('='));
+	const auto last = name.find_last_not_of(' ');
+	return last == std::string::npos ? std::string() : name.substr(0, last + 1);
+}
+
 std::vector<std::string> PresetEntries() {
-	const char* env  = std::getenv("KYTY_GRAPHICS_PRESET");
+	const char* env = std::getenv("KYTY_GRAPHICS_PRESET");
 	const char* name = env == nullptr || *env == '\0' ? "low" : env;
 	if (std::strcmp(name, "high") == 0) return {};
 	const Preset* chosen = nullptr;
@@ -76,65 +63,123 @@ std::vector<std::string> PresetEntries() {
 		return {};
 	}
 	std::printf("Graphics preset: %s (%s)\n", name, chosen->convars);
-	return Entries(chosen->convars);
+	std::vector<std::string> entries;
+	const std::string list = chosen->convars;
+	for (size_t at = 0; at < list.size();) {
+		auto end = list.find_first_of(";,", at);
+		if (end == std::string::npos) end = list.size();
+		const auto first = list.find_first_not_of(' ', at);
+		const auto last = list.find_last_not_of(' ', end - 1);
+		if (first != std::string::npos && first < end && last >= first)
+			entries.push_back(list.substr(first, last - first + 1));
+		at = end + 1;
+	}
+	return entries;
 }
 
-// One "+name=value" line per entry of KYTY_GAME_CONVARS, then the preset's entries that KYTY_GAME_CONVARS does not
-// set for the same name (its own entries win).
 const std::string& ExtraLines() {
 	static const std::string lines = [] {
-		const char* value = std::getenv("KYTY_GAME_CONVARS");
-		const auto  user  = Entries(value != nullptr ? value : "");
-		std::string out;
-		for (const auto& entry: user) out += "+" + entry + "\n";
-		for (const auto& entry: PresetEntries()) {
-			bool set = false;
-			for (const auto& own: user) set = set || NameOf(own) == NameOf(entry);
-			if (!set) out += "+" + entry + "\n";
+		std::vector<std::pair<std::string, std::string>> entries; // (name, "name=value")
+		const auto add = [&](const std::string& list) {
+			for (size_t at = 0; at < list.size();) {
+				auto end = list.find_first_of(";,", at);
+				if (end == std::string::npos) end = list.size();
+				const auto first = list.find_first_not_of(' ', at);
+				const auto last  = list.find_last_not_of(' ', end - 1);
+				if (first != std::string::npos && first < end && last >= first) {
+					auto       entry = list.substr(first, last - first + 1);
+					const auto name  = NameOf(entry);
+					std::erase_if(entries, [&](const auto& held) { return held.first == name; });
+					entries.emplace_back(name, std::move(entry));
+				}
+				at = end + 1;
+			}
+		};
+		const char* value = std::getenv("KYTY_GAME_CONVARS"); // (0: no injected console variables, including the preset)
+		if (value != nullptr && std::string_view(value) == "0") return std::string();
+		if (Libs::Graphics::DemonsSouls::IsSupportedGame()) {
+			add("doIndexBufferCulling=false");
+			if (Config::GetVblankFrequency() > 60) add("gameMinDeltaTime=0.004");
+			for (const auto& entry: PresetEntries()) add(entry);
 		}
+		if (value != nullptr) add(value);
+		std::string out;
+		for (const auto& [name, entry]: entries) out += "+" + entry + "\n";
 		return out;
 	}();
 	return lines;
 }
 
-// The engine opens it as "$/packagecmdlineargs.txt" (lower case): the name is compared without case.
-bool IsArgsFile(const std::filesystem::path& real) {
-	if (ExtraLines().empty()) return false;
+enum class Kind { None, Args, PerfConfig };
+
+// The engine opens them as "$/packagecmdlineargs.txt" and "$/misc/renderconfig_ps5_perf.txt" (lower case): the
+// names are compared without case.
+Kind KindOf(const std::filesystem::path& real) {
 	auto name = real.filename().string();
 	for (auto& c: name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-	return name == "packagecmdlineargs.txt";
+	if (name == "packagecmdlineargs.txt" && !ExtraLines().empty()) return Kind::Args;
+	if (name == "renderconfig_ps5_perf.txt" && DemonsSoulsSuperResolution::Active()) return Kind::PerfConfig;
+	return Kind::None;
 }
 
-std::string Contents(const std::filesystem::path& real) {
-	std::ifstream in(real, std::ios::binary);
-	std::string   text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+std::string Contents(const std::filesystem::path& real, Kind kind) {
+	std::string  text;
+	Common::File in;
+	if (in.Open(real, Common::File::Mode::Read)) { // (also a game archive's member)
+		text.resize(static_cast<size_t>(in.Size()));
+		uint32_t read = 0;
+		in.Read(text.data(), static_cast<uint32_t>(text.size()), &read);
+		text.resize(read);
+	}
 	if (!text.empty() && text.back() != '\n') text += '\n';
-	return text + ExtraLines();
+	if (kind == Kind::Args) return text + ExtraLines();
+	// The performance mode's display mode: 5 (the PS5 Pro's: 2688x1512 and super resolution), the rest of it kept.
+	std::string out;
+	bool        replaced = false;
+	for (size_t at = 0; at < text.size();) {
+		const auto end  = text.find('\n', at);
+		const auto line = text.substr(at, end - at + 1);
+		if (line.find("r_Wants4K") != std::string::npos) {
+			out += "+r_Wants4K = WantsTrinity\n";
+			replaced = true;
+		} else {
+			out += line;
+		}
+		at = end + 1;
+	}
+	return replaced ? out : out + "+r_Wants4K = WantsTrinity\n";
 }
 
 } // namespace
 
 std::filesystem::path RedirectRead(const std::filesystem::path& real) {
-	if (!IsArgsFile(real)) return {};
+	const auto kind = KindOf(real);
+	if (kind == Kind::None) return {};
 	static std::mutex mutex;
 	std::lock_guard   lock(mutex);
 	// The copy goes next to the temporary files; one that cannot be written leaves the file as it is.
 	std::error_code error;
-	const auto      copy = std::filesystem::temp_directory_path(error) / "kyty-PackageCmdLineArgs.txt";
+	const auto      copy = std::filesystem::temp_directory_path(error) /
+	                  (kind == Kind::Args ? "kyty-PackageCmdLineArgs.txt" : "kyty-RenderConfig_PS5_Perf.txt");
 	if (error) return {};
-	const auto    text = Contents(real);
+	const auto    text = Contents(real, kind);
 	std::ofstream out(copy, std::ios::binary | std::ios::trunc);
 	out.write(text.data(), static_cast<std::streamsize>(text.size()));
 	out.close();
 	if (!out) return {};
-	std::printf("Game args: %s read with\n%s", real.string().c_str(), ExtraLines().c_str());
+	if (kind == Kind::Args) {
+		std::printf("Game args: %s read with\n%s", real.string().c_str(), ExtraLines().c_str());
+	} else {
+		std::printf("Game args: %s read with r_Wants4K = WantsTrinity\n", real.string().c_str());
+	}
 	std::fflush(stdout);
 	return copy;
 }
 
 std::optional<uint64_t> RedirectedSize(const std::filesystem::path& real) {
-	if (!IsArgsFile(real)) return std::nullopt;
-	return Contents(real).size();
+	const auto kind = KindOf(real);
+	if (kind == Kind::None) return std::nullopt;
+	return Contents(real, kind).size();
 }
 
 } // namespace Loader::GameArgs

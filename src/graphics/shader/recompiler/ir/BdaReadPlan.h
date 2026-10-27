@@ -23,11 +23,13 @@ struct BdaReadSpan {
 	BdaReadWord low, high;
 	int64_t     begin = 0, end = 0; // byte offsets, exclusive end
 	bool        scalar_base = false;
+	bool        operator==(const BdaReadSpan&) const = default;
 };
 struct BdaReadPlan {
 	static constexpr uint32_t Capacity = 64;
 	std::vector<BdaReadSpan>  spans;
 	bool                      complete = false;
+	bool                      operator==(const BdaReadPlan&) const = default;
 };
 
 [[nodiscard]] BdaReadPlan BuildBdaReadPlan(const Program& program);

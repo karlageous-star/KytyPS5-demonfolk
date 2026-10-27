@@ -1,6 +1,8 @@
 #include "common/hostException.h"
 #include "common/guardedCopy.h"
 
+#include "common/guardedCopy.h"
+
 #include <atomic>
 #include <cstdio>
 
@@ -90,12 +92,35 @@ bool InitializeThreadSignalStack() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
-// RunOnGuestStack (pthread.cpp) runs guest code with the TEB's StackBase and StackLimit zeroed (__chkstk never probes
-// the guest's memory). Windows cannot dispatch an exception to the frames' handlers there: it marks the stack invalid
-// and ends the process with the exception's code, whatever a frame would have done with it.
+static std::atomic<GuardPageHandler> g_guard_page_handler {nullptr};
+
+void SetGuardPageHandler(GuardPageHandler handler) {
+	g_guard_page_handler.store(handler, std::memory_order_release);
+}
+
+static std::atomic<ReadGuardArm>    g_read_guard_arm {nullptr};
+static std::atomic<ReadGuardSettle> g_read_guard_settle {nullptr};
+
+void SetReadGuardHandlers(ReadGuardArm arm, ReadGuardSettle settle) {
+	g_read_guard_settle.store(settle, std::memory_order_release);
+	g_read_guard_arm.store(arm, std::memory_order_release);
+}
+
+static std::atomic<ProbeHandler> g_probe_handler {nullptr};
+
+void SetProbeHandler(ProbeHandler handler) {
+	g_probe_handler.store(handler, std::memory_order_release);
+}
+
+// RunOnGuestStack (pthread.cpp) runs guest code with the TEB's stack range set to the guest stacks' region
+// (KYTY_GUEST_TEB_STACK_RANGE_ASM; zeros where the host stack is not above it). Windows cannot dispatch an exception
+// through the guest frames there (guest code has no unwind data): the process ends with the exception's code, whatever
+// a frame would have done with it.
 static bool OnGuestStack() {
-	const auto* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
-	return tib->StackBase == nullptr && tib->StackLimit == nullptr;
+	const auto* tib   = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+	const auto  base  = reinterpret_cast<uint64_t>(tib->StackBase);
+	const auto  limit = reinterpret_cast<uint64_t>(tib->StackLimit);
+	return (base == 0 && limit == 0) || (base == GuestStacksHigh && limit == GuestStacksLow);
 }
 
 // "module+0xoffset" of a code address (or the bare address).
@@ -211,6 +236,39 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	    Common::ResumeGuardedCopy(exception->ContextRecord)) {
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
+	// A guest page's read guard (KYTY_READ_GUARD): served as the access violation no access raises.
+	bool read_guard = false;
+	if (exception_record->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
+		// (First: guest stacks, whose guards the guard-page handler takes, lie among guest memory's addresses but are
+		// private memory, no view's.)
+		const auto arm = g_read_guard_arm.load(std::memory_order_acquire);
+		if (arm != nullptr && exception_record->NumberParameters >= 2 && arm(exception_record->ExceptionInformation[1])) {
+			read_guard = true;
+		} else {
+			const auto handler = g_guard_page_handler.load(std::memory_order_acquire);
+			return handler != nullptr && exception_record->NumberParameters >= 2 &&
+			               handler(exception_record->ExceptionInformation[1], exception->ContextRecord)
+			           ? EXCEPTION_CONTINUE_EXECUTION
+			           : EXCEPTION_CONTINUE_SEARCH;
+		}
+	}
+	const bool access_violation = exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION || read_guard;
+	const auto served           = [&] {
+		if (read_guard) g_read_guard_settle.load(std::memory_order_acquire)(exception_record->ExceptionInformation[1]);
+		return EXCEPTION_CONTINUE_EXECUTION;
+	};
+
+	// A guarded copy reached a page without access: it stops there (never the guest's fault). (A read guard stays armed.)
+	if (access_violation && ResumeGuardedCopy(exception->ContextRecord)) {
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+	if (access_violation && exception_record->NumberParameters >= 2) {
+		if (const auto probe = g_probe_handler.load(std::memory_order_acquire);
+		    probe != nullptr &&
+		    probe(exception_record->ExceptionInformation[1], exception->ContextRecord->Rip, exception->ContextRecord,
+		          exception_record->ExceptionInformation[0] == 1))
+			return served();
+	}
 
 	if (exception_record->ExceptionCode == DBG_PRINTEXCEPTION_C ||
 	    exception_record->ExceptionCode == DBG_PRINTEXCEPTION_WIDE_C) {
@@ -227,7 +285,7 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	info.native_code       = exception_record->ExceptionCode;
 	info.native_context    = exception->ContextRecord;
 
-	if (exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+	if (access_violation) {
 		info.type = ExceptionType::AccessViolation;
 		switch (exception_record->ExceptionInformation[0]) {
 			case 0: info.access_violation_type = AccessViolationType::Read; break;
@@ -261,7 +319,7 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 
 	const auto handler = g_handler.load(std::memory_order_acquire);
 	if (handler != nullptr && handler(info)) {
-		return EXCEPTION_CONTINUE_EXECUTION;
+		return served();
 	}
 	return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -343,6 +401,12 @@ static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 constexpr uint64_t PAGE_FAULT_ERROR_WRITE       = 0x02;
 constexpr uint64_t PAGE_FAULT_ERROR_INSTRUCTION = 0x10;
 
+static std::atomic<ProbeHandler> g_probe_handler {nullptr};
+
+void SetProbeHandler(ProbeHandler handler) {
+	g_probe_handler.store(handler, std::memory_order_release);
+}
+
 // Let the kernel handle an unresolved fault on retry.
 static void ChainToDefault(int signal_number) noexcept {
 	struct sigaction restore {};
@@ -364,6 +428,12 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 	if (signal_number == SIGSEGV || signal_number == SIGBUS) {
 		info.type             = ExceptionType::AccessViolation;
 		const auto error_code = static_cast<uint64_t>(gregs[REG_ERR]);
+		// The texture offload's pages first, as on Windows: true runs the access again.
+		if (const auto probe = g_probe_handler.load(std::memory_order_acquire);
+		    probe != nullptr && probe(reinterpret_cast<uint64_t>(signal_info->si_addr),
+		                              static_cast<uint64_t>(gregs[REG_RIP]), context,
+		                              (error_code & PAGE_FAULT_ERROR_WRITE) != 0))
+			return;
 		if ((error_code & PAGE_FAULT_ERROR_INSTRUCTION) != 0) {
 			info.access_violation_type = AccessViolationType::Execute;
 		} else if ((error_code & PAGE_FAULT_ERROR_WRITE) != 0) {
@@ -465,5 +535,9 @@ bool InstallHandler(Handler handler) {
 	g_install_state.store(2, std::memory_order_release);
 	return true;
 }
+
+#if defined(__APPLE__)
+void SetProbeHandler(ProbeHandler /*handler*/) {}
+#endif
 
 } // namespace Common::HostException

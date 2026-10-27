@@ -5,6 +5,8 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <cstdio>
+
 namespace Libs::Graphics {
 
 SamplerCache::~SamplerCache() {
@@ -106,23 +108,27 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 		return vk::SamplerAddressMode::eClampToBorder;
 	};
 
-	vk::BorderColor border = vk::BorderColor::eIntTransparentBlack;
+	// Float border colors: the game samples UNORM, float and depth formats, for which Vulkan leaves an INT border color
+	// undefined (read as its bits as a float, opaque white is ~0). A shadow map's compare sampler clamped to an opaque white
+	// border (lit outside the map) then read as in shadow, and past sunShadowMaxDistance, which the Low and Lowest presets
+	// shorten, surfaces went dark. Transparent black is zero either way; integer formats would want INT colors.
+	vk::BorderColor border = vk::BorderColor::eFloatTransparentBlack;
 	switch (static_cast<Prospero::SamplerBorderColor>(r.BorderColorType())) {
 		case Prospero::SamplerBorderColor::kTransBlack:
-			border = vk::BorderColor::eIntTransparentBlack;
+			border = vk::BorderColor::eFloatTransparentBlack;
 			break;
 		case Prospero::SamplerBorderColor::kOpaqueBlack:
-			border = vk::BorderColor::eIntOpaqueBlack;
+			border = vk::BorderColor::eFloatOpaqueBlack;
 			break;
 		case Prospero::SamplerBorderColor::kOpaqueWhite:
-			border = vk::BorderColor::eIntOpaqueWhite;
+			border = vk::BorderColor::eFloatOpaqueWhite;
 			break;
 		case Prospero::SamplerBorderColor::kFromTable:
 			LOGF(
 			    "temporary: approximating table border color as transparent black, index = %" PRIu16
 			    "\n",
 			    r.BorderColorPtr());
-			border = vk::BorderColor::eIntTransparentBlack;
+			border = vk::BorderColor::eFloatTransparentBlack;
 			break;
 		default: EXIT("unknown border color: %d", static_cast<int>(r.BorderColorType()));
 	}
@@ -158,6 +164,18 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 		sampler_info.maxAnisotropy    = 1.0f;
 		sampler_info.compareEnable    = VK_FALSE;
 		sampler_info.mipLodBias       = 0.0f;
+	}
+	// (In the log: the first sampler of each opaque border color that samples its border.)
+	if (static bool noted[2] {}; border != vk::BorderColor::eFloatTransparentBlack) {
+		const bool white   = border == vk::BorderColor::eFloatOpaqueWhite;
+		const auto borders = [](vk::SamplerAddressMode mode) { return mode == vk::SamplerAddressMode::eClampToBorder; };
+		if (!noted[white ? 1 : 0] && (borders(sampler_info.addressModeU) || borders(sampler_info.addressModeV) ||
+		                              borders(sampler_info.addressModeW))) {
+			noted[white ? 1 : 0] = true;
+			std::printf("Samplers: the first with an opaque %s border (clamp %u/%u/%u, depth compare %u)\n", white ? "white" : "black",
+			            static_cast<unsigned>(r.ClampX()), static_cast<unsigned>(r.ClampY()), static_cast<unsigned>(r.ClampZ()),
+			            static_cast<unsigned>(r.DepthCompareFunc()));
+		}
 	}
 
 	vk::Sampler vk_sampler = nullptr;

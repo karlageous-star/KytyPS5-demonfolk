@@ -52,6 +52,22 @@ struct PadVibrationParam;
 struct PadLightBarParam;
 struct PadTriggerEffectParam;
 
+// scePadGetTriggerEffectState's information: which state each trigger's effect is in.
+struct PadTriggerEffectStateInformation {
+	int32_t state[2];
+};
+
+// The states a DualSense reports for the effect a trigger runs (scePadTriggerEffectState).
+enum PadTriggerEffectState {
+	PAD_TRIGGER_STATE_NO_FORCE             = 1,
+	PAD_TRIGGER_STATE_IS_PUSHING           = 2,
+	PAD_TRIGGER_STATE_WEAPON_NOT_PRESSED    = 3,
+	PAD_TRIGGER_STATE_WEAPON_ALMOST_PRESSED = 4,
+	PAD_TRIGGER_STATE_WEAPON_FULLY_PRESSED  = 5,
+	PAD_TRIGGER_STATE_VIBRATION_NOT_FIRING  = 6,
+	PAD_TRIGGER_STATE_VIBRATION_IS_FIRING   = 7,
+};
+
 inline int controller_get_axis(int min, int max, int value) {
 	int v = (255 * (value - min)) / (max - min);
 	if (v < 0) {
@@ -70,6 +86,9 @@ void SetAxis(int id, Axis axis, int value);
 void SetRightStick(int id, int x, int y);
 void SetTouchPad(int id, int finger, bool down, float x, float y);
 void ResetInputState();
+// Scripted input (live `pad`, automated tours): for `seconds` from now the game reads these stick values (0..255, 128
+// centre; -1: the host's) and these buttons OR-ed into the host's.
+void SetScriptedInput(int left_x, int left_y, int right_x, int right_y, uint32_t buttons, double seconds);
 
 int KYTY_SYSV_ABI PadInit();
 int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param);
@@ -82,6 +101,7 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data);
 int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num);
 int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param);
 int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* param);
+int KYTY_SYSV_ABI PadGetTriggerEffectState(int handle, PadTriggerEffectStateInformation* info);
 int KYTY_SYSV_ABI PadResetLightBar(int handle);
 int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param);
 

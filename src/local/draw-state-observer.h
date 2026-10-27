@@ -25,6 +25,9 @@ struct Shadow {
 	std::array<uint64_t, Pm4::SH_NUM> sh {};
 	std::array<uint64_t, Pm4::UC_NUM> uc {};
 	uint64_t generation = uint64_t {1} << 32u;
+	// The register spaces (bit 0 CX, 1 SH, 2 UC) a value changed in since RenderExecutor::NativeXprStateKey last hashed
+	// the state: it hashes the context and the user configuration again only after a change of theirs.
+	uint32_t key_changes = 7;
 	bool chain      = false; // the previous graphics draw was an indexed indirect draw
 	bool dirty      = true;  // graphics state changed since that draw
 	bool last_clean = false; // the latest DRAW_INDEX_INDIRECT was clean
@@ -43,12 +46,14 @@ inline void WriteRegister(uint32_t space, uint32_t raw_offset, uint32_t value) {
 	const auto update = [&](auto& values) {
 		if (offset >= values.size()) {
 			s.dirty = true;
+			s.key_changes |= 1u << space;
 			return;
 		}
 		const uint64_t entry = s.generation | value;
 		if (values[offset] != entry) {
 			values[offset] = entry;
 			s.dirty        = true;
+			s.key_changes |= 1u << space;
 		}
 	};
 	if (space == 1) {
@@ -83,19 +88,22 @@ inline void Invalidate() {
 		s.uc.fill(0);
 		s.generation = uint64_t {1} << 32u;
 	}
-	s.chain = false;
-	s.dirty = true;
+	s.chain       = false;
+	s.dirty       = true;
+	s.key_changes = 7;
 }
 
 // Every packet the command processor is about to execute.
 inline void ObservePacket(uint32_t opcode, const uint32_t* packet, uint32_t packet_dw, bool predicated_skip) {
 	auto& s = g_shadow;
 	if (predicated_skip) {
-		s.dirty = true;
+		s.dirty       = true;
+		s.key_changes = 7;
 		return;
 	}
 	switch (opcode) {
 		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
 		case Pm4::IT_DRAW_INDEX_2:
 		case Pm4::IT_DRAW_INDEX_OFFSET_2:
 			s.last_clean = s.chain && !s.dirty;
@@ -116,7 +124,8 @@ inline void ObservePacket(uint32_t opcode, const uint32_t* packet, uint32_t pack
 		case Pm4::IT_SET_SH_REG_INDIRECT:
 		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
 			if (packet_dw < 5) {
-				s.dirty = true;
+				s.dirty       = true;
+				s.key_changes = 7;
 				return;
 			}
 			WriteIndirectBlock(opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT ? 0u
@@ -124,6 +133,9 @@ inline void ObservePacket(uint32_t opcode, const uint32_t* packet, uint32_t pack
 			                                                              : 2u,
 			                   packet);
 			return;
+		// The context registers back to their defaults (CommandProcessor::ApplyContextStateOperation): a shadow value is
+		// no longer what a register holds (one written again with it after this would not look changed).
+		case Pm4::IT_CLEAR_STATE: Invalidate(); return;
 		case Pm4::IT_INDEX_BASE:
 		case Pm4::IT_INDEX_BUFFER_SIZE:
 		case Pm4::IT_INDEX_TYPE:
@@ -151,8 +163,9 @@ inline void ObservePacket(uint32_t opcode, const uint32_t* packet, uint32_t pack
 		case Pm4::IT_DMA_DATA: return;
 		default:
 			// Any other draw ends the chain; anything unknown may change state.
-			s.chain = false;
-			s.dirty = true;
+			s.chain       = false;
+			s.dirty       = true;
+			s.key_changes = 7;
 			return;
 	}
 }

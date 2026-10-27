@@ -16,7 +16,6 @@ namespace Libs::Graphics {
 
 class CommandScheduler;
 class Image;
-class StreamBuffer;
 struct GraphicContext;
 struct TileManagerTestAccess;
 
@@ -60,13 +59,17 @@ public:
 		uint64_t target_slice_stride = 0;
 	};
 
-	TileManager(GraphicContext& graphics, CommandScheduler& scheduler, StreamBuffer& stream_buffer);
+	TileManager(GraphicContext& graphics, CommandScheduler& scheduler);
 	~TileManager();
 	KYTY_CLASS_NO_COPY(TileManager);
 
-	// The returned device-local buffer remains alive through the current scheduler tick.
+	// The returned device-local buffer remains alive through the current scheduler tick. (`host_source`: `tiled` is in
+	// system memory, the image staging ring: KYTY_TILER_TIMING counts it apart.) `reuse_scratch`: into the buffer the
+	// last such call of this tick returned where it holds linear_capacity bytes (its readers recorded since finish first):
+	// the result is good until the next such call.
 	[[nodiscard]] Result Detile(vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
-	                            uint64_t linear_capacity, std::span<const GpuTileInfo> infos);
+	                            uint64_t linear_capacity, std::span<const GpuTileInfo> infos,
+	                            bool host_source = false, bool reuse_scratch = false);
 	void DetileInto(vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
 	                uint64_t linear_capacity, std::span<const GpuTileInfo> infos, Result target);
 	void Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity, vk::Buffer tiled,
@@ -124,7 +127,6 @@ private:
 	struct Dispatch {
 		Push     push {};
 		uint32_t pipeline_slot = 0;
-		uint64_t params_offset = 0;
 	};
 	struct Scratch {
 		vk::Buffer    buffer     = nullptr;
@@ -153,11 +155,14 @@ private:
 	            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
 	            std::span<Dispatch> dispatches, bool clear_target, bool target_reused = false);
 	[[nodiscard]] vk::Pipeline GetPipeline(uint32_t slot);
+	[[nodiscard]] vk::Pipeline CreatePipeline(const uint32_t* code, size_t words, const char* what);
+	// KYTY_TILER_TIMING=1: the GPU time of each detile (timestamps after all earlier work and after it), summed.
+	[[nodiscard]] uint32_t TimingBegin(vk::CommandBuffer command);
+	void                   TimingEnd(vk::CommandBuffer command, uint32_t slot, uint64_t bytes, bool host_source);
 	void                       SwapBgra16(Result input, Result output, uint32_t pixels);
 
 	GraphicContext&                         m_graphics;
 	CommandScheduler&                       m_scheduler;
-	StreamBuffer&                           m_stream_buffer;
 	vk::DescriptorSetLayout                 m_descriptor_layout = nullptr;
 	vk::PipelineLayout                      m_pipeline_layout   = nullptr;
 	std::array<vk::Pipeline, PipelineCount> m_pipelines {};
@@ -181,6 +186,12 @@ private:
 	std::mutex                 m_hold_mutex;
 	uint32_t                   m_hold_depth = 0;
 	std::vector<Scratch>       m_held;
+	uint64_t                   m_scratch_pool_budget = 0; // ScratchPoolBudget, at most a 32nd of the GPU's memory budget
+	// Detile's reuse_scratch buffer (its capacity) and the tick it was taken in.
+	Result                     m_reused_scratch {};
+	uint64_t                   m_reused_tick = 0;
+	vk::QueryPool              m_timing_pool         = nullptr;
+	uint32_t                   m_timing_next         = 0;
 };
 
 } // namespace Libs::Graphics

@@ -363,6 +363,16 @@ public:
         out_records = std::move(records); out_pipelines = std::move(pipelines);
         return true;
     }
+    // A seed file, or a warmup file of any device signature (kyty_shader_precompile --make-hints reads recordings).
+    static bool ReadInputs(const std::filesystem::path& location, std::vector<std::vector<uint32_t>>& out_records,
+                           std::vector<std::vector<uint32_t>>& out_pipelines) {
+        const auto signature = FileIdentity(location);
+        std::vector<uint32_t> contents;
+        const bool legacy = signature.starts_with("KytyShaderSeeds2:") || signature.starts_with("KytyShaderWarmup3:");
+        const bool current = signature.starts_with("KytyShaderSeeds3:") || signature.starts_with("KytyShaderWarmup4:");
+        return (legacy || current) && ReadFile(location, signature, contents) &&
+               Parse(contents, out_records, out_pipelines, legacy);
+    }
 
 private:
     struct Pending { bool pipeline; std::vector<uint32_t> words; };
@@ -538,4 +548,15 @@ private:
         return !ec;
     }
 };
+
+// A recipe's identity in the scene tags (local/scene-tags.h): the hash of its words as the recording holds them
+// (its shader records by index, so of this recording only); never 0.
+inline uint64_t RecipeKey(const std::vector<uint32_t>& words) {
+    const auto key = XXH3_64bits(words.data(), words.size() * 4);
+    return key != 0 ? key : 1;
+}
+inline uint64_t RecipeKey(PipelineRecord record) {
+    Writer writer;
+    return VisitPipeline(writer, record) ? RecipeKey(writer.words) : 0;
+}
 } // namespace LocalShaderWarmup

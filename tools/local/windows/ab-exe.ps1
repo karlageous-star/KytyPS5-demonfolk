@@ -1,12 +1,14 @@
 param([Parameter(Mandatory)][string]$A, [Parameter(Mandatory)][string]$B, [string]$Label = 'abexe',
       [string]$Plan = 'w:down:0,w:up:10000', [int]$Rounds = 2, [int]$Windows = 2, [double]$Seconds = 6,
-      [string[]]$Set = @(), [string[]]$SetA = @(), [string[]]$SetB = @())
+      [string[]]$Set = @(), [string[]]$SetA = @(), [string[]]$SetB = @(), [int]$StartupSeconds = 100,
+      [int]$Vblank = 0)
 # A/B of two builds at one place of the walk route, for changes a runtime switch cannot select (data
 # structures, code generation): separate launches in ABBA order (each one: bench-run.ps1 with -Exe,
 # walk -Plan, -Windows measurement windows of -Seconds). Each executable sits in its own directory
 # with libwinpthread-1.dll; its first launch also builds its driver pipeline cache (bench-run's
 # precompile), so the first round is a warm-up worth repeating when it differs. -SetA / -SetB add
-# switches to one side only (one executable as both A and B compares launch-time switches).
+# switches to one side only (one executable as both A and B compares launch-time switches). -StartupSeconds: each
+# start-up attempt's limit (a 1-1 save on a 16 GB laptop needs ~180). -Vblank 120: both sides at the 120 Hz cap.
 #   ab-exe.ps1 -A _Build\ab\base\kyty_emulator.exe -B _Build\windows\kyty_emulator.exe -Label rangeset
 $S = $PSScriptRoot
 $root = (Resolve-Path "$PSScriptRoot\..\..\..").Path
@@ -17,11 +19,16 @@ function Emulator { Get-Process kyty_emulator -ErrorAction SilentlyContinue | Wh
 $sums = @{}
 $order = @()
 for ($round = 1; $round -le $Rounds; $round++) { $order += if ($round % 2) { @('A', 'B') } else { @('B', 'A') } }
+# (A screenshot per launch, scene-<label>-A1.png ...: the default bench save starts in one of two places, tunnel or plain,
+# ~80 or ~87 fps at 120 Hz - compare launches at the same place.)
+$launches = @{ A = 0; B = 0 }
 foreach ($side in $order) {
 	$exe = (Resolve-Path $(if ($side -eq 'A') { $A } else { $B })).Path
-	$params = @{ Label = "$Label-$side"; Exe = $exe; KeepRunning = $true; NoWalk = $true; ShotOnly = $true }
-	$switches = @($Set) + $(if ($side -eq 'A') { @($SetA) } else { @($SetB) })
-	if ($switches.Count) { $params['Set'] = $switches }
+	$launches[$side]++
+	$params = @{ Label = "$Label-$side$($launches[$side])"; Exe = $exe; KeepRunning = $true; NoWalk = $true; ShotOnly = $true; StartupSeconds = $StartupSeconds }
+	# (Without the shader prefetch's cache: two executables taking turns would each make it again, ~2 GB written a launch.)
+	$params['Set'] = @('KYTY_PREFETCH_CACHE=0') + @($Set) + $(if ($side -eq 'A') { @($SetA) } else { @($SetB) })
+	if ($Vblank -gt 0) { $params['Vblank'] = $Vblank }
 	& "$S\bench-run.ps1" @params | Select-Object -Last 1
 	if (!(Emulator)) { "$side`: emulator not running"; continue }
 	$walk = Start-Process powershell -ArgumentList '-NoProfile', '-File', "$S\keys.ps1", '-Plan', $Plan -PassThru -WindowStyle Hidden -RedirectStandardOutput "$out\keys.txt"

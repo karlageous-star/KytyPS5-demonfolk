@@ -68,6 +68,7 @@ public:
 		m_owner.store(0, std::memory_order_relaxed);
 		m_lock.clear(std::memory_order_release);
 	}
+	[[nodiscard]] bool OwnedByCurrentThread() const noexcept { return m_owner.load(std::memory_order_relaxed) == CurrentThread(); }
 	// A read of state only holders of this lock write, without taking it: valid when no holder
 	// was inside while it ran (the sequence even and unchanged), else done again under the lock.
 	// The query then costs no locked instruction and leaves the lock's line to the writers.
@@ -117,6 +118,14 @@ private:
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
 
+// Advances whenever pages become CPU-dirty (ChangeState<Cpu, true>, a new region's pages). A region's LastDirtyClock is
+// the value of its last such change: the CPU-dirty pages of a region whose clock is not above a value read earlier were
+// dirty all the time since (nothing made them clean: see CommandScheduler::UploadPrologue).
+inline std::atomic<uint64_t> g_cpu_dirty_clock {1};
+[[nodiscard]] inline uint64_t NextCpuDirtyClock() noexcept {
+	return g_cpu_dirty_clock.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
+
 class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
@@ -132,6 +141,8 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
+	// See g_cpu_dirty_clock.
+	[[nodiscard]] uint64_t LastDirtyClock() const noexcept { return m_last_dirty.load(std::memory_order_acquire); }
 	[[nodiscard]] uint64_t CpuModificationEpoch() const {
 		// Pages marked clean whose write protection is still queued can change unseen:
 		// nothing is provable until the worker applied it (and moved the epoch).
@@ -182,12 +193,35 @@ public:
 				// Invalidate cached clean proofs before another CPU thread can write
 				// through the relaxed host protection. A cache miss takes this lock.
 				m_cpu_epoch.fetch_add(1, std::memory_order_release);
+				m_last_dirty.store(NextCpuDirtyClock(), std::memory_order_release);
 				BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
 			}
-			UpdateCpuProtection<!enable>();
+			UpdateCpuProtection<!enable>(start, end);
 		} else {
+			// (GPU-written pages given back to the CPU hold the GPU's bytes now: the epoch moves, NoteHostWrite.)
+			if constexpr (!enable) m_cpu_epoch.fetch_add(1, std::memory_order_release);
 			UpdateGpuProtection<enable>();
 		}
+	}
+
+	// The emulator wrote CPU-dirty pages of the region (their state stays): what a proof by the epoch holds of their
+	// bytes holds no longer (TableXpr::RingCopy's copies of guest-written ranges). The epoch moves as well when pages
+	// become CPU-dirty and when GPU-written pages are given back (their bytes the GPU's): with the guest's writes to
+	// dirty pages it covers every change of the region's bytes the CPU can see but those.
+	void NoteHostWrite() noexcept { m_cpu_epoch.fetch_add(1, std::memory_order_release); }
+
+	// CPU-dirty with the pages' write protection kept: the emulator wrote them through the backing view (no fault
+	// saw it). A page still write-watched stays so (UpdateCpuProtection moves only pages of a change's range, in its
+	// direction): its next upload finds it protected already, and a guest write before that faults once and drops
+	// the watcher as for any dirty page (ChangeState). Returns false (nothing changed) when the GPU wrote a page.
+	[[nodiscard]] bool MarkCpuDirtyKeepProtection(uint64_t vaddr, uint64_t size) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		if (m_gpu_dirty.AnyInRange(start, end)) return false;
+		m_cpu_dirty.SetRange(start, end);
+		m_cpu_epoch.fetch_add(1, std::memory_order_release);
+		m_last_dirty.store(NextCpuDirtyClock(), std::memory_order_release);
+		BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
+		return true;
 	}
 
 	template <DirtySource source, bool clear, typename Func>
@@ -199,11 +233,12 @@ public:
 			GetBits<source>().UnsetRange(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu && clear) {
-			UpdateCpuProtection<true>();
+			UpdateCpuProtection<true>(start, end);
 			ForEachRange(mask, std::forward<Func>(func));
 			return;
 		}
 		if constexpr (source == DirtySource::Gpu && clear) {
+			m_cpu_epoch.fetch_add(1, std::memory_order_release); // (as ChangeState's)
 			UpdateGpuProtection<false>();
 		}
 		ForEachRange(mask, std::forward<Func>(func));
@@ -213,13 +248,17 @@ public:
 	alignas(64) TrackingSpinLock lock;
 
 private:
+	// The pages of [start, end) whose write watcher no longer matches their dirty state, in the change's direction:
+	// clean pages without one get it (track), dirty pages with one lose it. (Dirty pages that keep their protection,
+	// MarkCpuDirtyKeepProtection, are left alone by a change that only made other pages clean or dirty.)
 	template <bool track>
-	void UpdateCpuProtection() {
-		auto mask  = m_cpu_dirty ^ m_writable;
-		m_writable = m_cpu_dirty;
+	void UpdateCpuProtection(size_t start, size_t end) {
+		const auto changed = track ? m_writable & ~m_cpu_dirty : m_cpu_dirty & ~m_writable;
+		RegionBits mask(changed, start, end);
 		if (mask.None()) {
 			return;
 		}
+		m_writable ^= mask;
 		LiveCounters::Add(track ? LiveCounters::Reprotect : LiveCounters::Unprotect);
 		LiveCounters::Add(track ? LiveCounters::ReprotectPages : LiveCounters::UnprotectPages, mask.Count());
 		if (track && LiveCounters::g_granules_on.load(std::memory_order_relaxed)) {
@@ -283,6 +322,7 @@ private:
 	alignas(64) PageManager& m_page_manager;
 	uint64_t              m_cpu_addr = 0;
 	std::atomic<uint64_t> m_cpu_epoch {1};
+	std::atomic<uint64_t> m_last_dirty {NextCpuDirtyClock()}; // (all pages start CPU-dirty)
 	std::atomic<uint32_t> m_deferred_protects {0};
 	RegionBits            m_cpu_dirty;
 	RegionBits            m_gpu_dirty;

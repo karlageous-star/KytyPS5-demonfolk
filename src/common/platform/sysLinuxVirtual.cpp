@@ -10,10 +10,19 @@
 #include "common/virtualMemory.h"
 
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+#if !defined(__APPLE__)
+#include <fcntl.h>
+#include <linux/userfaultfd.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#endif
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -35,6 +44,79 @@ static pthread_mutex_t              g_virtual_mutex {};
 static std::map<uintptr_t, size_t>* g_allocs   = nullptr;
 static PageProtectionTable*         g_protects = nullptr;
 
+#if !defined(__APPLE__)
+// KYTY_UFFD_WP=1: the GPU trackers' write watch of guest views as userfaultfd write protection (SysVirtualProtectWriteWatch).
+// A view's page keeps its mprotect protection writable and takes the write protection instead: a protect-fault-unprotect
+// cycle costs ~45% less (one ioctl each way, no VMA split or merge), and a write raises SIGBUS (BUS_ADRERR, the page-fault
+// error code's write bit set), which the host fault handler serves as it serves SIGSEGV. UFFD_USER_MODE_ONLY needs no
+// privilege; a kernel write into such a page fails with EFAULT, as into a read-only one. Pages not of a registered view,
+// or past the tracker's 1 << 40 window, keep mprotect.
+static int g_uffd = -1;
+// A byte per 4 KiB page of the low 1 TiB (reserved, committed as touched): the page's mprotect protection (PROT_*), as
+// last set, whether its view is registered, and whether it is write-protected.
+static uint8_t*         g_watch_pages     = nullptr;
+static constexpr uint64_t WATCH_PAGE_COUNT = (uint64_t {1} << 40u) >> 12u;
+static constexpr uint8_t  WATCH_PROT       = 0x07;
+static constexpr uint8_t  WATCH_REGISTERED = 0x40;
+static constexpr uint8_t  WATCH_WP         = 0x80;
+
+static void WriteWatchInit() {
+	// VirtualMemory::Init() runs more than once (main and the kernel memory module).
+	if (g_uffd >= 0) return;
+	const char* value = std::getenv("KYTY_UFFD_WP");
+	if (value == nullptr || value[0] != '1') return;
+	const int fd = static_cast<int>(syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY));
+	uffdio_api api {};
+	api.api      = UFFD_API;
+	api.features = UFFD_FEATURE_SIGBUS | UFFD_FEATURE_WP_HUGETLBFS_SHMEM | UFFD_FEATURE_WP_UNPOPULATED;
+	void* pages  = MAP_FAILED;
+	if (fd >= 0 && ioctl(fd, UFFDIO_API, &api) == 0) {
+		pages = mmap(nullptr, WATCH_PAGE_COUNT, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+	}
+	if (pages == MAP_FAILED) {
+		std::printf("KYTY_UFFD_WP: userfaultfd write protection unavailable, mprotect kept\n");
+		if (fd >= 0) close(fd);
+		return;
+	}
+	g_watch_pages = static_cast<uint8_t*>(pages);
+	g_uffd        = fd;
+	std::printf("KYTY_UFFD_WP: write watch by userfaultfd write protection\n");
+}
+
+static bool WatchRange(uint64_t address, uint64_t size) {
+	return g_uffd >= 0 && size != 0 && (address & 0xfffu) == 0 && address >> 12u < WATCH_PAGE_COUNT &&
+	       size <= (WATCH_PAGE_COUNT << 12u) - address;
+}
+
+static uint8_t WatchPage(uint64_t page) {
+	return __atomic_load_n(&g_watch_pages[page], __ATOMIC_RELAXED);
+}
+
+static void SetWatchPages(uint64_t first, uint64_t end, uint8_t value) {
+	for (auto page = first; page < end; page++) __atomic_store_n(&g_watch_pages[page], value, __ATOMIC_RELAXED);
+}
+
+// After an mprotect of [address, address + size): its pages' protection, their other bits kept.
+static void RecordWatchProtection(uint64_t address, uint64_t size, int protect) {
+	if (!WatchRange(address, (size + 0xfffu) & ~uint64_t {0xfff})) return;
+	for (auto page = address >> 12u, end = (address + size + 0xfffu) >> 12u; page < end; page++) {
+		const auto old = WatchPage(page);
+		if ((old & WATCH_PROT) != protect) __atomic_store_n(&g_watch_pages[page], static_cast<uint8_t>((old & ~WATCH_PROT) | protect), __ATOMIC_RELAXED);
+	}
+}
+
+static bool WriteProtect(uint64_t address, uint64_t size, bool on) {
+	uffdio_writeprotect wp {};
+	wp.range.start = address;
+	wp.range.len   = size;
+	wp.mode        = on ? UFFDIO_WRITEPROTECT_MODE_WP : 0;
+	return ioctl(g_uffd, UFFDIO_WRITEPROTECT, &wp) == 0;
+}
+#else
+static void WriteWatchInit() {}
+static void RecordWatchProtection(uint64_t /*address*/, uint64_t /*size*/, int /*protect*/) {}
+#endif
+
 void SysVirtualInit() {
 	pthread_mutexattr_t attr {};
 
@@ -49,6 +131,7 @@ void SysVirtualInit() {
 
 	g_allocs   = new std::map<uintptr_t, size_t>;
 	g_protects = new PageProtectionTable;
+	WriteWatchInit();
 }
 
 static int get_protection_flag(VirtualMemory::Mode mode) {
@@ -597,11 +680,77 @@ bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode
 		pthread_mutex_lock(&g_virtual_mutex);
 		g_protects->Set(page_start, page_end, static_cast<uint8_t>(get_protection_flag(mode)));
 		pthread_mutex_unlock(&g_virtual_mutex);
+		RecordWatchProtection(page_start << 12u, (page_end - page_start + 1) << 12u, get_protection_flag(mode));
 		return true;
 	}
 
 	return false;
 }
+
+#if !defined(__APPLE__)
+// Runs of pages in one state: those of registered views take the write protection for a write watch (Read) and lose it
+// for a writable mode, and an mprotect only where their protection differs (a write watch keeps the view writable:
+// after a no-access watch, made writable again under the write protection set first).
+bool SysVirtualProtectWriteWatch(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
+	const auto begin = address & ~uint64_t {0xfff};
+	const auto end   = (address + size + 0xfffu) & ~uint64_t {0xfff};
+	if (!WatchRange(begin, end - begin)) return SysVirtualProtect(address, size, mode);
+	const int  protect  = get_protection_flag(mode);
+	const bool watch    = protect == PROT_READ;
+	const bool writable = (protect & PROT_WRITE) != 0;
+	for (auto first = begin >> 12u, last = end >> 12u; first < last;) {
+		const auto state = WatchPage(first);
+		auto       next  = first + 1;
+		while (next < last && WatchPage(next) == state) next++;
+		const auto run_address = first << 12u;
+		const auto run_size    = (next - first) << 12u;
+		first                  = next;
+		if ((state & WATCH_REGISTERED) == 0) {
+			if (!SysVirtualProtect(run_address, run_size, mode)) return false;
+			continue;
+		}
+		const bool wp = (state & WATCH_WP) != 0;
+		if ((watch && !wp) || (writable && wp)) {
+			if (!WriteProtect(run_address, run_size, watch)) {
+				// (No longer a registered view: something else was mapped there.)
+				SetWatchPages(run_address >> 12u, next, state & WATCH_PROT);
+				if (!SysVirtualProtect(run_address, run_size, mode)) return false;
+				continue;
+			}
+			SetWatchPages(run_address >> 12u, next, static_cast<uint8_t>((state & ~WATCH_WP) | (watch ? WATCH_WP : 0)));
+		}
+		const int target = watch ? PROT_READ | PROT_WRITE : protect;
+		if ((state & WATCH_PROT) != target &&
+		    !SysVirtualProtect(run_address, run_size, watch ? VirtualMemory::Mode::ReadWrite : mode))
+			return false;
+	}
+	return true;
+}
+
+void SysVirtualWriteWatchMapped(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
+	if (!WatchRange(address, size)) return;
+	uffdio_register reg {};
+	reg.range.start = address;
+	reg.range.len   = size;
+	reg.mode        = UFFDIO_REGISTER_MODE_WP;
+	const bool registered = ioctl(g_uffd, UFFDIO_REGISTER, &reg) == 0;
+	SetWatchPages(address >> 12u, (address + size) >> 12u,
+	              static_cast<uint8_t>(get_protection_flag(mode) | (registered ? WATCH_REGISTERED : 0)));
+}
+
+void SysVirtualWriteWatchUnmapped(uint64_t address, uint64_t size) {
+	if (!WatchRange(address, size)) return;
+	SetWatchPages(address >> 12u, (address + size) >> 12u, 0);
+}
+#else
+bool SysVirtualProtectWriteWatch(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
+	return SysVirtualProtect(address, size, mode);
+}
+
+void SysVirtualWriteWatchMapped(uint64_t /*address*/, uint64_t /*size*/, VirtualMemory::Mode /*mode*/) {}
+
+void SysVirtualWriteWatchUnmapped(uint64_t /*address*/, uint64_t /*size*/) {}
+#endif
 
 bool SysVirtualFlushInstructionCache(uint64_t /*address*/, uint64_t /*size*/) {
 	return true;

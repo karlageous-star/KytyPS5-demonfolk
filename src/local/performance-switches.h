@@ -1,11 +1,12 @@
 #pragma once
-// Runtime switches of the performance paths. Every path keeps the original
-// behaviour unless its environment variable is set; the GPU thread applies them
-// once, before it consumes commands. Values outside a switch's range abort.
+// Runtime switches of the performance paths. Their defaults are the release settings (the values the variables
+// define them with); an environment variable sets one for an A/B or a workaround (0 turns a path off). The GPU
+// thread applies them once, before it consumes commands. Values outside a switch's range abort.
 
 #include "native-buffer-residency.h"
 #include "local-platform.h"
 #include "native-resource-state.h"
+#include "spin-gate.h"
 
 #include <array>
 #include <atomic>
@@ -21,11 +22,13 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 extern volatile std::atomic_uint32_t kyty_local_image_pool_mode;
 extern volatile std::atomic<uint32_t> kyty_local_vram_first_mode;
 extern volatile std::atomic_uint32_t kyty_local_backing_read_mode;
+extern volatile std::atomic<uint32_t> kyty_local_move_compare;
 extern volatile std::atomic_uint32_t kyty_local_stream_upload_mode;
 extern volatile std::atomic_uint32_t kyty_local_binding_scratch_mode;
 extern volatile std::atomic_uint32_t kyty_local_draw_run_ranges_mode;
 extern volatile std::atomic_uint32_t kyty_local_image_barrier_dedupe;
 extern volatile std::atomic_uint32_t kyty_local_pending_drain_mode;
+extern volatile std::atomic_uint32_t kyty_local_framegen_sleep;
 extern volatile std::atomic_uint32_t kyty_local_dispatch_batch;
 extern volatile std::atomic_uint32_t kyty_local_batch_while_busy_mode;
 extern volatile std::atomic<uint32_t> kyty_local_flush_on_drain_mode;
@@ -41,6 +44,8 @@ extern volatile std::atomic_uint32_t kyty_local_chain_bda_reads_mode;
 extern volatile std::atomic_uint32_t kyty_local_dispatch_barrier_merge_mode;
 extern volatile std::atomic<uint32_t> kyty_local_readback_page_runs_mode;
 extern volatile std::atomic<uint32_t> kyty_local_linear_copy_spans_mode;
+extern volatile std::atomic_uint32_t kyty_local_draw_batch;
+extern volatile std::atomic<uint32_t> kyty_local_upload_prologue;
 extern volatile std::atomic_uint32_t kyty_local_async_lod_stats_mode;
 extern volatile std::atomic<uint32_t> kyty_local_buffer_reclaim_mode;
 extern volatile std::atomic<uint32_t> kyty_local_buffer_retire_mode;
@@ -71,6 +76,9 @@ extern volatile std::atomic_uint32_t kyty_local_table_dispatch_buckets;
 extern volatile std::atomic_uint32_t kyty_local_table_dispatch_hash_lo;
 extern volatile std::atomic_uint32_t kyty_local_table_dispatch_hash_hi;
 extern volatile std::atomic_uint32_t kyty_local_table_store_budget;
+extern volatile std::atomic_uint32_t kyty_local_table_indirect_mode;
+extern volatile std::atomic_uint32_t kyty_local_table_set_proofs;
+extern volatile std::atomic_uint32_t kyty_local_table_mru;
 #endif
 }
 
@@ -83,7 +91,6 @@ inline void InitializePerformanceSwitches() {
 	};
 	const std::array switches {
 	    // Shader resource preparation.
-	    Switch {"KYTY_SRT_NATIVE", &kyty_local_srt_native_mode},
 	    Switch {"KYTY_SRT_PREDICATES", &kyty_local_srt_predicate_mode},
 	    Switch {"KYTY_PREPARATION_SCRATCH", &kyty_local_preparation_scratch_mode},
 	    Switch {"KYTY_PREPARATION_LOOKUP", &kyty_local_preparation_lookup_mode},
@@ -97,6 +104,8 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_COPY_FEEDBACK", &kyty_local_copy_feedback_mode},
 	    Switch {"KYTY_ASYNC_LOD_STATS", &kyty_local_async_lod_stats_mode},
 	    Switch {"KYTY_BACKING_READ", &kyty_local_backing_read_mode},
+	    // The game's large memmoves write only the pages whose bytes differ (default on; 0 for an A/B).
+	    Switch {"KYTY_GUEST_MOVE_COMPARE", &kyty_local_move_compare},
 	    Switch {"KYTY_STREAM_UPLOAD", &kyty_local_stream_upload_mode},
 	    Switch {"KYTY_FRAME_PIPELINE", &kyty_local_frame_pipeline_mode},
 	    Switch {"KYTY_WRITE_WINDOW_HANDOFF", &kyty_local_write_window_handoff_mode},
@@ -105,6 +114,9 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_READBACK_SLOTS", &kyty_local_readback_slots_mode},
 	    // 1: buffer upload copies on the upload worker; 2: image staging copies as well.
 	    Switch {"KYTY_ASYNC_UPLOAD", &kyty_local_async_upload_mode, 0, 2},
+	    // The upload and recording workers spin for new work only while this process's CPUs keep three idle
+	    // (spin-gate.h); 0 always, 2 never.
+	    Switch {"KYTY_SPIN_GATE", &kyty_local_spin_gate, 0, 2},
 	    Switch {"KYTY_BUFFER_RECLAIM", &kyty_local_buffer_reclaim_mode},
 	    // Opt-in (default 0): 1 retires the buffers no binding used for a while (RetireStaleBuffers).
 	    Switch {"KYTY_BUFFER_RETIRE", &kyty_local_buffer_retire_mode},
@@ -116,15 +128,20 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_RANGE_SET_FAST", &kyty_local_range_set_fast_mode},
 	    Switch {"KYTY_IMAGE_GRANULES", &kyty_local_image_granules_mode, 0, 2},
 	    Switch {"KYTY_TEXTURE_RESOLVE_PAGES", &kyty_local_texture_resolve_pages_mode},
-	    Switch {"KYTY_PARTIAL_IMAGE_DIRTY", &kyty_local_partial_image_dirty_mode, 0, 2},
+	    Switch {"KYTY_PARTIAL_IMAGE_DIRTY", &kyty_local_partial_image_dirty_mode},
 	    Switch {"KYTY_PARTIAL_ROW_BANDS", &kyty_local_partial_row_bands_mode},
 	    Switch {"KYTY_PARTIAL_MIXED_UPLOAD", &kyty_local_partial_mixed_upload_mode},
+	    // Sampled views refresh only their levels of a streamed texture (default on; 0 for an A/B).
+	    Switch {"KYTY_TEXTURE_LEVELS", &kyty_local_texture_levels_mode},
 	    Switch {"KYTY_ASYNC_REPROTECT", &kyty_local_async_reprotect_mode},
 	    Switch {"KYTY_READBACK_NARROW", &kyty_local_readback_narrow_mode},
 	    Switch {"KYTY_SYNC_READBACK_SCOPED_DRAIN", &kyty_local_sync_readback_scoped_drain_mode},
 	    Switch {"KYTY_SYNC_READBACK_NARROW", &kyty_local_sync_readback_narrow_mode},
 	    // Also creates the transfer queue at device creation (vulkanWindow.cpp).
-	    Switch {"KYTY_READBACK_QUEUE", &kyty_local_readback_queue_mode, 0, 3},
+	    Switch {"KYTY_READBACK_QUEUE", &kyty_local_readback_queue_mode},
+	    // Default 2: on unless read guards are on (0 for an A/B). 1 also spans with
+	    // KYTY_READ_GUARD=1 (not tested).
+	    Switch {"KYTY_READBACK_SPAN", &kyty_local_readback_span_mode, 0, 2},
 	    // Images and command submission.
 	    Switch {"KYTY_IMAGE_BARRIER_DEDUPE", &kyty_local_image_barrier_dedupe},
 	    // Opt-in (default 0): 1 keeps an HTile's metadata when its depth image is deleted (textureCache.cpp).
@@ -139,6 +156,9 @@ inline void InitializePerformanceSwitches() {
 	    // Default 1; 0 for an A/B: game buffers and images stay in video memory (system memory only as a last resort).
 	    Switch {"KYTY_VRAM_FIRST", &kyty_local_vram_first_mode},
 	    Switch {"KYTY_PENDING_DRAIN", &kyty_local_pending_drain_mode},
+	    // Submissions the GPU has still to run for a flush nothing waits on to be deferred (0: never).
+	    // DLSS-G frames' Reflex sleep (0: none).
+	    Switch {"KYTY_FRAMEGEN_SLEEP", &kyty_local_framegen_sleep},
 	    // Dispatches recorded per submission.
 	    Switch {"KYTY_DISPATCH_BATCH", &kyty_local_dispatch_batch, 1, 65536},
 	    // 1: a dispatch batch goes on while the GPU still runs work handed to it (up to 8 batches).
@@ -165,6 +185,10 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_LINEAR_COPY_SPANS", &kyty_local_linear_copy_spans_mode},
 	    // Presentation: 1 does not make up a vblank late by more than a period with vblanks back to back.
 	    Switch {"KYTY_VBLANK_NO_BURST", &kyty_local_vblank_no_burst_mode},
+	    // Draws recorded per submission (0: no limit).
+	    Switch {"KYTY_DRAW_BATCH", &kyty_local_draw_batch, 0, 65536},
+	    // Buffer uploads of pages dirty since before the open command buffer in its upload prologue (on by default).
+	    Switch {"KYTY_UPLOAD_PROLOGUE", &kyty_local_upload_prologue},
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 	    Switch {"KYTY_VULKAN_RECORDING", &kyty_local_vulkan_recording_mode},
 	    Switch {"KYTY_DEFERRED_SUBMIT", &kyty_local_deferred_submit_mode},
@@ -193,12 +217,19 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_TABLE_DISPATCH_HASH_HI", &kyty_local_table_dispatch_hash_hi, 0, UINT32_MAX},
 	    // Table store requests per frame (0: no limit).
 	    Switch {"KYTY_TABLE_STORE_BUDGET", &kyty_local_table_store_budget, 0, 65536},
+	    // Table dispatches of programs with an address probe's indirect image or reads by device address at offsets no
+	    // slot fixes (the light loops; default on, 0 for an A/B).
+	    Switch {"KYTY_TABLE_INDIRECT", &kyty_local_table_indirect_mode},
+	    // Table set image uses checked again only when they changed (default on; 0 checks all, 2 verifies).
+	    Switch {"KYTY_TABLE_SET_PROOFS", &kyty_local_table_set_proofs, 0, 2},
+	    // Table lookups that ask the last answer first (bits: pair cache size, variant, image set).
+	    Switch {"KYTY_TABLE_MRU", &kyty_local_table_mru, 0, 7},
 #endif
 	};
 	std::string enabled;
 	for (const auto& setting: switches) {
 		const auto* text = std::getenv(setting.environment);
-		if (text == nullptr) {
+		if (text == nullptr || *text == '\0') { // (an empty value keeps the default, as run_ds.sh's ${NAME:-default} did)
 			continue;
 		}
 		char*      end   = nullptr;

@@ -1,500 +1,203 @@
-name: Build and Release KytyPS5
+name: Build KytyPS5 (Windows)
 
+# This fork's Windows build (Demon's Souls, see README.md): a manual run (Actions > Build KytyPS5 (Windows) >
+# Run workflow) or a pushed v* tag builds the release package and publishes it as a GitHub release, marked
+# latest (README.md links to the latest one). Pushes build nothing.
 on:
-  workflow_dispatch:
   push:
-    branches: [ main, master ]
-  pull_request:
+    tags: [ 'v*' ]
+  workflow_dispatch:
 
-env:
-  KYTY_BUILD_ORIGIN: ${{ github.repository != 'KytyPS5/KytyPS5' && 'Fork' || github.event_name == 'push' && 'Official' || 'Source' }}
-  KYTY_BUILD_REPOSITORY: ${{ github.repository }}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  metadata:
-    name: Prepare build metadata
-    runs-on: ubuntu-latest
-    outputs:
-      release_tag: ${{ steps.release_tag.outputs.value }}
-
-    steps:
-      - name: Generate release tag
-        id: release_tag
-        shell: bash
-        run: |
-          echo "value=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-
   windows:
-    name: Build KytyPS5 (Windows)
-    needs: metadata
+    name: Build (Windows x64)
     runs-on: windows-2022
+    outputs:
+      package: ${{ steps.name.outputs.package }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Setup Visual Studio environment
-        uses: ilammy/msvc-dev-cmd@v1
+      - name: Package name
+        id: name
+        shell: pwsh
+        run: |
+          $name = if ($env:GITHUB_REF_TYPE -eq 'tag') { "KytyPS5-$env:GITHUB_REF_NAME" } else {
+            "KytyPS5-$((Get-Date).ToUniversalTime().ToString('yyyyMMdd'))-$($env:GITHUB_SHA.Substring(0, 8))" }
+          "package=$name" >> $env:GITHUB_OUTPUT
 
-      - name: Setup Ninja
-        uses: seanmiddleditch/gha-setup-ninja@v5
+      # The tested compiler (LLVM 23.1.2 crashed compiling agc.cpp; others are untested).
+      - name: Install LLVM 19.1.7
+        shell: pwsh
+        run: choco upgrade llvm --version=19.1.7 --allow-downgrade --no-progress -y
 
+      # glslangValidator: the runner has no Vulkan SDK.
       - name: Locate vcpkg
         id: vcpkg
         shell: pwsh
         run: |
-          $vcpkgRoot = Split-Path (Get-Command vcpkg).Source
-          $portHash = (Get-FileHash "$vcpkgRoot\ports\glslang\vcpkg.json" -Algorithm SHA256).Hash
-          "root=$vcpkgRoot" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "port_hash=$($portHash.ToLowerInvariant())" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $root = Split-Path (Get-Command vcpkg).Source
+          $hash = (Get-FileHash "$root\ports\glslang\vcpkg.json" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "root=$root" >> $env:GITHUB_OUTPUT
+          "port_hash=$hash" >> $env:GITHUB_OUTPUT
 
       - name: Cache glslang
-        id: glslang_cache
+        id: glslang
         uses: actions/cache@v4
         with:
           path: ${{ steps.vcpkg.outputs.root }}\installed\x64-windows
-          key: glslang-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.port_hash }}-tools-opt
+          key: glslang-${{ runner.os }}-${{ steps.vcpkg.outputs.port_hash }}-tools-opt
 
       - name: Install glslang
         shell: pwsh
         run: |
-          $vcpkgRoot = "${{ steps.vcpkg.outputs.root }}"
-          if ("${{ steps.glslang_cache.outputs.cache-hit }}" -ne "true") {
-            vcpkg install glslang[tools,opt]:x64-windows
-          }
-          "$vcpkgRoot\installed\x64-windows\tools\glslang" |
-            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          if ('${{ steps.glslang.outputs.cache-hit }}' -ne 'true') { vcpkg install 'glslang[tools,opt]:x64-windows' }
+          "${{ steps.vcpkg.outputs.root }}\installed\x64-windows\tools\glslang" >> $env:GITHUB_PATH
 
-      - name: Install Qt 6.10.3
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: "6.10.3"
-          host: windows
-          target: desktop
-          arch: win64_msvc2022_64
-          cache: true
-
-      - name: Verify toolchain
-        shell: cmd
+      # DLSS frame generation (src/local/frame-gen.cpp): NVIDIA Streamline's headers (MIT, LICENSES/Streamline-MIT.txt)
+      # at build time; its runtime is the user's own (the launcher's "Streamline..." folder). Without them the build
+      # has no frame generation.
+      - name: Streamline headers
+        shell: pwsh
+        continue-on-error: true
         run: |
-          git --version
-          cmake --version
-          ninja --version
-          clang-cl --version
-          glslangValidator --version
-          echo Qt6_DIR=%Qt6_DIR%
+          git clone --quiet --depth 1 --branch v2.14.1 --filter=blob:none --sparse https://github.com/NVIDIA-RTX/Streamline.git _Build\streamline-src
+          git -C _Build\streamline-src sparse-checkout set include
+          New-Item -ItemType Directory -Force _Build\deps\streamline\sdk | Out-Null
+          Copy-Item _Build\streamline-src\include _Build\deps\streamline\sdk -Recurse
+          Get-ChildItem _Build\deps\streamline\sdk\include -Name
 
-      - name: Configure
-        shell: cmd
+      # FSR 3.1 frame generation (src/local/frame-gen.cpp, KYTY_FRAMEGEN_BACKEND=fsr): AMD FidelityFX SDK 1.1.4's API
+      # headers (MIT, LICENSES/FidelityFX-SDK-MIT.txt) at build time; its runtime (amd_fidelityfx_vk.dll, signed by AMD)
+      # is the user's own, next to the emulator. Without them the build has no FSR.
+      - name: FidelityFX headers
+        shell: pwsh
+        continue-on-error: true
         run: |
-          cmake -S . -B _Build/windows ^
-            -G Ninja ^
-            -DCMAKE_BUILD_TYPE=Release ^
-            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
-            -DKYTY_BUILD_ORIGIN=%KYTY_BUILD_ORIGIN% ^
-            -DKYTY_BUILD_REPOSITORY=%KYTY_BUILD_REPOSITORY% ^
-            -DKYTY_RELEASE_TAG=${{ needs.metadata.outputs.release_tag }} ^
-            -DCMAKE_C_COMPILER=clang-cl ^
-            -DCMAKE_CXX_COMPILER=clang-cl ^
-            -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+          git clone --quiet --depth 1 --branch v1.1.4 --filter=blob:none --sparse https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git _Build\fidelityfx-src
+          git -C _Build\fidelityfx-src sparse-checkout set ffx-api/include
+          New-Item -ItemType Directory -Force _Build\deps\fidelityfx | Out-Null
+          Copy-Item _Build\fidelityfx-src\ffx-api\include _Build\deps\fidelityfx -Recurse
+          Get-ChildItem _Build\deps\fidelityfx\include\ffx_api -Name
 
+      # For other PCs: x86-64-v3 (AVX2), not the runner CPU's -march=native.
       - name: Build
         shell: cmd
-        run: |
-          cmake --build _Build/windows --target launcher audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests --parallel
-
-      - name: Test
-        shell: cmd
-        run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|ime_dialog|virtual_memory_allocation)$"
-
-      - name: Install
-        shell: cmd
-        run: |
-          cmake --install _Build/windows --prefix _Build/windows/install
-
-      - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: KytyPS5-Windows-x64
-          path: _Build/windows/install/**
-          if-no-files-found: error
-
-  macos:
-    name: Build KytyPS5 (macOS)
-    needs: metadata
-    runs-on: macos-15
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Select Xcode 26
-        shell: bash
-        run: |
-          xcode_path="$(ls -d /Applications/Xcode_26*.app | tail -n 1)"
-          test -n "$xcode_path"
-          sudo xcode-select --switch "$xcode_path/Contents/Developer"
-          xcodebuild -version
-
-      - name: Install build dependencies
-        shell: bash
-        run: brew install glslang ninja
-
-      - name: Install Qt 6.10.3
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: "6.10.3"
-          host: mac
-          target: desktop
-          arch: clang_64
-          cache: true
-
-      - name: Verify toolchain
-        shell: bash
-        run: |
-          git --version
-          cmake --version
-          ninja --version
-          clang++ --version
-          glslangValidator --version
-          echo "Host architecture: $(uname -m)"
-          echo "QT_ROOT_DIR=$QT_ROOT_DIR"
-
-      - name: Configure
-        shell: bash
-        run: |
-          cmake -S . -B _Build/macos \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
-            -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
-            -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
-            -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
-            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
-
-      - name: Build
-        shell: bash
-        run: |
-          cmake --build _Build/macos \
-            --target launcher audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests \
-            --parallel
-
-      - name: Test
-        shell: bash
-        run: |
-          ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|ime_dialog|virtual_memory_allocation)$'
-
-      - name: Install
-        shell: bash
-        run: |
-          cmake --install _Build/macos --prefix _Build/macos/install
-
-      - name: Bundle MoltenVK
-        shell: bash
         env:
-          MOLTENVK_VERSION: v1.4.2
-          MOLTENVK_SHA256: f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e
+          KYTY_CMAKE_ARGS: -DKYTY_MARCH=x86-64-v3
         run: |
-          archive="$RUNNER_TEMP/MoltenVK-macos.tar"
-          package="$RUNNER_TEMP/MoltenVK"
-          install_dir="_Build/macos/install"
-          app_dir="$install_dir/KytyPS5.app"
-          moltenvk="$install_dir/libMoltenVK.dylib"
-          curl --fail --location --retry 3 \
-            --output "$archive" \
-            "https://github.com/KhronosGroup/MoltenVK/releases/download/$MOLTENVK_VERSION/MoltenVK-macos.tar"
-          echo "$MOLTENVK_SHA256  $archive" | shasum -a 256 --check
-          tar -xf "$archive" -C "$RUNNER_TEMP"
-          test -d "$app_dir"
-          install -m 755 \
-            "$package/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib" \
-            "$moltenvk"
-          install -m 644 "$package/LICENSE" "$install_dir/LICENSE.MoltenVK"
-          codesign --force --sign - --timestamp=none "$moltenvk"
-          install -d -m 755 "$app_dir/Contents/Frameworks" "$app_dir/Contents/Resources"
-          install -m 755 "$moltenvk" "$app_dir/Contents/Frameworks/libMoltenVK.dylib"
-          install -m 644 "$package/LICENSE" "$app_dir/Contents/Resources/LICENSE.MoltenVK"
-          codesign --force --sign - --timestamp=none "$app_dir"
+          call build-windows.cmd kyty_emulator || exit /b 1
+          call build-windows.cmd kyty_shader_precompile || exit /b 1
 
-      - name: Verify artifacts
-        shell: bash
+      # The settings window (launcher-windows: WPF on .NET Framework 4.7.2, part of Windows 10 and 11).
+      - name: Build launcher
+        shell: cmd
+        run: call launcher-windows\build.cmd || exit /b 1
+
+      - name: Package
+        shell: pwsh
+        env:
+          PACKAGE: ${{ steps.name.outputs.package }}
         run: |
-          install_dir="_Build/macos/install"
-          app_dir="$install_dir/KytyPS5.app"
-          test -d "$app_dir"
-          for binary in \
-            "$install_dir/kyty_emulator" \
-            "$install_dir/libMoltenVK.dylib" \
-            "$app_dir/Contents/MacOS/KytyPS5" \
-            "$app_dir/Contents/MacOS/kyty_emulator" \
-            "$app_dir/Contents/Frameworks/libMoltenVK.dylib"; do
-            file "$binary"
-            lipo "$binary" -verify_arch x86_64
-          done
-          for binary in \
-            "$install_dir/kyty_emulator" \
-            "$install_dir/libMoltenVK.dylib" \
-            "$app_dir/Contents/MacOS/KytyPS5" \
-            "$app_dir/Contents/MacOS/kyty_emulator" \
-            "$app_dir/Contents/Frameworks/libMoltenVK.dylib"; do
-            codesign --verify --strict "$binary"
-          done
-          codesign --verify --deep --strict --verbose=2 "$app_dir"
+          $build = '_Build\windows'
+          $out = "_Build\package\$env:PACKAGE"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item "$build\kyty_emulator.exe", "$build\kyty_shader_precompile.exe", "$build\libwinpthread-1.dll",
+            _Build\launcher\KytyLauncher.exe, run-windows.ps1, precompile-windows.ps1, launcher.ps1, launcher.cmd, LICENSE $out
+          Copy-Item LICENSES $out -Recurse
+          Copy-Item run-windows.json "$out\launch.json"
+          Copy-Item docs\PORTABLE-README.md "$out\README.md"
+          # The render-pass states the precompile program makes the seed file with: the first launch lists the
+          # game's shaders from its files (kyty_shader_precompile --make-seeds; a release cannot hold that list: it
+          # contains the game's shader code). The Python tools that made it before are not needed. With them, each
+          # game version's specialization hints: recorded play without the game's code, which the precompile
+          # completes with the seed file's (--apply-hints). And the recording of the game's file opens a first launch
+          # starts from (files-*.files: file names, opened ahead of the game's loads).
+          $states = "$out\tools\local\static-precompile"
+          New-Item -ItemType Directory -Force $states | Out-Null
+          Copy-Item tools\local\static-precompile\pass-states.json, tools\local\static-precompile\hints-*.hints $states
+          Copy-Item tools\local\static-precompile\files-*.files $states -ErrorAction SilentlyContinue
+          # The VC++ runtime next to the exe (Microsoft's redistributable files): nothing to install.
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $crt = Get-Item "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" | Where-Object { $_.Parent.Parent.Name -match '^\d+\.' } |
+            Sort-Object { [version]$_.Parent.Parent.Name } | Select-Object -Last 1
+          Copy-Item "$($crt.FullName)\msvcp140*.dll", "$($crt.FullName)\vcruntime140*.dll" $out
+          # Double-click to play or to precompile (PowerShell's script policy would stop the scripts themselves).
+          Set-Content "$out\run.cmd" -Encoding ASCII -Value @(
+            '@echo off',
+            'rem Starts the game; the options are those of run-windows.ps1 (e.g. run.cmd -Fullscreen).',
+            '"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Prompt -Follow %*',
+            'if %errorlevel% neq 0 pause')
+          Set-Content "$out\precompile.cmd" -Encoding ASCII -Value @(
+            '@echo off',
+            'rem Every shader and pipeline of the game into the static pipeline cache: hours on a few cores (run it',
+            'rem overnight, it resumes when interrupted). Options: those of precompile-windows.ps1.',
+            '"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0precompile-windows.ps1" %*',
+            'pause')
+          $root = (Resolve-Path $out).Path
+          Get-ChildItem $out -Recurse -File | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.FullName.Substring($root.Length + 1) }
 
-      - name: Package macOS artifacts
-        shell: bash
-        run: |
-          install_dir="_Build/macos/install"
-          archive="$RUNNER_TEMP/KytyPS5-macOS-x86_64.zip"
-          (
-            cd "$install_dir"
-            zip -qry "$archive" .
-          )
-          unzip -t "$archive"
-
-      - name: Upload macOS artifacts
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-macOS-x86_64
-          path: ${{ runner.temp }}/KytyPS5-macOS-x86_64.zip
-          if-no-files-found: error
-
-  linux:
-    name: Build KytyPS5 (Linux)
-    needs: metadata
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install build dependencies
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes \
-            clang \
-            glslang-tools \
-            libasound2-dev \
-            libdbus-1-dev \
-            libgl1-mesa-dev \
-            libpulse-dev \
-            libudev-dev \
-            libwayland-dev \
-            libx11-dev \
-            libxcursor-dev \
-            libxext-dev \
-            libxfixes-dev \
-            libxi-dev \
-            libxkbcommon-dev \
-            libxrandr-dev \
-            libxss-dev \
-            lld \
-            ninja-build \
-            wayland-protocols
-
-      - name: Install Qt 6.10.3
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: "6.10.3"
-          host: linux
-          target: desktop
-          arch: linux_gcc_64
-          cache: true
-
-      - name: Verify toolchain
-        shell: bash
-        run: |
-          git --version
-          cmake --version
-          ninja --version
-          clang++ --version
-          ld.lld --version
-          glslangValidator --version
-          echo "Qt6_DIR=$Qt6_DIR"
-
-      - name: Configure
-        shell: bash
-        run: |
-          mkdir -p _Build
-          cmake -S . -B _Build/linux \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
-            -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
-            -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
-            -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_PREFIX_PATH="$Qt6_DIR" 2>&1 | tee _Build/configure.log
-          exit "${PIPESTATUS[0]}"
-
-      - name: Verify SDL2 backends
-        shell: bash
-        run: |
-          status=0
-          for feature in SDL_ALSA SDL_PULSEAUDIO SDL_WAYLAND SDL_X11 SDL_LIBUDEV SDL_DBUS; do
-            if grep -qE "^--   ${feature} +\\(Wanted: ON\\): ON" _Build/configure.log; then
-              echo "ok   ${feature}"
-            else
-              echo "FAIL ${feature} is not enabled"
-              status=1
-            fi
-          done
-          exit "$status"
-
-      - name: Build
-        shell: bash
-        run: |
-          cmake --build _Build/linux \
-            --target launcher page_manager_tests memory_tracker_tests \
-              audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests \
-            --parallel
-
-      - name: Test
-        shell: bash
-        run: |
-          ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|ime_dialog|page_manager|memory_tracker|virtual_memory_allocation)$'
-
-      - name: Install
-        shell: bash
-        run: |
-          cmake --install _Build/linux --prefix _Build/linux/install
-
-      - name: Verify artifacts
-        shell: bash
-        run: |
-          file _Build/linux/install/launcher
-          file _Build/linux/install/kyty_emulator
-          file _Build/linux/install/kyty_emulator | grep -q "ELF 64-bit LSB .*x86-64"
-          ldd _Build/linux/install/kyty_emulator > /dev/null
-          readelf -d _Build/linux/install/launcher | grep -q 'RPATH.*\$ORIGIN/lib'
-          while IFS= read -r -d '' binary; do
-            while read -r dependency; do
-              test -e "_Build/linux/install/lib/$dependency"
-            done < <(
-              readelf -d "$binary" |
-                sed -n 's/.*Shared library: \[\(libQt6[^]]*\|libicu[^]]*\)\].*/\1/p'
-            )
-          done < <(
-            find _Build/linux/install/launcher _Build/linux/install/plugins \
-              -type f \( -name launcher -o -name '*.so' \) -print0
-          )
-          _Build/linux/install/kyty_emulator --help > /dev/null
-
-      - name: Upload Linux artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: KytyPS5-Linux-x86_64
-          path: _Build/linux/install/**
+          name: ${{ steps.name.outputs.package }}
+          path: _Build/package/
           if-no-files-found: error
 
   release:
-    name: Release KytyPS5
-    if: >-
-      always() &&
-      github.event_name == 'push' &&
-      github.repository == 'KytyPS5/KytyPS5' &&
-      (needs.windows.result == 'success' ||
-       needs.macos.result == 'success' ||
-       needs.linux.result == 'success')
-    needs: [metadata, windows, macos, linux]
+    name: Publish release
+    needs: windows
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
-      RELEASE_NAME: ${{ needs.metadata.outputs.release_tag }}
+      PACKAGE: ${{ needs.windows.outputs.package }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
-      - name: Download Windows build
-        if: needs.windows.result == 'success'
+      - name: Download
         uses: actions/download-artifact@v4
         with:
-          name: KytyPS5-Windows-x64
-          path: artifacts/KytyPS5-Windows-x64
+          name: ${{ needs.windows.outputs.package }}
+          path: package
 
-      - name: Download macOS build
-        if: needs.macos.result == 'success'
-        uses: actions/download-artifact@v4
+      - name: Release notes
+        uses: actions/checkout@v4
         with:
-          name: KytyPS5-macOS-x86_64
-          path: artifacts/KytyPS5-macOS-x86_64
+          path: notes
+          sparse-checkout: docs/RELEASE-NOTES.md
+          sparse-checkout-cone-mode: false
 
-      - name: Download Linux build
-        if: needs.linux.result == 'success'
-        uses: actions/download-artifact@v4
-        with:
-          name: KytyPS5-Linux-x86_64
-          path: artifacts/KytyPS5-Linux-x86_64
-
-      - name: Package Windows build
-        if: needs.windows.result == 'success'
+      - name: Publish
         shell: bash
         run: |
-          windows_dir="artifacts/KytyPS5-Windows-x64"
-          test -d "$windows_dir"
-          (
-            cd "$windows_dir"
-            zip -r "$GITHUB_WORKSPACE/$RELEASE_NAME-Windows-x64.zip" .
-          )
-
-      - name: Package macOS build
-        if: needs.macos.result == 'success'
-        shell: bash
-        run: |
-          macos_archive="artifacts/KytyPS5-macOS-x86_64/KytyPS5-macOS-x86_64.zip"
-          test -f "$macos_archive"
-          cp "$macos_archive" "$RELEASE_NAME-macOS-x86_64.zip"
-
-      - name: Package Linux build
-        if: needs.linux.result == 'success'
-        shell: bash
-        run: |
-          linux_dir="artifacts/KytyPS5-Linux-x86_64"
-          test -d "$linux_dir"
-          chmod a+x \
-            "$linux_dir/launcher" \
-            "$linux_dir/kyty_emulator"
-          tar -C "$linux_dir" -czf \
-            "$GITHUB_WORKSPACE/$RELEASE_NAME-Linux-x86_64.tar.gz" .
-
-      - name: Create release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          assets=()
-          for artifact in \
-            "$RELEASE_NAME-Windows-x64.zip" \
-            "$RELEASE_NAME-macOS-x86_64.zip" \
-            "$RELEASE_NAME-Linux-x86_64.tar.gz"; do
-            if [[ -f "$artifact" ]]; then
-              assets+=("$artifact")
-            fi
-          done
-          test "${#assets[@]}" -gt 0
-          if gh release view "$RELEASE_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release upload "$RELEASE_NAME" "${assets[@]}" \
-              --clobber \
-              --repo "$GITHUB_REPOSITORY"
+          (cd package && zip -qr "../$PACKAGE.zip" "$PACKAGE")
+          # A tag's own release, else a new tag named after the package at this commit.
+          tag="$GITHUB_REF_NAME"
+          [ "$GITHUB_REF_TYPE" = tag ] || tag="$PACKAGE"
+          notes="Windows x64 build of ${GITHUB_SHA::8} for Demon's Souls (PPSA01341, versions 01.007.000 and 01.005.000). Unzip it and double-click KytyLauncher.exe (or run.cmd); the README.md inside explains the rest."
+          # A tag's release holds both packages, and either job may make it (the other uploads to it): the same title
+          # and header whichever does (build.yml, build-linux.yml). v20261024's Linux job came first and titled it as
+          # the Linux package's.
+          title="$PACKAGE"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            title="KytyPS5-$tag"
+            notes="$(printf '%s\n\n%s' \
+              "Windows x64 build of ${GITHUB_SHA::8} for Demon's Souls (PPSA01341, versions 01.007.000 and 01.005.000): KytyPS5-$tag.zip. Unzip it and double-click KytyLauncher.exe (or run.cmd); the README.md inside explains the rest." \
+              "Linux x64 build: KytyPS5-linux-$tag.zip. Unzip it and run ./kyty_launcher (the settings window), or ./run_ds.sh with KYTY_GAME set to the game; the README.md inside explains the rest.")"
+          fi
+          # The notes of this build (what changed, the per-PC shader caches, frame rates), when the commit has them.
+          if [ -s notes/docs/RELEASE-NOTES.md ]; then notes="$(printf '%s\n\n%s' "$notes" "$(cat notes/docs/RELEASE-NOTES.md)")"; fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$tag" "$PACKAGE.zip" --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$RELEASE_NAME" "${assets[@]}" \
-              --generate-notes \
-              --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" \
-              --title "$RELEASE_NAME"
+            gh release create "$tag" "$PACKAGE.zip" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "$title" --notes "$notes" --latest
           fi

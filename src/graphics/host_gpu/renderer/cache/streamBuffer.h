@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -46,20 +48,29 @@ public:
 	// video_memory: an Upload buffer placed in device-local host-visible memory (KYTY_UPLOAD_VRAM), still Upload.
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, bool video_memory = false);
+	// A game buffer bound to `allocation` (a defragmentation pass's destination: BufferCache::Defragment).
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, vk::BufferUsageFlags flags,
+	       uint64_t size, VmaAllocation allocation);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
+
+	[[nodiscard]] VmaAllocation Allocation() const noexcept { return m_allocation; }
+	// Defragmentation: the allocation it is destroyed without (a moved buffer's memory, which the pass frees), and the
+	// one it takes (the moved allocation, now at its memory).
+	void                        ReleaseAllocation() noexcept { m_allocation = nullptr; }
+	void                        AdoptAllocation(VmaAllocation allocation) noexcept { m_allocation = allocation; }
 
 	[[nodiscard]] vk::Buffer         Handle() const noexcept { return m_buffer; }
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
-	// A device-local buffer that got system memory (video memory full even past its budget).
+	// A device-local buffer that got system memory (video memory over budget when it was made): the GPU reads it over
+	// the bus.
 	[[nodiscard]] bool               IsInSystemMemory() const noexcept { return m_in_system_memory; }
+	[[nodiscard]] bool               HasDeviceAddress() const noexcept { return m_device_address != 0; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
-	// Created with eShaderDeviceAddress (BufferDeviceAddress() is fatal otherwise).
-	[[nodiscard]] bool HasDeviceAddress() const noexcept { return m_device_address != 0; }
 	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
 		return address - m_cpu_address;
 	}
@@ -78,15 +89,22 @@ public:
 	                                                   vk::AccessFlagBits::eMemoryWrite,
 	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
 	                                                   vk::AccessFlagBits::eMemoryWrite);
+	// A guest copy in a run of copies (CommandBuffer::CopyRunHandle: the run's barriers).
+	void CopyInRun(CommandBuffer& command, const Buffer& source, uint64_t source_offset, uint64_t destination_offset,
+	               uint64_t size);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
 	// BufferCache state lives directly on the resource.
-	bool   is_deleted   = false;
+	std::atomic<bool> is_deleted {false};
 	int    stream_score = 0;
 	size_t lru_id       = 0;
-	// A shader read it through the BDA page table while no buffer held its pages (FaultManager): such reads touch
-	// no LRU entry, so the stale-buffer retirement passes it over (BufferCache::RetireStaleBuffers).
+	// A shader read it through the BDA page table while no buffer held its pages (FaultManager): such reads touch no
+	// LRU entry, so the stale-buffer retirement passes it over (BufferCache::RetireStaleBuffers).
 	bool bda_read = false;
+	// The command buffer (CommandScheduler::CommandSerial) that last recorded a copy or fill into it or an image's
+	// bytes (TextureCache::DownloadImageData): writes that need not synchronize their pages first (a shader's write
+	// does, BufferCache::ObtainBuffer). Uploads into it then stay in order in that buffer (UploadPrologue).
+	uint64_t written_serial = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
@@ -122,6 +140,9 @@ public:
 	// lifetime if preparation submitted its original tick. No intervening Map/Commit.
 	void                                        RetainLastUse();
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
+	// KYTY_STAGING_STATS: an upload the caller sends around the ring (a temporary buffer, the
+	// large path), counted with its use.
+	void NoteBypass(uint64_t size);
 
 private:
 	friend struct StreamBufferTestAccess;
@@ -138,6 +159,21 @@ private:
 	                                                uint64_t requested_upper_bound, bool allow_wait,
 	                                                size_t& wait_cursor, uint64_t& wait_bound);
 
+	// KYTY_STAGING_STATS=1 (diagnostics): an upload ring's use, printed each 10 s (Map): the bytes
+	// through it, its laps, the waits for the GPU, the most in flight (reserved and not yet read
+	// by the GPU: the size it needs), the reservations refused (too large, or a wait not allowed)
+	// and the uploads sent around it.
+	struct UseStats {
+		uint64_t bytes = 0, maps = 0, laps = 0, waits = 0, wait_us = 0, largest = 0;
+		uint64_t second_bytes = 0, busiest = 0, in_flight = 0;
+		uint64_t refused = 0, refused_bytes = 0, bypassed = 0, bypassed_bytes = 0;
+		std::chrono::steady_clock::time_point since {}, second {};
+	};
+	[[nodiscard]] uint64_t InFlight();
+	void                   NoteUse(uint64_t size, bool wrap);
+	void                   NoteRefusal(uint64_t size);
+
+	UseStats              m_use;
 	uint64_t              m_offset      = 0;
 	uint64_t              m_mapped_size = 0;
 	std::vector<Watch>    m_current_watches;
@@ -147,6 +183,11 @@ private:
 	size_t                m_wait_cursor = 0;
 	uint64_t              m_wait_bound  = 0;
 };
+
+// The buffer reclaimer frees no memory from HoldBufferFrees (false: a free runs now) to ReleaseBufferFrees: a defragmentation
+// pass's moves must stay allocated until it ends (BufferCache::Defragment; streamBuffer.cpp).
+[[nodiscard]] bool HoldBufferFrees();
+void               ReleaseBufferFrees();
 
 } // namespace Libs::Graphics
 

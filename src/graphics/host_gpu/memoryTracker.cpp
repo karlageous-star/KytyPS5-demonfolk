@@ -90,6 +90,14 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+bool MemoryTracker::IsRegionFullyCpuModified(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	// (Missing regions were never tracked: all CPU-dirty.)
+	return !Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		return !QueryRegion(manager, [&] { return manager->IsModified<DirtySource::Cpu, true>(offset, bytes); });
+	});
+}
+
 bool MemoryTracker::IsRegionFullyGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	// Missing regions start CPU-dirty, so they must also participate in this test.
@@ -124,6 +132,20 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
+}
+
+bool MemoryTracker::MarkRegionAsCpuDirtyKeepProtection(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	if (IsRegionGpuModified(vaddr, size)) return false;
+	// (Untracked regions are all CPU-dirty; a page the GPU marks meanwhile is the GPU thread's, which calls this.)
+	return !Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		return !manager->MarkCpuDirtyKeepProtection(manager->GetCpuAddr() + offset, bytes);
+	});
+}
+
+void MemoryTracker::NoteHostWrite(uint64_t vaddr, uint64_t size) {
+	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t, uint64_t) { manager->NoteHostWrite(); });
 }
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {

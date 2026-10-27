@@ -3,6 +3,7 @@
 #include "SDL.h"
 #include "common/assert.h"
 #include "common/stringUtils.h"
+#include "gpu_blit_shaders/gpu_imgui_hdr_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
@@ -21,6 +22,7 @@
 #include <cstdlib>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -33,6 +35,7 @@ namespace {
 namespace CoreIme   = Libs::Ime;
 namespace DialogIme = Libs::Dialog::ImeDialog;
 namespace ErrorDialog = Libs::Dialog::ErrorDialog;
+namespace SaveDialog  = Libs::Dialog::SaveDataDialog;
 
 namespace Ime {
 
@@ -105,7 +108,7 @@ bool HostQueueExternalInput(uint64_t generation, ExternalInput input) {
 
 } // namespace Ime
 
-enum class OverlayKind : uint8_t { None, Ime, Error };
+enum class OverlayKind : uint8_t { None, Ime, Error, SaveList };
 
 struct OverlaySession {
 	OverlayKind kind       = OverlayKind::None;
@@ -118,11 +121,16 @@ struct OverlaySnapshot {
 	OverlaySession            session;
 	Ime::HostSnapshot         ime;
 	ErrorDialog::HostSnapshot error;
+	SaveDialog::HostSnapshot  save;
 };
 
 bool GetOverlaySnapshot(OverlaySnapshot* snapshot) {
 	if (ErrorDialog::GetHostSnapshot(&snapshot->error)) {
 		snapshot->session = {OverlayKind::Error, snapshot->error.generation};
+		return true;
+	}
+	if (SaveDialog::GetHostSnapshot(&snapshot->save)) {
+		snapshot->session = {OverlayKind::SaveList, snapshot->save.generation};
 		return true;
 	}
 	if (Ime::GetHostSnapshot(&snapshot->ime)) {
@@ -234,7 +242,7 @@ void RefreshVisibility() {
 	bool capture_keyboard   = false;
 	bool text_input         = false;
 	bool multiline          = false;
-	if (snapshot.session.kind == OverlayKind::Error) {
+	if (snapshot.session.kind == OverlayKind::Error || snapshot.session.kind == OverlayKind::SaveList) {
 		capture_controller = true;
 		capture_keyboard   = true;
 	} else if (snapshot.session.kind == OverlayKind::Ime) {
@@ -428,6 +436,7 @@ void InitializeSystemOverlayInput() {
 	CoreIme::SetVisibilityCallback(OnCoreVisibilityChanged);
 	DialogIme::SetVisibilityCallback(OnDialogVisibilityChanged);
 	ErrorDialog::SetVisibilityCallback(RefreshVisibility);
+	SaveDialog::SetVisibilityCallback(RefreshVisibility);
 	RefreshVisibility();
 }
 
@@ -435,6 +444,7 @@ void ShutdownSystemOverlayInput() {
 	CoreIme::SetVisibilityCallback(nullptr);
 	DialogIme::SetVisibilityCallback(nullptr);
 	ErrorDialog::SetVisibilityCallback(nullptr);
+	SaveDialog::SetVisibilityCallback(nullptr);
 	{
 		std::scoped_lock lock(g_visibility_mutex);
 		g_input_lifecycle_active = false;
@@ -464,8 +474,9 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto core   = CoreIme::GetVisualState();
 	const auto dialog = DialogIme::GetVisualState();
 	const auto error  = ErrorDialog::GetVisualState();
-	return {core.active || dialog.active || error.active,
-	        core.revision + dialog.revision + error.revision};
+	const auto save   = SaveDialog::GetVisualState();
+	return {core.active || dialog.active || error.active || save.active,
+	        core.revision + dialog.revision + error.revision + save.revision};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -517,6 +528,27 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	                            event.type == SDL_KEYDOWN || event.type == SDL_KEYUP;
 	if (keyboard_event && !g_input_keyboard) {
 		return false;
+	}
+	if (keyboard_event && session.kind == OverlayKind::SaveList) {
+		// The keys the game's pad has (arrows, J cross, L circle) and Enter / Escape, as the pad's buttons.
+		if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
+			int button = -1;
+			switch (event.key.keysym.sym) {
+				case SDLK_UP:
+				case SDLK_w: button = SDL_CONTROLLER_BUTTON_DPAD_UP; break;
+				case SDLK_DOWN:
+				case SDLK_s: button = SDL_CONTROLLER_BUTTON_DPAD_DOWN; break;
+				case SDLK_RETURN:
+				case SDLK_KP_ENTER:
+				case SDLK_j: button = SDL_CONTROLLER_BUTTON_A; break;
+				case SDLK_ESCAPE:
+				case SDLK_l: button = SDL_CONTROLLER_BUTTON_B; break;
+				default: break;
+			}
+			if (button >= 0 && event.key.repeat == 0)
+				QueueInput({InputKind::Button, session, button, event.type == SDL_KEYDOWN ? 1.0f : 0.0f, 0.0f});
+		}
+		return true;
 	}
 	if (keyboard_event && session.kind == OverlayKind::Error) {
 		if (event.type == SDL_KEYDOWN && event.key.repeat == 0 &&
@@ -635,6 +667,20 @@ struct SystemOverlay::Impl {
 		if (exists(fonts + "segoeuib.ttf")) {
 			hud_font = io.Fonts->AddFontFromFileTTF((fonts + "segoeuib.ttf").c_str(), 32.0f);
 		}
+		// The dialogs draw the game's own texts (save names and their detail, messages), which are not
+		// ASCII: the system's CJK face where Windows has one, with the ranges those texts use. Plain
+		// "?" for every character is what the default font, which only holds ASCII, drew before.
+		for (const char* face: {"msyh.ttc", "msyhbd.ttc", "simhei.ttf", "simsun.ttc"}) {
+			if (!exists(fonts + face)) {
+				continue;
+			}
+			dialog_font = io.Fonts->AddFontFromFileTTF(
+			    (fonts + face).c_str(), 32.0f, nullptr,
+			    io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+			if (dialog_font != nullptr) {
+				break;
+			}
+		}
 #endif
 		ImGui::StyleColorsDark();
 		auto& style          = ImGui::GetStyle();
@@ -669,6 +715,12 @@ struct SystemOverlay::Impl {
 		info.PipelineInfoMain.PipelineRenderingCreateInfo.colorAttachmentCount    = 1;
 		info.PipelineInfoMain.PipelineRenderingCreateInfo.pColorAttachmentFormats = &color_format;
 		info.CheckVkResultFn = CheckVulkanResult;
+		if (IsHdrSwapchainFormat(format)) {
+			// An HDR10 swapchain: the panels' sRGB colors are drawn as PQ.
+			info.CustomShaderFragCreateInfo.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+			info.CustomShaderFragCreateInfo.codeSize = sizeof(GPU_IMGUI_HDR_SPV);
+			info.CustomShaderFragCreateInfo.pCode    = GPU_IMGUI_HDR_SPV;
+		}
 		EXIT_IF(!ImGui_ImplVulkan_Init(&info));
 		vulkan_initialized = true;
 	}
@@ -696,6 +748,9 @@ struct SystemOverlay::Impl {
 			switch (event.kind) {
 				case InputKind::Button: {
 					const bool down = event.x != 0.0f;
+					if (session.kind == OverlayKind::SaveList && down && event.id == SDL_CONTROLLER_BUTTON_B) {
+						SaveDialog::HostCancel(session.generation);
+					}
 					if (session.kind == OverlayKind::Ime && down) {
 						if (event.id == SDL_CONTROLLER_BUTTON_B) {
 							Ime::HostCancel(session.generation);
@@ -931,7 +986,7 @@ struct SystemOverlay::Impl {
 		}
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {24.0f * scale, 24.0f * scale});
 		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {12.0f * scale, 16.0f * scale});
-		ImGui::PushFont(nullptr, 20.0f * scale);
+		ImGui::PushFont(dialog_font, 20.0f * scale);
 		constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
 		                                   ImGuiWindowFlags_NoSavedSettings |
 		                                   ImGuiWindowFlags_AlwaysAutoResize;
@@ -956,6 +1011,134 @@ struct SystemOverlay::Impl {
 		if (accepted) {
 			ErrorDialog::HostAccept(snapshot.generation);
 		}
+	}
+
+	// The system's save data list (a game's Load Game): one button per save, the game's texts for it and its date.
+	void DrawSaveList(const SaveDialog::HostSnapshot& snapshot, vk::Extent2D extent) {
+		const ImVec2 display(static_cast<float>(extent.width), static_cast<float>(extent.height));
+		const float  scale = std::max(std::min(display.x / 1280.0f, display.y / 720.0f), 0.5f);
+		ImGui::GetBackgroundDrawList()->AddRectFilled({0.0f, 0.0f}, display, IM_COL32(0, 0, 0, 160));
+		ImGui::SetNextWindowPos({display.x * 0.5f, display.y * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
+		ImGui::SetNextWindowSize({std::max(std::min(720.0f * scale, display.x - 32.0f), 1.0f), 0.0f}, ImGuiCond_Always);
+		if (focus_pending) {
+			ImGui::SetNextWindowFocus();
+		}
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {24.0f * scale, 20.0f * scale});
+		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {12.0f * scale, 10.0f * scale});
+		ImGui::PushFont(dialog_font, 20.0f * scale);
+		constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+		                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize;
+		ImGui::Begin("##SaveDataList", nullptr, flags);
+		ImGui::TextUnformatted(snapshot.disp_type == 3 ? "Delete" : (snapshot.disp_type == 1 ? "Save" : "Load"));
+		ImGui::Separator();
+		ImGui::BeginChild("##Saves", {0.0f, std::min(display.y * 0.6f, 96.0f * scale * static_cast<float>(snapshot.entries.size()))});
+		std::optional<size_t> chosen;
+		ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, {0.0f, 0.5f});
+		for (size_t i = 0; i < snapshot.entries.size(); i++) {
+			const auto& entry = snapshot.entries[i];
+			std::string label = entry.title;
+			if (!entry.detail.empty()) label += "\n" + entry.detail;
+			if (!entry.date.empty()) label += "\n" + entry.date;
+			label += "##" + entry.dir_name;
+			if (ImGui::Button(label.c_str(), {ImGui::GetContentRegionAvail().x, 0.0f})) chosen = i;
+			if (focus_pending && i == snapshot.focus) {
+				ImGui::SetItemDefaultFocus();
+				ImGui::SetKeyboardFocusHere(-1);
+			}
+		}
+		ImGui::PopStyleVar();
+		ImGui::EndChild();
+		const float button_width = std::min(140.0f * scale, ImGui::GetContentRegionAvail().x);
+		ImGui::SetCursorPosX((ImGui::GetWindowSize().x - button_width) * 0.5f);
+		const bool canceled = ImGui::Button("Cancel", {button_width, 40.0f * scale});
+		ImGui::TextDisabled("Cross / Enter: choose    Circle / Escape: back    Up / Down (W / S): move");
+		focus_pending = false;
+		ImGui::End();
+		ImGui::PopFont();
+		ImGui::PopStyleVar(2);
+		if (chosen) {
+			SaveDialog::HostSelect(snapshot.generation, *chosen);
+		} else if (canceled) {
+			SaveDialog::HostCancel(snapshot.generation);
+		}
+	}
+
+	// KYTY_FPS_HUD: the frame-time graph (the frames green, hitches red; the render thread's busy part of each
+	// orange; lines at 60 and 30 fps) and the detailed panel's rows with the processor's cores as bars.
+	void DrawPerf(const SystemOverlayPerf& perf, float unit) {
+		const ImU32 green = IM_COL32(118, 186, 0, 255), red = IM_COL32(235, 64, 52, 255),
+		            orange = IM_COL32(255, 160, 40, 110), grid = IM_COL32(255, 255, 255, 60),
+		            dim = IM_COL32(255, 255, 255, 150);
+		auto*       draw  = ImGui::GetWindowDrawList();
+		const float width = 420.0f * unit;
+		if (!perf.frame_ms.empty()) {
+			const float height = 100.0f * unit;
+			ImGui::Dummy({0.0f, 8.0f * unit});
+			ImGui::PushFont(hud_font, 16.0f * unit);
+			ImGui::TextColored({1.0f, 1.0f, 1.0f, 0.75f}, "%s", perf.graph_note.c_str());
+			ImGui::PopFont();
+			ImGui::Dummy({0.0f, 3.0f * unit});
+			const ImVec2 origin = ImGui::GetCursorScreenPos();
+			ImGui::Dummy({width, height});
+			draw->AddRectFilled(origin, {origin.x + width, origin.y + height}, IM_COL32(0, 0, 0, 110), 4.0f * unit);
+			// 0 to 40 ms (longer frames reach the top): the 60 fps line 42% of the way up, the 30 fps one 83%.
+			constexpr float top = 40.0f;
+			const auto      y   = [&](float ms) { return origin.y + height - std::min(ms / top, 1.0f) * height; };
+			const auto  n = perf.frame_ms.size();
+			const auto  x = [&](size_t i) {
+                return origin.x + (n > 1 ? width * static_cast<float>(i) / static_cast<float>(n - 1) : 0.0f);
+			};
+			const float step = n > 1 ? width / static_cast<float>(n - 1) : width;
+			for (size_t i = 0; i < perf.busy_ms.size() && i < n; ++i)
+				draw->AddRectFilled({x(i) - step * 0.5f, y(perf.busy_ms[i])}, {x(i) + step * 0.5f, origin.y + height}, orange);
+			ImGui::PushFont(hud_font, 13.0f * unit);
+			for (const auto& [ms, label]: {std::pair {1000.0f / 60.0f, "60"}, std::pair {1000.0f / 30.0f, "30"}}) {
+				if (ms >= top) continue;
+				draw->AddLine({origin.x, y(ms)}, {origin.x + width, y(ms)}, grid, 1.0f * unit);
+				draw->AddText({origin.x + 4.0f * unit, y(ms) - 15.0f * unit}, dim, label);
+			}
+			ImGui::PopFont();
+			for (size_t i = 1; i < n; ++i) {
+				// (A frame half again as long as the one before it, and over 20 ms: a hitch.)
+				const bool hitch = perf.frame_ms[i] > 20.0f && perf.frame_ms[i] > perf.frame_ms[i - 1] * 1.5f;
+				draw->AddLine({x(i - 1), y(perf.frame_ms[i - 1])}, {x(i), y(perf.frame_ms[i])}, hitch ? red : green,
+				              (hitch ? 2.0f : 1.5f) * unit);
+			}
+		}
+		if (perf.rows.empty()) return;
+		ImGui::Dummy({0.0f, 8.0f * unit});
+		ImGui::PushFont(hud_font, 17.0f * unit);
+		const float value_x = 64.0f * unit;
+		for (const auto& row: perf.rows) {
+			const float left = ImGui::GetCursorPosX();
+			ImGui::TextColored({0.62f, 0.78f, 1.0f, 1.0f}, "%s", row.label.c_str());
+			ImGui::SameLine(left + value_x);
+			ImGui::TextUnformatted(row.value.c_str());
+			if (row.label == "CPU" && !perf.core_load.empty()) {
+				// The cores as bars, a hybrid processor's performance cores brighter.
+				const float  bar_height = 26.0f * unit, gap = 2.0f * unit;
+				const auto   count      = static_cast<float>(perf.core_load.size());
+				const float  bar_width  = std::min(14.0f * unit, (width - value_x - gap * (count - 1.0f)) / count);
+				ImGui::SetCursorPosX(left + value_x);
+				const ImVec2 origin = ImGui::GetCursorScreenPos();
+				ImGui::Dummy({count * (bar_width + gap), bar_height + 4.0f * unit});
+				for (size_t i = 0; i < perf.core_load.size(); ++i) {
+					const bool  fast = i < perf.core_fast.size() && perf.core_fast[i] != 0;
+					const float x0   = origin.x + static_cast<float>(i) * (bar_width + gap);
+					draw->AddRectFilled({x0, origin.y}, {x0 + bar_width, origin.y + bar_height}, IM_COL32(255, 255, 255, 40));
+					draw->AddRectFilled({x0, origin.y + bar_height * (1.0f - std::clamp(perf.core_load[i], 0.0f, 1.0f))},
+					                    {x0 + bar_width, origin.y + bar_height},
+					                    fast ? IM_COL32(110, 170, 255, 255) : IM_COL32(60, 200, 190, 255));
+				}
+				if (!perf.core_note.empty()) {
+					ImGui::SetCursorPosX(left + value_x);
+					ImGui::PushFont(hud_font, 15.0f * unit);
+					ImGui::TextColored({1.0f, 1.0f, 1.0f, 0.75f}, "%s", perf.core_note.c_str());
+					ImGui::PopFont();
+				}
+			}
+		}
+		ImGui::PopFont();
 	}
 
 	// Top right of the game image, below the game's own corner icon: the frame rate (KYTY_FPS_HUD)
@@ -991,9 +1174,12 @@ struct SystemOverlay::Impl {
 				ImGui::PushFont(hud_font, 46.0f * unit);
 				ImGui::TextColored({0.46f, 0.73f, 0.0f, 1.0f}, "%s", hud.title.c_str());
 				ImGui::PopFont();
-				ImGui::PushFont(hud_font, 21.0f * unit);
-				ImGui::TextUnformatted(hud.detail.c_str());
-				ImGui::PopFont();
+				if (!hud.detail.empty()) {
+					ImGui::PushFont(hud_font, 21.0f * unit);
+					ImGui::TextUnformatted(hud.detail.c_str());
+					ImGui::PopFont();
+				}
+				DrawPerf(hud.perf, unit);
 			});
 		}
 		if (!hud.status.empty()) {
@@ -1067,6 +1253,8 @@ struct SystemOverlay::Impl {
 		if (dialog) {
 			if (snapshot.session.kind == OverlayKind::Error) {
 				DrawError(snapshot.error, frame_extent);
+			} else if (snapshot.session.kind == OverlayKind::SaveList) {
+				DrawSaveList(snapshot.save, frame_extent);
 			} else {
 				DrawIme(snapshot.ime, frame_extent);
 			}
@@ -1113,6 +1301,7 @@ struct SystemOverlay::Impl {
 	GraphicContext&                       graphics;
 	ImGuiContext*                         imgui_context      = nullptr;
 	ImFont*                               hud_font           = nullptr; // null: the default font
+	ImFont*                               dialog_font        = nullptr; // null: the default font
 	bool                                  vulkan_initialized = false;
 	bool                                  shift              = false;
 	bool                                  symbol_mode        = false;

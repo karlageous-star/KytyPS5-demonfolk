@@ -1,6 +1,8 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
+#include <algorithm>
+
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 namespace {
 
@@ -365,8 +367,15 @@ void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 	}
 }
 
+// A cooperative program's lane read the wave runs (IR::Program::cooperative_reads).
+static IR::WaveFlags WaveRead(const IR::Program& program, uint32_t pc) {
+	return {.cooperative = program.lane_cooperative &&
+	                       std::binary_search(program.cooperative_reads.begin(), program.cooperative_reads.end(), pc)};
+}
+
 void Translator::V_READFIRSTLANE_B32(const Decoder::Instruction& inst) {
-	const auto result = ir.Emit(IR::ValueOpcode::ReadFirstLane, {ReadU32(inst.src0), ir.GetExec()});
+	const auto result =
+	    ir.Emit(IR::ValueOpcode::ReadFirstLane, {ReadU32(inst.src0), ir.GetExec()}, WaveRead(program, inst.pc));
 	WriteOperand(DestinationOperand(inst), result);
 }
 
@@ -374,7 +383,7 @@ void Translator::V_READLANE_B32(const Decoder::Instruction& inst) {
 	const auto lane_mask = IR::U32(IR::Value(program.wave_size == 32u ? 31u : 63u));
 	const auto lane      = ir.BitwiseAnd(ReadU32(inst.src1), lane_mask);
 	WriteOperand(DestinationOperand(inst),
-	             ir.Emit(IR::ValueOpcode::ReadLane, {ReadU32(inst.src0), lane}));
+	             ir.Emit(IR::ValueOpcode::ReadLane, {ReadU32(inst.src0), lane}, WaveRead(program, inst.pc)));
 }
 
 void Translator::V_WRITELANE_B32(const Decoder::Instruction& inst) {

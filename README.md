@@ -1,3 +1,81 @@
+> [!NOTE]
+> **This fork is tuned for Demon's Souls.** Its renderer, shader and memory paths are optimized for
+> **Demon's Souls (PS5, PPSA01341), game versions 1.07 (01.007.000) and 1.05 (01.005.000)**: both are
+> supported, with the same performance patches (each version precompiles its own shader caches); other
+> versions and games are untested here and may not run. Tested on Windows 11 with an Intel i9-14900K and
+> an NVIDIA RTX 5090 (60 fps in most places at 2560×1440, the heaviest spots about 57–60); users also run
+> it on AMD Radeon and Intel Arc cards, with problems of their own tracked in the issues. 32 GB of RAM and
+> a GPU with 12 GB of video memory are recommended; it also runs with 16 GB of RAM (slower loading; close
+> browsers while playing, see [#50](https://github.com/chenxiao07/KytyPS5/issues/50)) and 8 GB of video memory (the test PC limited to 8 GB: most areas 40–60
+> fps, the heaviest 10–35).
+>
+> **Download: [the latest release](https://github.com/chenxiao07/KytyPS5/releases/latest)**, a Windows
+> x64 build made by GitHub Actions from this branch. Unzip it, double-click `launcher.cmd` (or
+> `run.cmd`) and choose the game folder (the one with `eboot.bin`); the `README.md` inside explains
+> the rest. Use only a game dump made from your own copy of the game. To build it yourself, see
+> [Building with build-windows.cmd](#building-with-build-windowscmd-windows).
+>
+> **Chinese, Japanese, Korean:** the game files hold every language, but the game lists only its
+> release's. Setting `"userDefinedParam1"` in the game's `sce_sys\param.json` from `2` (Europe, as dumped)
+> to `0` lists every language (`4`: the Asian release, `3`: the Japanese one); with saves, move
+> `_SaveData\PPSA01341\SAVEDATA0OptionsProfile0` away so the game asks again. Steps:
+> [Game language](docs/PORTABLE-README.md#game-language-chinese-japanese-korean-and-others).
+>
+> 中文：本分支专为《恶魔之魂》(PS5 版 PPSA01341) 优化，支持游戏版本 1.07 (01.007.000) 和 1.05 (01.005.000)，两者性能补丁相同
+> （着色器缓存按版本分别预编译）；其他版本和游戏未测试。
+> 下载[最新 release](https://github.com/chenxiao07/KytyPS5/releases/latest)，解压后双击 `launcher.cmd`
+> 或 `run.cmd`，选择游戏目录（含 `eboot.bin` 的那一层）。推荐 32 GB 内存、12 GB 以上显存的显卡；16 GB 内存
+> （加载较慢；游戏时请关闭浏览器等大程序，见 [#50](https://github.com/chenxiao07/KytyPS5/issues/50)）和 8 GB 显存（测试机限制到 8 GB 时：多数区域 40–60 帧，最重的场景
+> 10–35 帧）也能运行。
+> **中文/日文：** 游戏文件里包含全部语言，但只列出所属发行区域的语言。把游戏目录 `sce_sys\param.json` 里的
+> `"userDefinedParam1": 2`（欧版，dump 原值）改成 `0` 即可列出全部语言（含简繁中文和日文；`4` 为亚洲版：简繁中文、
+> 英文、韩文、泰文；`3` 为日版）。已有存档时，先备份 `_SaveData`，再把 `_SaveData\PPSA01341\SAVEDATA0OptionsProfile0`
+> 移出存档目录（角色存档不受影响，只有游戏设置恢复默认），下次启动会出现语言选择。详见
+> [Game language](docs/PORTABLE-README.md#game-language-chinese-japanese-korean-and-others)。
+
+## Fixes worth cherry-picking
+
+Most of this fork is performance work tied to its own caches, but these three fixes stand on their
+own and are useful in other KytyPS5 trees:
+
+**1. Game audio: the game was silent, then positional sounds were nearly inaudible**
+
+- [`f203d0f3`](https://github.com/chenxiao07/KytyPS5/commit/f203d0f3), its audio part only (the commit
+  also holds Windows packaging): ATRAC9 streams in a RIFF container required the whole `data` chunk in
+  the first stream piece, so every decode returned partial input and the game played no sound besides
+  its videos; AudioOut2 object ports are mixed into the main port. Take just its two audio files:
+  `git show f203d0f3 -- src/libs/ajm/atrac9_decoder.h src/libs/libAudio2.cpp | git apply`
+  (upstream has rewritten its RIFF parsing since, in `e40438f9`: compare before taking that part).
+- [`c2b48aeb`](https://github.com/chenxiao07/KytyPS5/commit/c2b48aeb), `git cherry-pick c2b48aeb` after
+  the above: the game sends its whole mix as two fifth-order ambisonics scenes on AudioOut2 object
+  ports (attribute 8 = 0x40 | ACN, SN3D). Summed into the front pair they cancelled out; they are now
+  decoded to stereo from the first order, and 7.1 ports are downmixed on stereo devices without SDL's
+  -13.5 dB front level.
+
+**2. Nexus: a ring of blue "?" models** ([`3248e372`](https://github.com/chenxiao07/KytyPS5/commit/3248e372),
+`src/libs/libAmpr.cpp` only)
+
+APR file ids were hashes of the guest path. The game resolves all of its ~250K files at start-up, 13
+pairs collided, and one file of each pair read the other's bytes: the Nexus arch model failed to load
+and the engine drew its default "?" model instead (some LODs, a collision mesh and a texture elsewhere
+were affected too). Ids are now assigned one per path. Upstream main (cdb64bfd, 2026-10-06) still hashes.
+
+![The Nexus ceiling before and after 3248e372: the ring of "?" models is gone](docs/images/nexus-question-marks.jpg)
+
+**3. Boletaria 1-1: the brazier's stone pillar and other missing objects**
+([`3b351932`](https://github.com/chenxiao07/KytyPS5/commit/3b351932))
+
+Indirect draws name a user SGPR (START_INST_LOC) that the command processor fills with the draw's
+start instance, and the shader's instance ID counts from 0. Both were ignored (the ID included
+firstInstance), so shaders that index per-object data with that SGPR read stale values: the stone
+pillar under the brazier at 1-1, rock faces there, the hall behind the cell windows of the Tower of
+Latria. The fix is in the shader recompiler (`Translate.cpp`, the SPIR-V emitter), `shader.cpp/.h`
+(the static key), `graphicsRun.cpp` / `hardwareContext.h` (the SGPR per draw) and `vulkanWindow.cpp`
+(`shaderDrawParameters`, `drawIndirectFirstInstance`); its `src/local` and `tools` changes only follow
+this fork's caches.
+
+![Boletaria 1-1 before and after 3b351932: the brazier floats without its stone pillar before the fix](docs/images/boletaria-pillar.jpg)
+
 # KytyPS5
 
 [![Build KytyPS5 (Windows)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
@@ -123,6 +201,58 @@ the Vulkan/SPIR-V validation rules.
 - A Vulkan 1.3-capable GPU with current drivers (on macOS, Vulkan is provided by the bundled
   MoltenVK)
 
+### Building with build-windows.cmd (Windows)
+
+The shortest way to a Release build of the emulator (without the Qt launcher):
+
+1. Install the tools once:
+   - Git: `winget install Git.Git`
+   - Visual Studio 2022 or Build Tools 2022 with the **Desktop development with C++** workload (its
+     **C++ CMake tools for Windows** component brings CMake and Ninja)
+   - LLVM 19 for `clang-cl`: `winget install LLVM.LLVM --version 19.1.7` (19.1.7 is tested; the
+     **C++ Clang tools for Windows** component of Visual Studio is used when LLVM is not installed;
+     LLVM 23.1.2 crashes compiling `agc.cpp`). Visual Studio 2026's C++ library needs Clang 20 or
+     newer (`STL1000: Unexpected compiler version`): with it, use its bundled `clang-cl` (no LLVM in
+     `Program Files`) or a newer LLVM.
+   - Vulkan SDK, for `glslangValidator`: `winget install KhronosGroup.VulkanSDK`
+   - Python 3: `winget install Python.Python.3.12`
+2. Clone and build from a new terminal (so that the tools are on `PATH`):
+
+   ```powershell
+   git clone --recurse-submodules https://github.com/chenxiao07/KytyPS5.git
+   cd KytyPS5
+   .\build-windows.cmd
+   ```
+
+   The script finds Visual Studio, `clang-cl` and the Vulkan SDK, checks out submodules that are
+   missing, configures `_Build\windows` the first time (CMake downloads xbyak, zydis, zstd and ZArchive) and builds
+   `_Build\windows\kyty_emulator.exe`. Run it again after changes for an incremental build;
+   `.\build-windows.cmd all` builds every target.
+3. Start a game with its folder (the one with `eboot.bin`; it is remembered in `game-path.txt`):
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\run-windows.ps1 -Game "D:\Games\PPSA01341-app0"
+   ```
+
+   The emulator's switches default to the release settings (`src/local/performance-switches.h`;
+   `-Set KYTY_NAME=value` changes one); `-DryRun` prints the environment and the command,
+   `-Fullscreen`, `-Width`/`-Height` and the others are listed at the top of the script.
+   A ZArchive of the folder (`-Game D:\Games\PPSA01341-app0.zar`) works too, read without extracting
+   it; `.\build-windows.cmd zarchive_tool` builds the packer, `_Build\windows\3rdparty\zarchive.exe
+   <folder> <file.zar>`.
+
+The build is optimized for the CPU it is built on (`-march=native`). For an executable that other
+PCs can run, set `KYTY_CMAKE_ARGS=-DKYTY_MARCH=x86-64-v3` before the first configure. The release
+package is built that way by [`.github/workflows/build.yml`](.github/workflows/build.yml) when
+**Actions > Build KytyPS5 (Windows) > Run workflow** is started or a `v*` tag is pushed, and published as a
+release (pushes build nothing). [`.github/workflows/build-linux.yml`](.github/workflows/build-linux.yml)
+builds the Linux package the same way (a `v*` tag adds it to that tag's release).
+
+AMD FSR 3.1 frame generation (2x, any GPU without DLSS frame generation; `run-windows.ps1 -Fsr`, a launcher
+checkbox) is built in when AMD FidelityFX SDK 1.1.4's API headers (`ffx-api/include`, MIT) are unpacked into
+`_Build\deps\fidelityfx\include` before configuring. At run time it needs AMD's signed `amd_fidelityfx_vk.dll` next
+to the emulator. The release build fetches the headers itself (as Streamline's); the DLL is not in the package.
+
 ### Build requirements (Windows)
 
 - Git
@@ -130,6 +260,7 @@ the Vulkan/SPIR-V validation rules.
 - Ninja
 - Visual Studio 2022 or Build Tools 2022 with the **Desktop development with C++** workload and
   **C++ Clang tools for Windows** component
+- The Vulkan SDK (`glslangValidator`) and Python 3
 - Qt 6 for MSVC 2022 64-bit, including Concurrent, Network, and Widgets
 
 The Microsoft C++ compiler (`cl.exe`) is not supported; use `clang-cl`.
@@ -158,6 +289,15 @@ The finished application and its runtime dependencies will be placed in
 `_Build/windows/install`.
 
 ### Building on Linux
+
+`./build-linux.sh` builds the emulator (no Qt launcher) in one step: `./build-linux.sh` builds
+`kyty_emulator` and `kyty_launcher`, `./build-linux.sh kyty_shader_precompile` another target. `kyty_launcher`
+([`launcher-linux/`](launcher-linux)) is the settings window, the Windows launcher's pages and settings with SDL2 and
+Dear ImGui linked in (nothing to install); it starts the game through `run_ds.sh`. It uses `-O3`, ThinLTO and
+`-march=x86-64-v3` for an executable other PCs can run (`KYTY_MARCH=native` for this CPU only). The
+manual steps below build the Qt launcher as well. `tools/local/dlss-bridge/build-dlss-linux.sh` adds DLSS
+(`tools/local/dlss-bridge/README.md`), and `./precompile-linux.sh --game <the game>` makes the static shader cache
+as `precompile-windows.ps1` does on Windows (`--help`).
 
 Install the toolchain and the libraries the bundled SDL2 needs. Without the audio, Wayland and
 udev development packages SDL2 quietly configures itself without those backends, and the resulting
@@ -192,6 +332,30 @@ As on Windows, the MSVC compiler is not used; Clang is required. `cl.exe` is rej
 time.
 
 The CMake source root is the repository root.
+
+#### PGO on Linux
+
+`tools/pgo/kyty.profdata` is made by clang-cl and matches almost nothing in a Linux build (MSVC-mangled names), so
+Linux has its own: `tools/pgo/kyty-linux.profdata`, which the Linux package is built with
+(`KYTY_CMAKE_ARGS=-DKYTY_PGO_USE=$PWD/tools/pgo/kyty-linux.profdata ./build-linux.sh` does the same). It is made with
+clang 18 (Ubuntu 24.04's, the CI's compiler): clang 18 can't read a profile written by a newer `llvm-profdata`, and a
+newer clang may match it less well. Like the Windows profile, it goes stale as the code changes: retrain it before
+releases. Use fresh build directories: `KYTY_CMAKE_ARGS` only applies to the first configure.
+
+To make one (with clang 18 for the shipped profile):
+
+1. An instrumented build: `KYTY_BUILD_DIR=_Build/linux-pgogen KYTY_CMAKE_ARGS=-DKYTY_PGO_GENERATE=ON ./build-linux.sh`
+2. Play with it for 10-15 minutes (it runs slower). The emulator exits without writing a profile, so write it with
+   the live command `pgo <file>`: start the emulator with `KYTY_LIVE_FILE=<command file>` and put
+   `id <n>` and `pgo /absolute/path/kyty.profraw` on two lines in that file, with a new `id` each time. The counters
+   add up, so the last write has the whole session. Don't give `KYTY_LIVE_FILE` to `run_ds.sh`: its stutter capture
+   writes to the same file. Set it in a small wrapper script passed as `KYTY_BIN` instead.
+3. Merge and build: `llvm-profdata merge -o kyty-linux.profdata *.profraw`, then
+   `KYTY_BUILD_DIR=_Build/linux-pgo KYTY_CMAKE_ARGS=-DKYTY_PGO_USE=$PWD/kyty-linux.profdata ./build-linux.sh`
+
+The shipped profile was made without playing, by [kyty-bench-linux](https://gist.github.com/the2ndday/5a3f2681a7f61081faee483f47c42b5c)'s
+`train` command: 8 scenes (1-1 twice, 1-2, the Nexus, 2-1, 3-1, 4-1, 5-1), each a launch warped to a spawn point
+with 3 minutes of walking, camera turns and fights, then `pgo`.
 
 ### Building on macOS
 
@@ -341,3 +505,26 @@ licenses included with those components.
   of the original Kyty project.
 - [shadps4-emu/shadPS4](https://github.com/shadps4-emu/shadPS4) — reference for memory-model
   understanding and the AVPlayer implementation.
+
+## Contributors to this fork
+
+Code from these contributors is part of this branch. Thank you!
+
+- [@nerdjb](https://github.com/nerdjb): the Linux port fixes, the `int 0x41` skip on Linux, Linux packaging
+  (`build-linux.sh`, the Linux workflow), the live-budget texture collector and `run_ds.sh`
+  ([#3](https://github.com/chenxiao07/KytyPS5/pull/3); its commits carry the author name "CachyOS", mapped in `.mailmap`).
+- [@Myoko](https://github.com/Myoko): DualSense haptics and a resizable window ([#18](https://github.com/chenxiao07/KytyPS5/pull/18)),
+  add-on content ([#25](https://github.com/chenxiao07/KytyPS5/pull/25)), CJK text in the save dialogs
+  ([#75](https://github.com/chenxiao07/KytyPS5/pull/75)), license-only add-ons and checked add-on ids
+  ([#104](https://github.com/chenxiao07/KytyPS5/pull/104)).
+- [@todojuegos67-bot](https://github.com/todojuegos67-bot): wave OR in pixel shaders, the water in Demon's Souls
+  ([#19](https://github.com/chenxiao07/KytyPS5/pull/19)).
+- [@MikeSee0](https://github.com/MikeSee0): Windows build tool selection ([#39](https://github.com/chenxiao07/KytyPS5/pull/39)).
+- [@iSamigor](https://github.com/iSamigor): AMD pipeline cache keys and unwritten color targets
+  ([#41](https://github.com/chenxiao07/KytyPS5/pull/41)), AMD FSR 3.1 frame generation and the volumes' variants of
+  recorded compute shaders in the precompile ([#96](https://github.com/chenxiao07/KytyPS5/pull/96)).
+- [@Vorshim92](https://github.com/Vorshim92): GPU buffers back in video memory ([#44](https://github.com/chenxiao07/KytyPS5/pull/44)),
+  HUD-less frame generation ([#72](https://github.com/chenxiao07/KytyPS5/pull/72)), save bookkeeping after a power cut
+  ([#74](https://github.com/chenxiao07/KytyPS5/pull/74)).
+- [@Sandermand](https://github.com/Sandermand): AudioOut2 catch-up ([#68](https://github.com/chenxiao07/KytyPS5/pull/68)).
+- [@intellq](https://github.com/intellq): Demon's Souls' own 1080p output ([#103](https://github.com/chenxiao07/KytyPS5/pull/103)).

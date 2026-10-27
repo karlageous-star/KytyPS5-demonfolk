@@ -28,10 +28,19 @@ using VulkanMemoryBarrier = vk::MemoryBarrier;
 vk::Format  VulkanFormat(Prospero::BufferFormat guest_format);
 void        RequireVulkanSuccess(vk::Result result, const char* operation);
 
+// The swapchain takes a 10-bit format only for HDR10 (PQ) output.
+[[nodiscard]] constexpr bool IsHdrSwapchainFormat(vk::Format format) {
+	switch (format) {
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eA2R10G10B10UnormPack32: return true;
+		default: return false;
+	}
+}
+
 template <typename Handle, typename... Args>
 void SetVulkanObjectNameF(vk::Device device, Handle handle, fmt::format_string<Args...> format,
                           Args&&... args) {
-	if (!Config::GraphicsDebugDumpEnabled() || device == nullptr || handle == nullptr ||
+	if (!Config::VulkanObjectNamesEnabled() || device == nullptr || handle == nullptr ||
 	    VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT == nullptr) {
 		return;
 	}

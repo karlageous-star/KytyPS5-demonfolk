@@ -51,6 +51,14 @@ struct PermlaneFlags {
 static_assert(sizeof(PermlaneFlags) <= sizeof(uint64_t));
 static_assert(std::is_trivially_copyable_v<PermlaneFlags>);
 
+// AnyLane, ReadLane, ReadFirstLane of a cooperative lane-local program (Program::lane_cooperative): the wave's answer,
+// the two 32-lane halves exchanging their lanes through workgroup memory (not the subgroup's alone).
+struct WaveFlags {
+	bool cooperative = false;
+};
+static_assert(sizeof(WaveFlags) <= sizeof(uint64_t));
+static_assert(std::is_trivially_copyable_v<WaveFlags>);
+
 struct MemoryFlags {
 	uint32_t index = 0;
 	uint32_t pc    = 0;

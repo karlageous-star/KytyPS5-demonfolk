@@ -16,7 +16,25 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <system_error>
 #include <vector>
+
+// A path of MAX_PATH characters or more opens only in the extended-length form (\\?\, \\?\UNC\ for a share), which
+// takes no relative path, "." or "..", nor forward slashes: a game folder deep in a user's documents (issue #13, a
+// material at 265 characters). Shorter paths go as they are.
+static std::wstring WidePath(const std::filesystem::path& path) {
+	auto wide = path.wstring();
+	if (wide.size() < MAX_PATH - 12 || wide.starts_with(L"\\\\?\\") || wide.starts_with(L"\\\\.\\")) return wide;
+	std::error_code error;
+	const auto      absolute = std::filesystem::absolute(path, error);
+	if (error) return wide;
+	const auto normal = absolute.lexically_normal().wstring();
+	if (normal.starts_with(L"\\\\")) return L"\\\\?\\UNC\\" + normal.substr(2);
+	return L"\\\\?\\" + normal;
+}
+
+// (SysFileTakeLastError.)
+static thread_local uint32_t g_last_error = 0;
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 enum sys_file_type_t {
@@ -112,7 +130,7 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read)
 void SysFileWrite(const void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_written) {
 	if (f.type == SYS_FILE_FILE) {
 		DWORD w = 0;
-		WriteFile(f.handle, data, size, &w, nullptr);
+		if (WriteFile(f.handle, data, size, &w, nullptr) == 0) g_last_error = GetLastError();
 		if (bytes_written != nullptr) {
 			*bytes_written = w;
 		}
@@ -151,12 +169,13 @@ void SysFileWrite(uint32_t n, sys_file_t& f) {
 sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
 	auto* ret = new sys_file_t;
 
-	auto   wide   = file_name.wstring();
+	auto   wide   = WidePath(file_name);
 	HANDLE h_file = nullptr;
 	h_file = CreateFileW(wide.c_str(),
 	                     static_cast<DWORD>(GENERIC_READ) | static_cast<DWORD>(GENERIC_WRITE) |
 	                         static_cast<DWORD>(DELETE),
 	                     FILE_SHARE_POSIX, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (h_file == INVALID_HANDLE_VALUE) g_last_error = GetLastError();
 
 	ret->handle = h_file;
 	ret->type   = SYS_FILE_FILE;
@@ -167,7 +186,7 @@ sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
 sys_file_t* SysFileOpenR(const std::filesystem::path& file_name, sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
 
-	auto   wide   = file_name.wstring();
+	auto   wide   = WidePath(file_name);
 	HANDLE h_file = nullptr;
 	h_file = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_POSIX, nullptr, OPEN_EXISTING,
 	                     GetCacheAccessType(cache_type), nullptr);
@@ -210,14 +229,15 @@ sys_file_t* SysFileCreate() {
 sys_file_t* SysFileOpenW(const std::filesystem::path& file_name, sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
 
-	auto   wide   = file_name.wstring();
+	auto   wide   = WidePath(file_name);
 	HANDLE h_file = nullptr;
 	h_file        = CreateFileW(
 	    wide.c_str(), static_cast<DWORD>(GENERIC_WRITE) | static_cast<DWORD>(DELETE),
 	    FILE_SHARE_POSIX, nullptr, OPEN_EXISTING, GetCacheAccessType(cache_type), nullptr);
 
 	if (h_file == INVALID_HANDLE_VALUE) {
-		ret->type = SYS_FILE_ERROR;
+		g_last_error = GetLastError();
+		ret->type    = SYS_FILE_ERROR;
 	} else {
 		ret->type = SYS_FILE_FILE;
 	}
@@ -231,7 +251,7 @@ sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
                           sys_file_cache_type_t        cache_type) {
 	auto* ret = new sys_file_t;
 
-	auto   wide   = file_name.wstring();
+	auto   wide   = WidePath(file_name);
 	HANDLE h_file = nullptr;
 	h_file = CreateFileW(wide.c_str(),
 	                     static_cast<DWORD>(GENERIC_READ) | static_cast<DWORD>(GENERIC_WRITE) |
@@ -240,7 +260,8 @@ sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
 	                     nullptr);
 
 	if (h_file == INVALID_HANDLE_VALUE) {
-		ret->type = SYS_FILE_ERROR;
+		g_last_error = GetLastError();
+		ret->type    = SYS_FILE_ERROR;
 	} else {
 		ret->type = SYS_FILE_FILE;
 	}
@@ -282,7 +303,7 @@ uint64_t SysFileSize(const std::filesystem::path& file_name) {
 	LARGE_INTEGER             s;
 	WIN32_FILE_ATTRIBUTE_DATA a;
 
-	auto wide = file_name.wstring();
+	auto wide = WidePath(file_name);
 	if (GetFileAttributesExW(wide.c_str(), GetFileExInfoStandard, &a) == 0) {
 		return 0;
 	}
@@ -357,32 +378,43 @@ bool SysFileIsError(sys_file_t& f) {
 	       (f.type == SYS_FILE_FILE && f.handle == INVALID_HANDLE_VALUE);
 }
 
+bool SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size) {
+	WIN32_FILE_ATTRIBUTE_DATA a {};
+	auto                      wide = WidePath(name);
+	if (GetFileAttributesExW(wide.c_str(), GetFileExInfoStandard, &a) == 0) {
+		return false;
+	}
+	*is_file = (a.dwFileAttributes & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) == 0u;
+	*size    = *is_file ? (static_cast<uint64_t>(a.nFileSizeHigh) << 32u) | a.nFileSizeLow : 0;
+	return true;
+}
+
 bool SysFileIsDirectoryExisting(const std::filesystem::path& path) {
-	auto  wide = path.wstring();
+	auto  wide = WidePath(path);
 	DWORD a    = GetFileAttributesW(wide.c_str());
 	return a != INVALID_FILE_ATTRIBUTES &&
 	       ((a & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) != 0u);
 }
 
 bool SysFileIsFileExisting(const std::filesystem::path& name) {
-	auto  wide = name.wstring();
+	auto  wide = WidePath(name);
 	DWORD a    = GetFileAttributesW(wide.c_str());
 	return a != INVALID_FILE_ATTRIBUTES &&
 	       ((a & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) == 0u);
 }
 
 bool SysFileCreateDirectory(const std::filesystem::path& path) {
-	auto wide = path.wstring();
+	auto wide = WidePath(path);
 	return CreateDirectoryW(wide.c_str(), nullptr) != 0;
 }
 
 bool SysFileDeleteDirectory(const std::filesystem::path& path) {
-	auto wide = path.wstring();
+	auto wide = WidePath(path);
 	return RemoveDirectoryW(wide.c_str()) != 0;
 }
 
 bool SysFileDeleteFile(const std::filesystem::path& name) {
-	auto wide = name.wstring();
+	auto wide = WidePath(name);
 	return DeleteFileW(wide.c_str()) != 0;
 }
 
@@ -499,7 +531,7 @@ void SysFileFindFiles(const std::filesystem::path& path, std::vector<sys_file_fi
 	HANDLE           h = nullptr;
 	WIN32_FIND_DATAW data;
 
-	auto wide_pattern = std::filesystem::path(pattern).wstring();
+	auto wide_pattern = WidePath(std::filesystem::path(pattern));
 	h                 = FindFirstFileW(wide_pattern.c_str(), &data);
 
 	if (h == INVALID_HANDLE_VALUE) {
@@ -536,17 +568,12 @@ void SysFileFindFiles(const std::filesystem::path& path, std::vector<sys_file_fi
 }
 
 void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out) {
-	std::string real_path = Common::ReplaceChar(Common::PathToGenericString(path), '\\', '/');
-	if (!Common::EndsWith(real_path, "/")) {
-		real_path += "/";
-	}
-
-	std::string pattern = real_path + "*";
-
 	HANDLE           h = nullptr;
 	WIN32_FIND_DATAW data;
 
-	auto wide_pattern = std::filesystem::path(pattern).wstring();
+	// The pattern from the path itself: a UTF-8 string of it made a path again went through the ANSI code page (a
+	// non-ASCII game folder listed nothing, so its modules were not loaded).
+	auto wide_pattern = WidePath(path / "*");
 	h                 = FindFirstFileW(wide_pattern.c_str(), &data);
 
 	if (h == INVALID_HANDLE_VALUE) {
@@ -569,19 +596,40 @@ void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entr
 }
 
 bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
-	auto src_wide = src.wstring();
-	auto dst_wide = dst.wstring();
+	auto src_wide = WidePath(src);
+	auto dst_wide = WidePath(dst);
 	return CopyFileW(src_wide.c_str(), dst_wide.c_str(), FALSE) != 0;
 }
 
 bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
-	auto src_wide = src.wstring();
-	auto dst_wide = dst.wstring();
+	auto src_wide = WidePath(src);
+	auto dst_wide = WidePath(dst);
 	return MoveFileW(src_wide.c_str(), dst_wide.c_str()) != 0;
 }
 
+uint32_t SysFileTakeLastError() {
+	const auto error = g_last_error;
+	g_last_error     = 0;
+	return error;
+}
+
+std::string SysFileErrorText(uint32_t error) {
+	// In English where Windows has it (logs are read in UTF-8 and reported in English), else in the system's language.
+	wchar_t    text[256] {};
+	const auto flags  = static_cast<DWORD>(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS);
+	auto       length = FormatMessageW(flags, nullptr, error, MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US), text, 256, nullptr);
+	if (length == 0) length = FormatMessageW(flags, nullptr, error, 0, text, 256, nullptr);
+	while (length != 0 && (text[length - 1] == L'\n' || text[length - 1] == L'\r' || text[length - 1] == L'.')) length--;
+	if (length == 0) return {};
+	std::string result(static_cast<size_t>(length) * 4, '\0');
+	const auto  bytes = WideCharToMultiByte(CP_UTF8, 0, text, static_cast<int>(length), result.data(),
+	                                        static_cast<int>(result.size()), nullptr, nullptr);
+	result.resize(bytes > 0 ? static_cast<size_t>(bytes) : 0);
+	return result;
+}
+
 void SysFileRemoveReadonly(const std::filesystem::path& name) {
-	auto wide = name.wstring();
+	auto wide = WidePath(name);
 	SetFileAttributesW(wide.c_str(), GetFileAttributesW(wide.c_str()) &
 	                                     (~static_cast<DWORD>(FILE_ATTRIBUTE_READONLY)));
 }

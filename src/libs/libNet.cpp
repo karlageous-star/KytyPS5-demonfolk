@@ -5,10 +5,14 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "libs/addcont.h"
 #include "loader/symbolDatabase.h"
+#include "loader/systemContent.h"
 
 #include <cctype>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <string>
@@ -1543,9 +1547,83 @@ static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS
     {{{"_mtqu6"}, {}}, 3, 4}, // GTA V hash 0x9cd1bcad
 };
 
+// The add-ons the guest may be told it owns: the entries this port has always had, plus every add-on
+// kept beside the emulator, read through the one pairing in libs/addcont.h that the mount in
+// libAppContent also answers from - so a label is never unowned here and mounted there, and a game
+// that put its add-on content in Content\<title id>\ is told it owns it. Built once, on the first
+// question.
+static const std::vector<NpEntitlementAccessAddcontEntitlementInfo>& AddcontEntitlements() {
+	static std::vector<NpEntitlementAccessAddcontEntitlementInfo> entitlements;
+	static std::once_flag                                         once;
+
+	std::call_once(once, [] {
+		for (const auto& entry: NP_ENTITLEMENT_ACCESS_ADDON_LIST) {
+			entitlements.push_back(entry);
+		}
+
+		std::string title_id;
+		if (!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) {
+			std::printf("NpEntitlementAccess: no title id; only the built-in add-on list is answered\n");
+			return;
+		}
+
+		// The same pairing the mount in libAppContent serves: one label per folder, read the same way,
+		// so a label is never unowned here and mounted there.
+		const auto folders = Addcont::Folders(title_id);
+		if (folders.empty()) {
+			std::printf("NpEntitlementAccess: %s holds no add-on\n",
+			            Addcont::Directory(title_id).string().c_str());
+		} else {
+			std::printf("NpEntitlementAccess: reading add-ons from %s\n",
+			            Addcont::Directory(title_id).string().c_str());
+		}
+
+		for (const auto& folder: folders) {
+			NpEntitlementAccessAddcontEntitlementInfo info {};
+			std::snprintf(info.entitlement_label.data, sizeof(info.entitlement_label.data), "%s",
+			              folder.label.c_str());
+			info.package_type    = NP_ENTITLEMENT_ACCESS_ADDON_LIST[0].package_type;
+			info.download_status = NP_ENTITLEMENT_ACCESS_ADDON_LIST[0].download_status;
+			entitlements.push_back(info);
+
+			// printf, not LOGF: the console's LOGF is silent in the release configuration.
+			std::printf("NpEntitlementAccess: add-on '%s' reported as owned (%s)\n",
+			            folder.label.c_str(), folder.path.string().c_str());
+		}
+
+		// A license-only declaration is owned although no folder holds its files: nothing can mount it,
+		// but the game is told it owns it, which is what unlocks a deluxe edition's extras.
+		for (const auto& local: Addcont::LocalEntitlements(title_id)) {
+			bool installed = false;
+			for (const auto& folder: folders) {
+				installed = installed || folder.label == local.label;
+			}
+			if (installed) {
+				continue;
+			}
+			NpEntitlementAccessAddcontEntitlementInfo info {};
+			std::snprintf(info.entitlement_label.data, sizeof(info.entitlement_label.data), "%s",
+			              local.label.c_str());
+			info.package_type    = NP_ENTITLEMENT_ACCESS_ADDON_LIST[0].package_type;
+			info.download_status = NP_ENTITLEMENT_ACCESS_ADDON_LIST[0].download_status;
+			entitlements.push_back(info);
+			std::printf("NpEntitlementAccess: license-only add-on '%s' reported as owned (%s)\n",
+			            local.label.c_str(), local.content_id.c_str());
+		}
+	});
+
+	return entitlements;
+}
+
 static int KYTY_SYSV_ABI NpEntitlementAccessInitialize(
     const NpEntitlementAccessInitParam* init_param, NpEntitlementAccessBootParam* boot_param) {
 	PRINT_NAME();
+
+	// A canary in printf: it says whether a game asks this library about its add-ons at all, and
+	// forces the list to be built, which prints what it found.
+	(void)AddcontEntitlements();
+	std::printf("NpEntitlementAccess: initialized with %zu add-on entitlement(s)\n",
+	            AddcontEntitlements().size());
 
 	if (init_param == nullptr || boot_param == nullptr) {
 		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
@@ -1558,6 +1636,9 @@ static int KYTY_SYSV_ABI NpEntitlementAccessInitialize(
 
 static int KYTY_SYSV_ABI NpEntitlementAccessGetSkuFlag(uint32_t* sku_flag) {
 	PRINT_NAME();
+
+	// printf: a canary for the games that ask this library about their add-ons.
+	std::printf("NpEntitlementAccess: sku flag asked for\n");
 
 	if (sku_flag == nullptr) {
 		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
@@ -1581,15 +1662,18 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfoList(
 		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
 	}
 
-	*hit_num = static_cast<uint32_t>(sizeof(NP_ENTITLEMENT_ACCESS_ADDON_LIST) /
-	                                 sizeof(NP_ENTITLEMENT_ACCESS_ADDON_LIST[0]));
+	*hit_num = static_cast<uint32_t>(AddcontEntitlements().size());
+
+	// printf: a canary for the games that list their add-ons rather than asking one by one.
+	std::printf("NpEntitlementAccess: add-on list asked for -> %u entr(ies)\n", *hit_num);
 
 	if (list != nullptr && list_num != 0) {
 		memset(list, 0, sizeof(*list) * list_num);
 
-		const auto copy_num = (list_num < *hit_num ? list_num : *hit_num);
+		const auto& entitlements = AddcontEntitlements();
+		const auto  copy_num     = (list_num < *hit_num ? list_num : *hit_num);
 		for (uint32_t i = 0; i < copy_num; i++) {
-			list[i] = NP_ENTITLEMENT_ACCESS_ADDON_LIST[i];
+			list[i] = entitlements[i];
 		}
 	}
 
@@ -1612,14 +1696,19 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 
 	memset(info, 0, sizeof(*info));
 
-	for (const auto& entitlement: NP_ENTITLEMENT_ACCESS_ADDON_LIST) {
+	for (const auto& entitlement: AddcontEntitlements()) {
 		if (strncmp(entitlement_label->data, entitlement.entitlement_label.data,
 		            sizeof(entitlement_label->data)) == 0) {
 			*info = entitlement;
+			// printf, not LOGF: this line is what says which add-ons a game asked about.
+			std::printf("NpEntitlementAccess: add-on '%.16s' asked about -> owned\n",
+			            entitlement_label->data);
 			return 0;
 		}
 	}
 
+	std::printf("NpEntitlementAccess: add-on '%.16s' asked about -> not owned\n",
+	            entitlement_label->data);
 	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
 }
 

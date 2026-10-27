@@ -49,9 +49,6 @@ enum Id : uint32_t {
 	RbRejectImage,         // ... an image overlaps the window
 	RbRejectCapacity,      // ... more than the download capacity
 	RbQueueDone,           // guest readbacks on the copy engine: no GPU write of the bytes in flight
-	RbQueueInflight,       // ... waiting only for their last writer (KYTY_READBACK_QUEUE=2)
-	RbQueueVerified,       // copy-engine copies compared with a graphics-queue copy (mode 3)
-	RbQueueMismatch,       // ... that differed
 	IndirectTables,        // indirect register tables / command buffers synchronized before parsing
 	DirectDraws,           // prepared draws recorded directly (not as a recording packet)
 	MeshDraws,             // ... of them, mesh-shader draws
@@ -71,9 +68,6 @@ enum Id : uint32_t {
 	BackingHoldZeroUs,     // backing store mutex held to zero new allocations (any thread), microseconds
 	BackingHoldWriteUs,    // ... held for backing writes (GPU readback results)
 	BackingHoldMapUs,      // ... held for mapping changes
-	AliasRebuilds,         // rebuilds of the guest backing alias intervals (IsUniqueGuestBackingRange)
-	AliasRebuildUs,        // ... their time in microseconds
-	AliasMaps,             // ... guest mappings summed over the rebuilds
 	UnmapFinishes,         // guest unmaps that waited for a download of an image over the range (GpuResourceManager::UnmapMemory)
 	UnmapFinishUs,         // ... their wait in microseconds
 	PartialDirtyFaults,    // CPU writes into large images recorded as dirty ranges (KYTY_PARTIAL_IMAGE_DIRTY)
@@ -178,13 +172,76 @@ enum Id : uint32_t {
 	DrainFlushes,          // KYTY_FLUSH_ON_DRAIN submissions (the GPU had finished every earlier one)
 	BatchedCopies,         // KYTY_COPY_BATCH: guest linear copies held for a batch (CommandBuffer::BatchCopy)
 	CopyBatches,           // ... the dispatches that made them
+	GpuUnmapKt,            // guest unmaps' GPU-side part (UnmapGpuRange: the GPU thread's turn and its work), TSC / 1024
+	GpuMapKt,              // guest maps' GPU-side part (MapGpuRange), TSC ticks / 1024
+	PlaceholderCalls,      // placeholder splits and coalesces of the guest address space (VirtualFree)
+	PlaceholderKt,         // ... their time, TSC ticks / 1024
+	ParkedUnmaps,          // partial unmaps of a view left parked in it (GuestBackingStore::UnmapOne)
+	ParkedReleases,        // views unmapped whole once nothing of them stayed mapped (their parked ranges with them)
+	ParkedSplits,          // views split for real: something mapped over a range parked in them (Materialize)
+	TimelineQueries,       // timeline semaphore reads (vkGetSemaphoreCounterValue: a system call on Linux' RADV, issue #80)
+	TimelineQueriesRender, // ... by the render thread
+	UploadSleeps,          // times the upload worker went to sleep (its next push pays a wake-up system call)
+	RecordSleeps,          // ... the recording worker (its next publish)
+	SpinGateShuts,         // times the workers stopped spinning: the process's CPUs had fewer than three idle (spin-gate.h)
+	ReadGuardFaults,       // KYTY_READ_GUARD: faults of guest pages' read guards (each armed again at once)
+	ReadGuardSettles,      // ... served pages still guarded after, given their trackers' protection
+	ReadHotLocks,          // KYTY_HOT_READS: guest pages read back, their backing pages locked (no access, not guards)
+	ReadHotCools,          // ... not read back for a while: guards again, unlocked
+	ReadHotFull,           // ... read back but not locked: as many locked already (GuestAddressSpace::HotReadsMax)
+	UnmappedUploadBytes,   // whole-image upload bytes over unmapped guest memory, zeros written on the GPU instead
+	Presents,              // frames the presenter gave the swapchain (Windows: its own thread with direct presentation off)
+	PresentsReplaced,      // ... frames a newer one replaced while they waited, never shown
+	PresentsNotDue,        // ... frames dropped because the display could not take them yet
+	ReadGuardRaces,        // KYTY_READ_GUARD_RACES=1: read guard faults whose page another thread read before it was guarded again
+	RbSpans,               // KYTY_READBACK_SPAN: readbacks copied from more than one host buffer
+	GuestBarrierCs,        // the game's compute partial flushes (full barriers: CommandProcessor::EmitGlobalBarrier)
+	GuestBarrierGfx,       // ... vertex and pixel partial flushes (full barriers)
+	GuestBarrierCache,     // ... render target cache flush events (full barriers)
+	GuestBarrierRelease,   // ... end-of-pipe releases with a cache action (full barriers)
 	Count
 };
 
 inline constexpr const char* Names[Count] = {
-    "window_faults", "window_pages",     "write_faults",     "read_faults",   "reprotects",
-    "reprotect_pages", "unprotects",     "unprotect_pages",  "protect_calls", "protect_calls_render",
-    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "readback_evictions", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices", "buffer_registrations", "bda_rebuilds", "region_syncs", "region_skips", "bda_full_syncs", "bda_range_calls", "bda_ranges", "bda_range_mib", "protect_calls_gfx", "sync_reads_guest", "sync_reads_render", "rb_reject_size", "rb_reject_backing", "rb_reject_image", "rb_reject_capacity", "rb_queue_done", "rb_queue_inflight", "rb_queue_verified", "rb_queue_mismatch", "indirect_tables", "direct_draws", "mesh_draws", "backing_read_bytes", "backing_read_us", "xpr_tries", "xpr_hits", "xpr_miss_key", "xpr_miss_state", "xpr_miss_target", "xpr_miss_validate", "xpr_stores", "vblanks", "async_image_bytes", "backing_lock_waits", "backing_lock_wait_us", "backing_hold_zero_us", "backing_hold_write_us", "backing_hold_map_us", "alias_rebuilds", "alias_rebuild_us", "alias_maps", "unmap_finishes", "unmap_finish_us", "partial_dirty_faults", "partial_uploads", "partial_upload_bytes", "partial_fallbacks", "partial_unmaps", "stale_protect_repairs", "readback_parts", "gpu_range_entries", "texture_unmaps", "texture_unmap_us", "texture_unmap_deletes", "full_uploads", "full_upload_bytes", "async_pipelines", "xpr_store_pending", "dispatch_key_new", "dispatch_key_same", "dispatch_key_changed", "draw_key_new", "draw_key_same", "xpr_direct_tries", "xpr_direct_hits", "xpr_stored", "xpr_refuse_program", "xpr_refuse_reads", "xpr_refuse_bind", "xpr_refuse_draw", "xpr_relocated", "xpr_relocated_stored", "depth_overlaps", "depth_overlap_bytes", "xpr_miss_blocked", "xpr_miss_refused", "xpr_miss_unseen", "xpr_miss_budget", "readback_regions", "table_draws", "table_evals", "table_stores", "table_continued", "table_store_variant", "table_store_targets", "table_refused_sets", "table_dispatches", "table_registered", "render_passes", "writeback_skips", "copy_forwards", "copy_forward_bytes", "linear_copies", "backing_write_waits", "backing_write_wait_us", "gc_image_deletes", "gc_buffer_deletes", "image_refills", "image_refill_bytes", "inorder_uploads", "inorder_upload_bytes", "level_refreshes", "level_skipped_bytes", "table_no_set", "table_draw_native", "table_store_deferred", "upload_wait_us", "upload_busy_us", "record_wait_us", "upload_call_us", "upload_shared_runs", "upload_guard_stops", "table_proof_mismatches", "table_ring_copies", "table_ring_bytes", "table_ring_shared", "table_ring_shared_bytes", "rb_narrowed", "rb_window_narrowed", "unmap_buffer_deletes", "bda_fault_pages", "backing_span_writes", "discarded_gpu_bytes", "guest_move_bytes", "guest_move_same_bytes", "guest_move_gpu_bytes", "unmap_buffer_splits", "unmap_split_freed_bytes", "shortcut_mismatches", "remapped_views", "write_back_retries", "remap_window_writes", "download_pages_released", "address_space_holds", "address_space_hold_kt", "address_space_waits", "address_space_wait_kt", "address_space_wait_kt_render", "address_space_unmap_hold_kt", "address_space_busy_waits", "compute_programs", "compute_program_same", "drain_flushes", "batched_copies", "copy_batches"};
+    "window_faults", "window_pages", "write_faults", "read_faults", "reprotects",
+    "reprotect_pages", "unprotects", "unprotect_pages", "protect_calls", "protect_calls_render",
+    "upload_copies", "upload_bytes", "sync_downloads", "async_readbacks", "readback_detaches",
+    "readback_evictions", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues",
+    "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices", "buffer_registrations",
+    "bda_rebuilds", "region_syncs", "region_skips", "bda_full_syncs", "bda_range_calls",
+    "bda_ranges", "bda_range_mib", "protect_calls_gfx", "sync_reads_guest", "sync_reads_render",
+    "rb_reject_size", "rb_reject_backing", "rb_reject_image", "rb_reject_capacity", "rb_queue_done",
+    "indirect_tables", "direct_draws", "mesh_draws", "backing_read_bytes", "backing_read_us",
+    "xpr_tries", "xpr_hits", "xpr_miss_key", "xpr_miss_state", "xpr_miss_target",
+    "xpr_miss_validate", "xpr_stores", "vblanks", "async_image_bytes", "backing_lock_waits",
+    "backing_lock_wait_us", "backing_hold_zero_us", "backing_hold_write_us", "backing_hold_map_us", "unmap_finishes",
+    "unmap_finish_us", "partial_dirty_faults", "partial_uploads", "partial_upload_bytes", "partial_fallbacks",
+    "partial_unmaps", "stale_protect_repairs", "readback_parts", "gpu_range_entries", "texture_unmaps",
+    "texture_unmap_us", "texture_unmap_deletes", "full_uploads", "full_upload_bytes", "async_pipelines",
+    "xpr_store_pending", "dispatch_key_new", "dispatch_key_same", "dispatch_key_changed", "draw_key_new",
+    "draw_key_same", "xpr_direct_tries", "xpr_direct_hits", "xpr_stored", "xpr_refuse_program",
+    "xpr_refuse_reads", "xpr_refuse_bind", "xpr_refuse_draw", "xpr_relocated", "xpr_relocated_stored",
+    "depth_overlaps", "depth_overlap_bytes", "xpr_miss_blocked", "xpr_miss_refused", "xpr_miss_unseen",
+    "xpr_miss_budget", "readback_regions", "table_draws", "table_evals", "table_stores",
+    "table_continued", "table_store_variant", "table_store_targets", "table_refused_sets", "table_dispatches",
+    "table_registered", "render_passes", "writeback_skips", "copy_forwards", "copy_forward_bytes",
+    "linear_copies", "backing_write_waits", "backing_write_wait_us", "gc_image_deletes", "gc_buffer_deletes",
+    "image_refills", "image_refill_bytes", "inorder_uploads", "inorder_upload_bytes", "level_refreshes",
+    "level_skipped_bytes", "table_no_set", "table_draw_native", "table_store_deferred", "upload_wait_us",
+    "upload_busy_us", "record_wait_us", "upload_call_us", "upload_shared_runs", "upload_guard_stops",
+    "table_proof_mismatches", "table_ring_copies", "table_ring_bytes", "table_ring_shared", "table_ring_shared_bytes",
+    "rb_narrowed", "rb_window_narrowed", "unmap_buffer_deletes", "bda_fault_pages", "backing_span_writes",
+    "discarded_gpu_bytes", "guest_move_bytes", "guest_move_same_bytes", "guest_move_gpu_bytes", "unmap_buffer_splits",
+    "unmap_split_freed_bytes", "shortcut_mismatches", "remapped_views", "write_back_retries", "remap_window_writes",
+    "download_pages_released", "address_space_holds", "address_space_hold_kt", "address_space_waits", "address_space_wait_kt",
+    "address_space_wait_kt_render", "address_space_unmap_hold_kt", "address_space_busy_waits", "compute_programs", "compute_program_same",
+    "drain_flushes", "batched_copies", "copy_batches", "gpu_unmap_kt", "gpu_map_kt",
+    "placeholder_calls", "placeholder_kt", "parked_unmaps", "parked_releases", "parked_splits",
+    "timeline_queries", "timeline_queries_render", "upload_sleeps", "record_sleeps", "spin_gate_shuts",
+    "read_guard_faults", "read_guard_settles", "read_hot_locks", "read_hot_cools", "read_hot_full",
+    "unmapped_upload_bytes", "presents", "presents_replaced", "presents_not_due", "read_guard_races",
+    "rb_spans", "gb_cs", "gb_gfx", "gb_cache", "gb_release",
+};
 
 inline std::atomic<uint64_t> g_values[Count];
 // The render thread's counts: it is their only writer, so an increment needs no locked
@@ -201,8 +258,18 @@ inline bool (*g_backing_maps)(const char* path) = nullptr;
 // pass (TextureCache::RunGarbageCollector), then clears the flag.
 inline std::atomic_bool g_cache_map_due {false};
 inline char             g_cache_map_path[256] {};
+// Live "images <path>": the texture cache's images as a tab-separated table (TextureCache::WriteReport).
+inline void (*g_image_report)(const char* path) = nullptr;
+// Live "buffers <path>": the buffer cache's buffers as a tab-separated table (BufferCache::WriteBufferReport).
+inline void (*g_buffer_report)(const char* path) = nullptr;
+// Live "objects": counts of what the pipeline cache keeps for the session (PipelineCache), and shader modules alive.
+inline void (*g_objects_report)(uint64_t id) = nullptr;
+inline std::atomic<int64_t> g_shader_modules {0};
+// Live "sync": the GPU timelines, deferred submissions and pending guest readbacks (BufferCache::PrintSyncState):
+// where a stalled GPU thread waits.
+inline void (*g_sync_report)() = nullptr;
 // Render thread: the last draw (0) or dispatch shader address.
-inline uint64_t g_last_dispatch_shader = 0;
+inline thread_local uint64_t g_last_dispatch_shader = 0;
 
 inline void Add(Id id, uint64_t n = 1) {
 	if (g_single_writer) {

@@ -6,8 +6,13 @@ shader / pipeline in the game no longer stalls for 1–3 seconds.
 
 ## Flow
 
-1. `precompile.py seeds OUT`: static collection into a seed file (`KytyShaderSeeds2`, the warmup
-   cache's format).
+1. `kyty_shader_precompile --game <dir> --make-seeds OUT` (`src/local/static-seeds.cpp`): static
+   collection into a seed file (`KytyShaderSeeds2`, the warmup cache's format), without Python. It is
+   the C++ port of `precompile.py seeds OUT` and writes the same file byte for byte (`--stages` and
+   `--limit` as there); the Python tools (Python 3 with numpy) stay the reference and do the analyses
+   below. `pass-states.json` is read from `tools/local/static-precompile` below the program's folder (a
+   release package), two folders above it (`_Build/<build>/`) or below the working directory;
+   `--states <file>` names another.
    - Shaders: every CSDR package (`_trinity` is the PS5 Pro variant, skipped) plus the AGC headers and
      code embedded in eboot.bin's data segment.
    - Compile keys: derived from the AGC headers' register tables (`keys.py`, ported from
@@ -19,10 +24,12 @@ shader / pipeline in the game no longer stalls for 1–3 seconds.
    - Pipeline state: each material pass's render target/blend/depth-stencil state table
      (`pass-states.json`, the "engine render pass configurations" `learn-states` learned from recorded
      caches), each state with culling on and off.
-2. `precompile-windows.ps1` (repository root): the standalone program `kyty_shader_precompile` (no game,
-   no window; build it with `build-windows.cmd kyty_shader_precompile`) translates every seed into
+2. `precompile-windows.ps1` (repository root; on Linux `precompile-linux.sh`, the same run with `--jobs`,
+   `--quick`, `--coverage` ... for `-Jobs`, `-Quick`, `-Coverage` ...): the standalone program `kyty_shader_precompile`
+   (no game, no window; build it with `build-windows.cmd kyty_shader_precompile` or
+   `./build-linux.sh kyty_shader_precompile`) translates every seed into
    SPIR-V (portable specialization, see below), creates every pipeline and writes the **static pipeline
-   cache** `_PipelineCache/static/PPSA01341.bin`. It runs step 1 first when the seed file is missing.
+   cache** `_PipelineCache/static/PPSA01341_<version>.bin` (one per game version). It runs step 1 first when the seed file is missing.
    - The static cache is keyed by the GPU/driver signature only and survives emulator rebuilds; the
      game looks a pipeline up there first without compiling
      (`VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT`) and returns on a hit.
@@ -34,7 +41,7 @@ shader / pipeline in the game no longer stalls for 1–3 seconds.
      saves a checkpoint every 10 minutes; after an interruption a rerun merges those checkpoints first.
    - `-Coverage`: builds no pipelines, only writes what was compiled (`<seeds>.compiled.shaders` and
      `.spirv.txt`/`.rejected.txt`).
-   - A full run finally writes `_PipelineCache/static/PPSA01341.shaders` (the compile inputs, warmup
+   - A full run finally writes `_PipelineCache/static/PPSA01341_<version>.shaders` (the compile inputs, warmup
      format, 136 MB) for the game's **background pre-translation** (`KYTY_SHADER_PREFETCH`, on by
      default): after start-up, low-priority threads translate all of these programs (about 60–100 s,
      SPIR-V kept in a temporary system file), and the first encounter takes them instead of
@@ -47,8 +54,25 @@ shader / pipeline in the game no longer stalls for 1–3 seconds.
    SPIR-V level = whether the driver cache can hit). `recorded-seeds` turns a recorded cache into
    seeds, compiled the same way with `-Coverage` to get R.
 4. `stalls.py LOG`: compile stall statistics of a run log (`KYTY_SLOW_LOG_MS=30`).
+5. **Specialization hints** (`src/local/shader-hints.cpp`): the seeds guess the formats and table forms the
+   game binds; only recorded play has the real ones (`recorded-<title>_<version>.seeds`, compiled by
+   `precompile-windows.ps1` as its own shards). A recording holds the game's shader code, so a release
+   cannot ship it; it ships `hints-<title>_<version>.hints` here instead: the recording's records with
+   each code and back code replaced by its word count and XXH3-64, no static key (made again from the
+   input info), and the pipeline recipes, zstd-compressed (1.07: 13,345 programs and 16,007 pipelines in
+   239 KiB). On a PC without a recording, `precompile-windows.ps1` completes them with the code of its own
+   seed file (`kyty_shader_precompile --apply-hints`, under a second) into
+   `hinted-<title>_<version>.seeds`, byte for byte the recording's records whose programs the seeds list.
+   Made from this PC's recordings of a version (several `--recorded`; records of another version's code
+   are left out):
 
-## Portable specialization (recompiler, `KYTY_PORTABLE_SHADERS`, on by default)
+   ```
+   kyty_shader_precompile --game <dir> --seeds _Build\static-precompile\seeds-<id>.seeds --make-hints tools\local\static-precompile\hints-<id>.hints --recorded _PipelineCache\warmup-v2\<device>\<id>.shaders
+   ```
+
+   Recording tours (`demons-souls-save.py set-map` spawn points, every world) make the recordings.
+
+## Portable specialization (recompiler)
 
 Information that is not in the shader binary but only in runtime descriptors used to be baked into the
 SPIR-V, which a static pass cannot predict:

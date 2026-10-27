@@ -11,8 +11,14 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/padData.h"
+#include "local/anti-lag.h"
+#include "loader/demonsSoulsWarp.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -25,6 +31,17 @@ constexpr int PAD_ERROR_INVALID_HANDLE = -2137915389; /* 0x80920003 */
 
 constexpr uint32_t RUMBLE_DURATION_MS = 0xffff;
 constexpr uint32_t RELEASE_FLUSH_MS   = 50;
+constexpr uint64_t DROP_REPORT_MS     = 5000;
+
+// The newest unread input state takes an event that changes no button and no touch (GameController::AddState).
+// KYTY_PAD_STATE_COALESCE=0: every input event a state of its own, as before.
+static bool StateCoalescing() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_PAD_STATE_COALESCE");
+		return value == nullptr || std::string_view(value) != "0";
+	}();
+	return on;
+}
 
 struct PadControllerInformation {
 	float    touch_pixel_density;
@@ -107,6 +124,7 @@ public:
 	void SetVibration(uint8_t large_motor, uint8_t small_motor);
 	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
 	bool SetTriggerEffect(const PadTriggerEffectParam& param);
+	int32_t GetTriggerEffectState(bool left);
 	void ReadState(ControllerState* state, bool* flag, int* count);
 	int  ReadStates(ControllerState* states, int states_num, bool* flag, int* count);
 
@@ -115,6 +133,8 @@ private:
 
 	void CheckActive();
 	void AddState();
+	void CountDroppedState();
+	void ReportDroppedStates();
 
 	Common::Mutex    m_mutex;
 	std::vector<int> m_connected_ids;
@@ -127,9 +147,30 @@ private:
 	uint32_t         m_states_num    = 0;
 	uint32_t         m_first_state   = 0;
 	uint8_t          m_next_touch_id = 1;
+	// Every effect the game set, whether or not the host pad could reproduce it:
+	// scePadGetTriggerEffectState answers from it (m_trigger_sent keeps the sent one only).
+	PadTriggerEffectParam m_state_effect {};
+	// Input states dropped from the history before a read took them (AddState): in all, since the last report, and when
+	// that was (SDL ticks; none yet: m_dropped_reported).
+	uint64_t         m_dropped_states     = 0;
+	uint64_t         m_dropped_unreported = 0;
+	uint64_t         m_dropped_report_ms  = 0;
+	bool             m_dropped_reported   = false;
 };
 
 static GameController* g_controller = nullptr;
+
+// SetScriptedInput's values; `until` (steady clock ns, 0: none) is written last.
+struct ScriptedInput {
+	std::atomic<int64_t>                until {0};
+	std::array<std::atomic<int32_t>, 4> axes {};
+	std::atomic<uint32_t>               buttons {0};
+};
+static ScriptedInput g_scripted;
+
+static int64_t SteadyNanoseconds() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 static void pad_fill_data(PadData* data, const ControllerState& state, bool connected,
                           int connected_count) {
@@ -152,6 +193,15 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 			output.y     = touch.y;
 			output.id    = touch.id;
 		}
+	}
+	if (const auto until = g_scripted.until.load(std::memory_order_acquire); until != 0 && SteadyNanoseconds() < until) {
+		uint8_t* axes[] = {&data->left_stick_x, &data->left_stick_y, &data->right_stick_x, &data->right_stick_y};
+		for (size_t i = 0; i < 4; i++) {
+			if (const auto value = g_scripted.axes[i].load(std::memory_order_relaxed); value >= 0) {
+				*axes[i] = static_cast<uint8_t>(std::min(value, 255));
+			}
+		}
+		data->buttons |= g_scripted.buttons.load(std::memory_order_relaxed);
 	}
 	data->connected              = connected;
 	data->timestamp              = state.time;
@@ -321,8 +371,30 @@ void GameController::CheckActive() {
 	m_next_touch_id = 1;
 }
 
+// The history scePadRead returns, oldest unread first: a state per input event. Demon's Souls reads 64 each tick and
+// takes the presses and releases of every one, the last as the pad's state (its pad update, eboot 0xb933a0), so a press
+// is lost only when it leaves the STATES_MAX states unread. An event that changes no button and no touch (a stick or
+// trigger step, a finger moving) updates the newest state instead while no read has taken it (StateCoalescing): every
+// press and release keeps a state of its own, and a burst of axis events between two reads (a frame hitch: 5-43 of
+// 100 ms or more a session in the logs, one of 18.5 s) no longer pushes an unread press out.
 void GameController::AddState() {
+	if (m_states_num != 0 && StateCoalescing()) {
+		const auto  newest = (m_first_state + m_states_num - 1) % STATES_MAX;
+		const auto& last   = m_states[newest];
+		if (!m_obtained[newest] && last.buttons == m_state.buttons &&
+		    std::equal(std::begin(last.touch), std::end(last.touch), std::begin(m_state.touch),
+		               [](const ControllerState::Touch& a, const ControllerState::Touch& b) {
+			               return a.down == b.down && a.id == b.id;
+		               })) {
+			m_states[newest] = m_state;
+			return;
+		}
+	}
+
 	if (m_states_num >= STATES_MAX) {
+		if (!m_obtained[m_first_state]) {
+			CountDroppedState();
+		}
 		m_states_num  = STATES_MAX - 1;
 		m_first_state = (m_first_state + 1) % STATES_MAX;
 	}
@@ -331,6 +403,28 @@ void GameController::AddState() {
 	m_states[index]   = m_state;
 	m_obtained[index] = false;
 	m_states_num++;
+}
+
+// A state dropped before a read took it: in the log (stdout) at most every DROP_REPORT_MS, the count since the last line.
+void GameController::CountDroppedState() {
+	m_dropped_states++;
+	m_dropped_unreported++;
+	if (const auto now = SDL_GetTicks64(); !m_dropped_reported || now - m_dropped_report_ms >= DROP_REPORT_MS) {
+		m_dropped_reported  = true;
+		m_dropped_report_ms = now;
+		ReportDroppedStates();
+	}
+}
+
+void GameController::ReportDroppedStates() {
+	if (m_dropped_unreported == 0) {
+		return;
+	}
+	std::printf("Pad: %llu input states dropped unread (the %u-state history was full; %llu in all)\n",
+	            static_cast<unsigned long long>(m_dropped_unreported), STATES_MAX,
+	            static_cast<unsigned long long>(m_dropped_states));
+	std::fflush(stdout);
+	m_dropped_unreported = 0;
 }
 
 void GameController::Button(int id, uint32_t button, bool down) {
@@ -448,6 +542,7 @@ void GameController::ReleaseHostPads() {
 	}
 
 	m_connected_ids.clear();
+	ReportDroppedStates();
 }
 
 void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
@@ -500,11 +595,71 @@ bool GameController::SetTriggerEffect(const PadTriggerEffectParam& param) {
 	}
 
 	Common::LockGuard lock(m_mutex);
+	// Remember it for scePadGetTriggerEffectState even when no DualSense takes it: a game that polls
+	// the state has to see the effect it asked for, not a zero.
+	m_state_effect = param;
 	auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(m_active_id));
 	if (pad != nullptr && SDL_GameControllerGetType(pad) == SDL_CONTROLLER_TYPE_PS5) {
 		(void)SDL_GameControllerSendEffect(pad, &effect, sizeof(effect));
 	}
 	return true;
+}
+
+// A trigger's travel, 0..255. An L2/R2 that arrives as a button only (input remapping, pads or
+// tools that report the trigger digitally) counts as full travel.
+static int TriggerTravel(const ControllerState& state, Axis axis) {
+	const auto button = axis == Axis::TriggerLeft ? PAD_BUTTON_L2 : PAD_BUTTON_R2;
+	const int  value  = state.axes[static_cast<int>(axis)];
+	// An analog press also sets the button, so only a button without any travel is digital.
+	return (state.buttons & button) != 0 && value == 0 ? 255 : value;
+}
+
+// A real DualSense reports which effect runs and where the trigger is against it. Without that
+// report (SDL does not expose it, and other pads have no trigger motors) the state follows from the
+// game's effect and the trigger's travel: 0..255 maps to the effect's ten positions 0..9. Games wait
+// for the weapon or feedback state before acting on L2/R2 - the state stayed 0 before, so those
+// actions only ever half happened (a bow's draw, for one).
+static int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int value) {
+	const int  pos     = std::clamp(value, 0, 255) * 10 / 256;
+	const bool pressed = value >= 8; // below this a trigger counts as released (analog rest noise)
+
+	switch (command.mode) {
+		case 1: // feedback: resistance from position data[0], strength data[1]
+			return pressed && command.data[1] != 0 && pos >= command.data[0]
+			           ? PAD_TRIGGER_STATE_IS_PUSHING
+			           : PAD_TRIGGER_STATE_NO_FORCE;
+		case 2: // weapon: resistance from data[0], released at data[1]
+			if (pos >= command.data[1]) {
+				return PAD_TRIGGER_STATE_WEAPON_FULLY_PRESSED;
+			}
+			return pos >= command.data[0] ? PAD_TRIGGER_STATE_WEAPON_ALMOST_PRESSED
+			                              : PAD_TRIGGER_STATE_WEAPON_NOT_PRESSED;
+		case 3: // vibration from position data[0], amplitude data[1], frequency data[2]
+			return pressed && command.data[1] != 0 && command.data[2] != 0 && pos >= command.data[0]
+			           ? PAD_TRIGGER_STATE_VIBRATION_IS_FIRING
+			           : PAD_TRIGGER_STATE_VIBRATION_NOT_FIRING;
+		case 4: // multiple-position feedback: strength per position
+			return pressed && command.data[pos] != 0 ? PAD_TRIGGER_STATE_IS_PUSHING
+			                                         : PAD_TRIGGER_STATE_NO_FORCE;
+		case 5: // slope feedback from position data[0]
+			return pressed && pos >= command.data[0] ? PAD_TRIGGER_STATE_IS_PUSHING
+			                                         : PAD_TRIGGER_STATE_NO_FORCE;
+		case 6: // multiple-position vibration: frequency data[0], amplitude per position
+			return pressed && command.data[0] != 0 && command.data[1 + pos] != 0
+			           ? PAD_TRIGGER_STATE_VIBRATION_IS_FIRING
+			           : PAD_TRIGGER_STATE_VIBRATION_NOT_FIRING;
+		default: return 0;
+	}
+}
+
+int32_t GameController::GetTriggerEffectState(bool left) {
+	Common::LockGuard lock(m_mutex);
+	const auto        index = left ? 0 : 1;
+	if ((m_state_effect.trigger_mask & (1u << index)) == 0) {
+		return 0;
+	}
+	const auto axis = left ? Axis::TriggerLeft : Axis::TriggerRight;
+	return TriggerEffectState(m_state_effect.command[index], TriggerTravel(m_state, axis));
 }
 
 void GameController::GetConnectionInfo(bool* flag, int* count) {
@@ -583,6 +738,16 @@ void SetRightStick(int id, int x, int y) {
 
 void SetTouchPad(int id, int finger, bool down, float x, float y) {
 	g_controller->TouchPad(id, finger, down, x, y);
+}
+
+void SetScriptedInput(int left_x, int left_y, int right_x, int right_y, uint32_t buttons, double seconds) {
+	g_scripted.until.store(0, std::memory_order_release);
+	const int values[] = {left_x, left_y, right_x, right_y};
+	for (size_t i = 0; i < 4; i++) g_scripted.axes[i].store(values[i], std::memory_order_relaxed);
+	g_scripted.buttons.store(buttons, std::memory_order_relaxed);
+	if (seconds > 0) {
+		g_scripted.until.store(SteadyNanoseconds() + static_cast<int64_t>(seconds * 1e9), std::memory_order_release);
+	}
 }
 
 void ResetInputState() {
@@ -709,6 +874,7 @@ int KYTY_SYSV_ABI PadGetControllerInformation(int handle, PadControllerInformati
 
 int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	PRINT_NAME();
+	Loader::DemonsSoulsWarp::RunQueuedCommand(); // (live `gamecmd`: on the game's own thread)
 
 	if (handle != 1) {
 		return PAD_ERROR_INVALID_HANDLE;
@@ -721,6 +887,7 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	bool            connected       = false;
 	ControllerState state;
 
+	Graphics::AntiLag::Input(); // (KYTY_LOW_LATENCY on AMD: a new frame's input; the driver may wait here)
 	g_controller->ReadState(&state, &connected, &connected_count);
 
 	pad_fill_data(data, state, connected, connected_count);
@@ -745,6 +912,7 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	bool            connected       = false;
 	ControllerState states[64]      = {};
 
+	Graphics::AntiLag::Input(); // (KYTY_LOW_LATENCY on AMD: a new frame's input; the driver may wait here)
 	int ret_num = g_controller->ReadStates(states, num, &connected, &connected_count);
 
 	if (!connected || ret_num == 0) {
@@ -816,6 +984,32 @@ int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* p
 	}
 
 	return g_controller->SetTriggerEffect(*param) ? OK : PAD_ERROR_INVALID_ARG;
+}
+
+int KYTY_SYSV_ABI PadGetTriggerEffectState(int handle, PadTriggerEffectStateInformation* info) {
+	PRINT_NAME();
+
+	if (handle != 1) {
+		return PAD_ERROR_INVALID_HANDLE;
+	}
+	if (info == nullptr) {
+		return PAD_ERROR_INVALID_ARG;
+	}
+
+	info->state[0] = g_controller->GetTriggerEffectState(true);
+	info->state[1] = g_controller->GetTriggerEffectState(false);
+
+	// The first changes, so a log shows whether the game polls this and what it sees (printf: the
+	// console's LOGF is silent in the release configuration).
+	static int                    reports = 0;
+	static std::array<int32_t, 2> last {-1, -1};
+	if (reports < 32 && (info->state[0] != last[0] || info->state[1] != last[1])) {
+		std::printf("Pad: trigger state %d,%d\n", info->state[0], info->state[1]);
+		last[0] = info->state[0];
+		last[1] = info->state[1];
+		reports++;
+	}
+	return OK;
 }
 
 } // namespace Libs::Controller

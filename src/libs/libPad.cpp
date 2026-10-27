@@ -26,21 +26,8 @@ struct PadTriggerEffectStateInformation {
 	int32_t state[2];
 };
 
-static int KYTY_SYSV_ABI PadGetTriggerEffectState(int                               handle,
-                                                  PadTriggerEffectStateInformation* info) {
-	PRINT_NAME();
-
-	LOGF("\t handle = %d\n", handle);
-
-	if (info == nullptr) {
-		return -2137653243; /* 0x80960005 */
-	}
-
-	info->state[0] = 0;
-	info->state[1] = 0;
-
-	return 0;
-}
+// PadGetTriggerEffectState lives in controller.cpp now: it answers from the effect the game set and
+// the trigger's travel (a DualSense reports both; see the notes), where this stub always said zero.
 
 static int KYTY_SYSV_ABI PadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse(bool enabled) {
 	PRINT_NAME();
@@ -213,7 +200,7 @@ LIB_DEFINE(InitPad_1) {
 	LIB_FUNC("yFVnOdGxvZY", Controller::PadSetVibration);
 	LIB_FUNC("W2G-yoyMF5U", PadSetVibrationMode);
 	LIB_FUNC("Yq0zOH7YNOM", PadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse);
-	LIB_FUNC("znaWI0gpuo8", PadGetTriggerEffectState);
+	LIB_FUNC("znaWI0gpuo8", Controller::PadGetTriggerEffectState);
 	LIB_FUNC("DscD1i9HX1w", Controller::PadResetLightBar);
 	LIB_FUNC("RR4novUEENY", Controller::PadSetLightBar);
 	LIB_FUNC("6ncge5+l5Qs", PadClose);

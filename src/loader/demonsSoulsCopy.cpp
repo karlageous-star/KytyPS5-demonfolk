@@ -5,52 +5,127 @@
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "kernel/memory.h"
+#include "live-counters.h"
 #include "loader/runtimeLinker.h"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <xxhash.h>
 
+extern "C" {
+// KYTY_GUEST_MOVE_COMPARE (default on; 0 for an A/B): a large move writes only the destination pages whose bytes
+// differ (CompareMove).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_move_compare {1};
+}
+
 namespace Loader::DemonsSoulsCopy {
 namespace {
 uint64_t                site = 0;
 std::array<uint8_t, 13> original {}, patch {};
-void* KYTY_SYSV_ABI     CoherentMove(void* destination, const void* source, size_t size) {
-    return Move(destination, source, size, &Libs::LibKernel::Memory::TryPrepareHostWrite);
+
+// A large move into memory the GPU caches, page by page: a page the GPU wrote (its bytes here are stale, and reading them
+// would fault) or whose bytes differ is written (runs prepared as overwritten, Memory::TryPrepareHostOverwrite); a page
+// that already holds the source's bytes is left alone, clean: no upload of it again, no protection change.
+void* CompareMove(uint64_t to, uint64_t from, size_t size) {
+	constexpr uint64_t Page = 4096;
+	// (The images over all of it as before: a GPU-written image's bytes here are stale, equal or not.)
+	(void)Libs::LibKernel::Memory::TryPrepareHostImageWrite(to, size);
+	uint64_t           run = 0, run_end = 0, same = 0, gpu = 0;
+	const auto         write = [&] {
+        if (run_end == run) return;
+        (void)Libs::LibKernel::Memory::TryPrepareHostOverwrite(to + run, run_end - run);
+        std::memmove(reinterpret_cast<void*>(to + run), reinterpret_cast<const void*>(from + run), run_end - run);
+	};
+	for (uint64_t at = 0; at < size;) {
+		const auto next  = std::min<uint64_t>(size, ((to + at) / Page + 1) * Page - to);
+		const auto bytes = next - at;
+		bool       differs = Libs::LibKernel::Memory::ReadFaults(to + at, bytes);
+		if (differs) gpu += bytes;
+		else differs = std::memcmp(reinterpret_cast<const void*>(to + at), reinterpret_cast<const void*>(from + at), bytes) != 0;
+		if (!differs) {
+			same += bytes;
+		} else {
+			if (run_end != at) {
+				write();
+				run = at;
+			}
+			run_end = next;
+		}
+		at = next;
+	}
+	write();
+	LiveCounters::Add(LiveCounters::GuestMoveBytes, size);
+	LiveCounters::Add(LiveCounters::GuestMoveSameBytes, same);
+	LiveCounters::Add(LiveCounters::GuestMoveGpuBytes, gpu);
+	return reinterpret_cast<void*>(to);
 }
+
+void* KYTY_SYSV_ABI     CoherentMove(void* destination, const void* source, size_t size) {
+	// A move within one range reads bytes it then writes: their GPU data is read back first. Else the destination's is
+	// replaced whole and dropped (Memory::InvalidateMemoryForWrite).
+	const auto to = reinterpret_cast<uint64_t>(destination), from = reinterpret_cast<uint64_t>(source);
+	const bool overlap = to < from + size && from < to + size;
+	if (!overlap && size >= 256 * 1024 && kyty_local_move_compare.load(std::memory_order_relaxed) != 0)
+		return CompareMove(to, from, size);
+	if (size >= 256 * 1024) LiveCounters::Add(LiveCounters::GuestMoveBytes, size);
+	return Move(destination, source, size,
+	            overlap ? &Libs::LibKernel::Memory::TryPrepareHostWrite : &Libs::LibKernel::Memory::TryPrepareHostOverwrite);
+}
+// libc.prx's memmove/bcopy/memcpy body, shared by the three entries, which jump to it after the guest's
+// argument/stack checks with one saved RBP. Hashed whole, not just the prologue, in each build audited; nothing
+// else branches into the replaced bytes (the body's size jump table neither). Other builds, relocations or
+// platform loader patches fail closed.
+struct Body {
+	const char* build;
+	uint64_t    offset, size, hash;
+};
+constexpr std::array<Body, 2> Bodies {{
+    {"01.007.000", 0x3c36, 2048, 0xe654325b8be848a9ull},
+    {"01.005.000", 0x3d06, 1705, 0xc4be692ee02e9f77ull}, // an older body (another small-size table), the same entries
+}};
 } // namespace
 
 void Install(Program* program) {
 #if defined(__x86_64__) || defined(_M_X64)
-	constexpr uint64_t offset = 0x3c36, verify_size = 2048;
-	if (site || !program || !Libs::Graphics::DemonsSouls::IsSupportedGame() ||
-	    program->file_name.filename() != "libc.prx" ||
-	    program->mapped_size < offset + verify_size ||
-	    program->base_vaddr > UINT64_MAX - offset - verify_size)
+	if (site || !program || !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "libc.prx")
 		return;
-	const auto address = program->base_vaddr + offset;
-	if (!Libs::Graphics::HostMemoryRangeIsReadable(address, verify_size)) return;
-	const auto* bytes = reinterpret_cast<const uint8_t*>(address);
-	// Hash the complete audited shared memmove/bcopy body, not just the prologue.
-	// This entry follows the guest's argument/stack checks and has one saved RBP.
-	// Changed module versions, relocations, or platform loader patches fail closed.
-	const auto actual_hash = XXH3_64bits(bytes, verify_size);
 	const auto* audit = std::getenv("KYTY_DS_PATCH_AUDIT");
-	if (audit != nullptr && std::strcmp(audit, "1") == 0) {
-		std::printf("Demon's Souls patch audit: module=libc base=0x%016llx memmove=0x%016llx "
-		            "size=0x%llx actual=0x%016llx expected=0xe654325b8be848a9 match=%s\n",
-		            static_cast<unsigned long long>(program->base_vaddr),
-		            static_cast<unsigned long long>(address),
-		            static_cast<unsigned long long>(verify_size),
-		            static_cast<unsigned long long>(actual_hash),
-		            actual_hash == 0xe654325b8be848a9ull ? "yes" : "no");
+	const bool  audit_enabled = audit != nullptr && std::strcmp(audit, "1") == 0;
+	const Body* body = nullptr;
+	for (const auto& candidate: Bodies) {
+		const bool in_range = candidate.offset <= program->mapped_size &&
+		                      candidate.size <= program->mapped_size - candidate.offset &&
+	                      candidate.offset <= UINT64_MAX - candidate.size &&
+	                      program->base_vaddr <= UINT64_MAX - candidate.offset - candidate.size;
+		const auto address = in_range ? program->base_vaddr + candidate.offset : 0;
+		const bool readable = in_range && Libs::Graphics::HostMemoryRangeIsReadable(address, candidate.size);
+		const auto actual_hash = readable ? XXH3_64bits(reinterpret_cast<const void*>(address), candidate.size) : 0;
+		if (audit_enabled) {
+			std::printf("Demon's Souls patch audit: module=libc build=%s base=0x%016llx memmove=0x%016llx "
+			            "size=0x%llx actual=0x%016llx expected=0x%016llx readable=%s match=%s\n",
+			            candidate.build, static_cast<unsigned long long>(program->base_vaddr),
+			            static_cast<unsigned long long>(address), static_cast<unsigned long long>(candidate.size),
+			            static_cast<unsigned long long>(actual_hash), static_cast<unsigned long long>(candidate.hash),
+			            readable ? "yes" : "no", readable && actual_hash == candidate.hash ? "yes" : "no");
+		}
+		if (readable && actual_hash == candidate.hash) {
+			if (body != nullptr) {
+				std::printf("Demon's Souls copy: libc.prx matches multiple audited builds; retaining its memmove\n");
+				return;
+			}
+			body = &candidate;
+		}
 	}
-	if (actual_hash != 0xe654325b8be848a9ull) {
-		std::printf("Demon's Souls copy: libc memmove differs; retaining guest code\n");
+	if (body == nullptr) {
+		std::printf("Demon's Souls copy: libc.prx of an unknown build; retaining its memmove\n");
 		return;
 	}
-	std::memcpy(original.data(), bytes, original.size());
+	const auto address = program->base_vaddr + body->offset;
+	std::memcpy(original.data(), reinterpret_cast<const void*>(address), original.size());
 	patch = Tailcall(reinterpret_cast<uint64_t>(&CoherentMove));
 	std::memcpy(reinterpret_cast<void*>(address), patch.data(), patch.size());
 	if (!Common::VirtualMemory::FlushInstructionCache(address, patch.size())) {
@@ -59,7 +134,7 @@ void Install(Program* program) {
 		return;
 	}
 	site = address;
-	std::printf("Demon's Souls copy: installed verified coherent memmove\n");
+	std::printf("Demon's Souls copy: installed verified coherent memmove (libc.prx of %s)\n", body->build);
 #endif
 }
 

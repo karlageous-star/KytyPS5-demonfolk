@@ -10,12 +10,18 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/cache/tickClock.h"
+
+#include <vk_mem_alloc.h>
 
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <deque>
+#include <future>
 #include <map>
 #include <memory>
+#include <shared_mutex>
 #include <span>
 #include <utility>
 #include <vector>
@@ -46,6 +52,13 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// Before a host write of all of [vaddr, vaddr + size) (any thread): as InvalidateMemory, but the GPU-written bytes the
+	// write replaces are dropped, not read back (only those of its first and last page outside it are).
+	void                   InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
+	// Live "sync" (any thread, racy by design: for a stalled GPU thread).
+	void                   PrintSyncState();
+	// Live "buffers <path>": the cached buffers as a tab-separated table (on the GPU thread).
+	void                   WriteBufferReport(const char* path);
 	[[nodiscard]] bool TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
@@ -74,19 +87,41 @@ public:
 	// ring keeps its own GPU retirement watches across runtime mode changes.
 	[[nodiscard]] StreamBuffer& GetShaderUploadBuffer() noexcept;
 	// The per-draw blocks of table draws (src/local/table-xpr.inc), read by their device addresses.
-	[[nodiscard]] StreamBuffer& GetTableUploadBuffer() noexcept { return m_table_upload; }
+	[[nodiscard]] StreamBuffer& GetTableUploadBuffer() noexcept;
 	[[nodiscard]] const Buffer* GetLodStatsBuffer() const noexcept { return &m_lod_stats_buffer; }
 	void ReportLodStats(void* dst, uint32_t size, bool reset);
 	// GET_LOD_STATS of another layout: zeros and a ready label written by the GPU when the range holds
 	// GPU-written bytes (a CPU write there drains the GPU first). False: the caller writes them.
 	[[nodiscard]] bool TryFillLodStatsOnGpu(uint64_t vaddr, uint32_t size);
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
-	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
+	// The BDA page table descriptor writes take (the newest: GrowBdaTable). A set made with it records
+	// BdaTableGeneration() read before it, and is made again once that moved.
+	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return m_bda_table.load(std::memory_order_acquire); }
+	[[nodiscard]] static uint64_t BdaTableGeneration() noexcept {
+		return s_bda_table_generation.load(std::memory_order_acquire);
+	}
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
-	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	// `refillable`: set when the bytes went to the staging ring by the upload worker (RefillImageStaging may copy them
+	// again while the upload is unsubmitted).
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size,
+	                                                               bool* refillable = nullptr);
+	// KYTY_ASYNC_REPROTECT: the write protection of the pages an image starts watching again (TextureCache's
+	// DeferredImageProtects sets the page manager's deferred write-protect sink to this list around TrackImage), applied
+	// by the upload worker ahead of an upload copy that reads those pages whole (the whole image: PushImageStagingCopies;
+	// parts of it: StageImagePieces), else before any other read of them (ApplyImageProtects, and what is left when the
+	// texture cache's upload returns): a CPU write before the protection is in the copy, one after it faults.
+	[[nodiscard]] std::vector<PageManager::DeferredRange>* ImageProtectSink(PageManager& manager) noexcept {
+		m_image_protect_manager = &manager;
+		return &m_image_protects;
+	}
+	void ApplyImageProtects();
+	// The guest bytes of [vaddr, vaddr + size) copied again by the upload worker to a staging copy ObtainBufferForImage
+	// made (`ring` at `offset`): whose GPU copies are recorded but not submitted, so they upload the new bytes. False,
+	// with nothing done, where ObtainBufferForImage would not stage them that way now.
+	[[nodiscard]] bool RefillImageStaging(const Buffer& ring, uint64_t offset, uint64_t vaddr, uint64_t size);
 	// Guest ranges staged one after another in one staging allocation of `total` bytes, each
-	// at its `offset`. Returns nullptr (nothing staged) when a range starts in a cached buffer
-	// or holds GPU-written pages: the caller then uploads the whole image instead.
+	// at its `offset`. Returns nullptr (nothing staged) when a range holds GPU-written pages: the
+	// caller then uploads the whole image instead.
 	struct StagingPiece {
 		uint64_t vaddr  = 0;
 		uint64_t size   = 0;
@@ -100,6 +135,9 @@ public:
 	                                                            uint64_t total,
 	                                                            ImageStageFailure* failure = nullptr,
 	                                                            bool sources_prevalidated = false);
+	// Diagnostic compatibility overload: `why` is "gpu" or "map" on refusal.
+	[[nodiscard]] std::pair<Buffer*, uint64_t> StageImagePieces(const std::vector<StagingPiece>& pieces,
+	                                                            uint64_t total, const char** why);
 	// Retain the last staging reservation through a consumer recorded after a tiler-stream wrap.
 	void RetainImageStaging() { m_staging_buffer.RetainLastUse(); }
 	[[nodiscard]] uint64_t ImageStagingCapacity() const noexcept { return m_staging_buffer.Size(); }
@@ -107,6 +145,8 @@ public:
 	// batch: the copy may join a run that one compute dispatch makes (KYTY_COPY_BATCH: CommandBuffer::BatchCopy).
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds, bool batch = false);
+	// CopyBuffer's copy on the CPU: only the destination pages whose bytes differ are written.
+	void CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size);
 	// Called after an identified small GPU copy; it never submits or publishes guest data.
 	void ScheduleCopyFeedback(uint64_t vaddr, uint64_t size);
 	// GPU thread: retire a pending guest read before touching overlapping backing.
@@ -119,6 +159,10 @@ public:
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
+	// IsRegionCpuModified's answer, inline (the table path's).
+	[[nodiscard]] bool IsRegionCpuDirty(uint64_t vaddr, uint64_t size) {
+		return m_memory_tracker.IsRegionCpuModified(vaddr, size);
+	}
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
@@ -126,7 +170,7 @@ public:
 		uint64_t address = 0, size = 0, cpu_epoch = 0, registration_epoch = 0;
 	};
 	void SynchronizeRegionRequest(SyncRegionRequest& request);
-	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch; }
+	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch.load(std::memory_order_acquire); }
 	// Moves whenever a buffer is unregistered (deleted, or joined into a new one): Vulkan buffers a binding resolved
 	// before it is unchanged are still the owners of their bytes. A join copies the old buffer's bytes into the new
 	// one in the open command buffer, so a binding to the old one GPU work records after it reads or writes bytes
@@ -136,7 +180,8 @@ public:
 	// request's proof only depends on the buffers of its own region.
 	[[nodiscard]] uint64_t RegionRegistrationEpoch(uint64_t vaddr) const {
 		const auto region = vaddr / TRACKER_REGION_SIZE;
-		return region < m_region_registrations.size() ? m_region_registrations[region] : 0;
+		return region < TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE ? m_region_registrations[region].load(std::memory_order_acquire)
+		                                                           : 0;
 	}
 	// Proofs that an earlier resolution still holds. Pure queries; TouchLiveBuffer
 	// only refreshes the LRU slot exactly as ObtainBuffer's TouchBuffer would.
@@ -175,7 +220,18 @@ public:
 		TouchBuffer(*buffer);
 		return true;
 	}
-	void CollectMappedRegisteredRanges(const RangeSet& mapped, std::vector<RangeSet::Range>& ranges) const;
+	// The buffers [vaddr, vaddr + size) holds whole go, after the guest unmapped it (GpuResourceManager::UnmapMemory).
+	void DeleteUnmappedBuffers(uint64_t vaddr, uint64_t size);
+	// Then a buffer the range holds in part, mapped in no more than half of it now, is cut to its mapped parts.
+	void SplitUnmappedBuffers(uint64_t vaddr, uint64_t size);
+	// The mapped parts of registered buffers in [begin, end), adjacent ones merged.
+	// The mapped parts of guest [vaddr, vaddr + size) (GpuResourceManager::MappedRanges), added to `out`.
+	void MappedRanges(uint64_t vaddr, uint64_t size, RangeSet& out) const;
+	void CollectMappedRegisteredRanges(const RangeSet& mapped, uint64_t begin, uint64_t end,
+	                                   std::vector<RangeSet::Range>& ranges) const;
+	// The spans of the buffers registered or unregistered since the last call, appended to `spans`; false when
+	// more changed than it keeps (then anything may have).
+	[[nodiscard]] bool TakeRegistrationSpans(std::vector<GuestRange>& spans);
 
 	void               RunGarbageCollector(bool collect = true);
 	// The video memory the game buffers in use that got system memory need back, with headroom (0: none): the
@@ -187,11 +243,25 @@ public:
 private:
 	friend struct BufferCacheTestAccess;
 
-	// A game buffer in use that got system memory (Buffer::IsInSystemMemory) goes back to video memory once there
-	// is room for it: one a call, from RunGarbageCollector every 60 flips. True when one moved. bda_frame: the
-	// frame read guest memory through the BDA page table, which leaves no trace in the LRU, so every spilled
-	// buffer counts as in use then.
+	// A game buffer in use that got system memory goes back to video memory once there is room.
 	bool MoveSpilledBufferBack(bool bda_frame);
+	// The game buffers' pool compacted (GraphicContext::game_buffer_pool): one pass at a time.
+	void Defragment(uint64_t tick);
+	void EndDefragmentation();
+	struct DefragMove {
+		BufferId source, destination;
+	};
+	VmaDefragmentationContext      m_defrag = nullptr;
+	VmaDefragmentationPassMoveInfo m_defrag_pass {};
+	std::vector<DefragMove>        m_defrag_moves;
+	bool                           m_defrag_pass_open = false;
+	std::future<VkResult>          m_defrag_ending;
+	std::vector<VmaAllocation>     m_defrag_free_later;
+	uint64_t                       m_defrag_next_check = 0;
+	uint64_t                       m_defrag_free_after = 0;
+	uint32_t                       m_defrag_passes = 0;
+	uint32_t                       m_defrag_ignored = 0;
+	double                         m_defrag_ms = 0, m_defrag_max_ms = 0;
 
 	using BufferMap = std::map<uint64_t, BufferId>;
 	struct OverlapResult {
@@ -211,6 +281,12 @@ private:
 	}
 	[[nodiscard]] static std::pair<uint64_t, uint64_t> DownloadEnvelope(const DownloadCopy& copy);
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
+	// The BDA page tables' entries [first, first + count): written (`entries`) or cleared (null), in every table that
+	// holds them (m_bda_tables). GrowBdaTable: a table with `entries` entries at least replaces the newest.
+	void WriteBdaEntries(uint64_t first, uint64_t count, const vk::DeviceAddress* entries);
+	void GrowBdaTable(uint64_t entries);
+	// GPU thread: InvalidateMemoryForWrite's work where GPU-written bytes are in the range.
+	void DiscardGpuWrites(uint64_t vaddr, uint64_t size);
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
@@ -222,11 +298,16 @@ private:
 	// The buffers no binding used for a while go (RunGarbageCollector, once a flip).
 	void RetireStaleBuffers(uint64_t tick);
 	void DeleteBuffer(BufferId id);
+	// A deleted buffer destroyed, its slot erased (DeleteBuffer's, once nothing uses it).
+	void EraseSlot(BufferId id);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
 	void UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-	                                      uint64_t total_size);
+	                                      uint64_t total_size, const Buffer** ring = nullptr);
+	// The open upload prologue's copies by device address (VK_NV_copy_memory_indirect): one command as it closes.
+	std::vector<VkCopyMemoryIndirectCommandNV> m_prologue_copies;
+	void                                       FlushPrologueCopies(vk::CommandBuffer command);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void DownloadBufferMemory(std::span<const DownloadCopy> copies);
 	void WriteBackGpuOwned(uint64_t address, const uint8_t* data, uint64_t size, const char* source);
@@ -258,13 +339,22 @@ private:
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_lod_stats_buffer;
-	Buffer                                            m_bda_pagetable_buffer;
+	// The BDA page tables: the newest last (m_bda_table), the ones it replaced kept and written alike - sets made before
+	// it grew may still read them, never a freed buffer or a stale entry (GrowBdaTable).
+	std::vector<std::unique_ptr<Buffer>>              m_bda_tables;
+	std::atomic<Buffer*>                              m_bda_table {nullptr};
+	bool                                              m_bda_zeroed = false; // the first table (WriteBdaEntries)
+	static inline std::atomic<uint64_t>               s_bda_table_generation {0};
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
-	uint64_t m_registration_epoch = 1;
-	uint64_t m_unregister_epoch   = 1;
-	std::vector<uint64_t> m_region_registrations; // per tracker region, see RegionRegistrationEpoch
+	std::atomic<uint64_t> m_registration_epoch {1};
+	uint64_t              m_unregister_epoch {1};
+	// Per tracker region, see RegionRegistrationEpoch.
+	std::unique_ptr<std::atomic<uint64_t>[]> m_region_registrations =
+	    std::make_unique<std::atomic<uint64_t>[]>(TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE);
+	std::vector<GuestRange> m_registration_spans; // see TakeRegistrationSpans
+	bool                    m_registration_spans_lost = true;
 	struct SyncBuffer {
 		uint64_t start;
 		uint64_t end;
@@ -279,20 +369,27 @@ private:
 	std::vector<SyncStamp> m_sync_stamps;
 	std::vector<SyncBuffer> m_old_sync_buffers; // rebuild scratch
 	std::vector<SyncStamp>  m_old_sync_stamps;
+	// The registration changes since the index was current, applied to it in order (ApplySyncChanges) instead of a
+	// rebuild from every registered buffer (a walk of m_buffers' nodes and slots: ~5 a frame at 1-1, 2% of the GPU
+	// thread). Lost: too many, or the index was never built; the next use rebuilds it.
+	struct SyncChange {
+		BufferId id;
+		uint64_t address = 0, size = 0;
+		bool     insert  = false;
+	};
+	std::vector<SyncChange> m_sync_changes;
+	bool                    m_sync_changes_lost = true;
+	[[nodiscard]] bool      ApplySyncChanges();
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
-	// KYTY_TARGET_RAM_TRIM: the page-aligned parts of GPU-written ranges whose guest pages were asked out of the
-	// working set, kept to what is still GPU-written (TrimGpuWrittenRanges).
+	std::shared_mutex m_gpu_modified_mutex; // protects queries from other threads
+	// Moves whenever m_gpu_modified_ranges loses bytes: CPU-ownership proofs use this epoch.
+	uint64_t m_gpu_coverage_epoch = 1;
+	// The ranges ObtainBuffer made GPU-written lately; a repeat is reusable while registration and coverage stay put.
 	RangeSet m_trimmed_gpu_ranges;
-	// System-memory temporary upload buffers in flight (UploadCopies; KYTY_UPLOAD_TEMP_BOUND).
 	std::atomic<uint64_t> m_temp_upload_bytes {0};
 	uint64_t m_trimmed_gpu_bytes = 0;
-	void     TrimGpuWrittenRanges();
-	// Moves whenever m_gpu_modified_ranges loses bytes (readbacks, copy feedback, downloads, forward copies: CPU
-	// writes and unmaps go through those first). GPU thread.
-	uint64_t m_gpu_coverage_epoch = 1;
-	// The ranges ObtainBuffer made GPU-written lately: one written again while no buffer was registered or
-	// unregistered and no GPU-written byte was given back since is the same buffer's, its pages still GPU-owned
+	void TrimGpuWrittenRanges();
 	// and its bytes still in m_gpu_modified_ranges (what SynchronizeBuffer and the Add would find).
 	struct WriteMemo {
 		uint64_t vaddr = 0, size = 0, registration = 0, coverage = 0;
@@ -304,9 +401,21 @@ private:
 	StreamBuffer                                      m_staging_buffer;
 	// ObtainBufferForImage (KYTY_ASYNC_UPLOAD=2): the backing pieces of an image upload.
 	std::vector<std::pair<const uint8_t*, uint64_t>>  m_backing_pieces;
+	// The upload worker's copies of guest [vaddr, vaddr + size) to `staging`; false when it reads the mapped parts
+	// only (a partly unmapped range: the rest is zeros).
+	bool PushImageStagingCopies(uint8_t* staging, uint64_t vaddr, uint64_t size);
+	// ImageProtectSink's protections: those of pages a copy of [vaddr, vaddr + size) the upload worker makes next reads
+	// whole go ahead of it, the others are applied here. `whole_image`: the range is the image's (bytes of its first and
+	// last pages outside it are no other watcher's, or their pages would have been watched already).
+	std::vector<PageManager::DeferredRange> m_image_protects;
+	PageManager*                            m_image_protect_manager = nullptr;
+	void QueueImageProtects(std::span<const StagingPiece> copied, bool whole_image);
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_host_shader_upload;
 	StreamBuffer                                      m_table_upload;
+	// Buffer uploads stage here while it has room (UploadCopies): device-local host-visible memory, whose copies read
+	// video memory instead of system memory across the bus.
+	StreamBuffer                                      m_staging_device;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
@@ -322,24 +431,42 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
-	// When each recent collector tick began (steady clock, by tick % size): RetireStaleBuffers counts idleness in time.
-	std::array<int64_t, 8192> m_tick_times {};
-	bool m_retire_pressure = false; // the video memory in use at the critical level
-	// The registered game buffers in system memory, and the room those in use need (MoveSpilledBufferBack).
+	TickClock m_tick_clock; // RetireStaleBuffers counts idleness in time
+	bool      m_retire_pressure = false;
+	// The registered game buffers in system memory and the room those in use need.
 	std::vector<BufferId> m_spilled;
 	uint64_t              m_spilled_room = 0;
 
 	// KYTY_READBACK_QUEUE: GPU writes that may still be in flight, oldest first. An entry's
 	// tick is set at the next point between commands (every write noted by then is recorded
-	// at or before the current tick); entries the GPU completed are dropped from the front.
+	// at or before the current tick: m_gpu_write_stamps); entries the GPU completed are dropped
+	// from the front.
 	struct GpuWrite {
-		uint64_t begin, end, tick, sequence;
+		uint64_t begin, end;
+		bool     big = false; // spans more granules than GpuWriteSpan: in m_gpu_big_writes, not m_gpu_write_last
 	};
-	// Trace origins distinguish a writable binding declaration from a recorded copy.
-	enum class GpuWriteOrigin : uint32_t {
-		WritableBinding = 1, CpuUpload = 2, BufferJoin = 3, ImageDownload = 4,
-	};
-	void                  NoteGpuWrite(uint64_t vaddr, uint64_t size, GpuWriteOrigin origin);
+	// The ticks of the stamped writes, oldest first: (end, tick) dates the writes numbered from the previous entry's end
+	// (the head's number for the first) up to `end`. (A tick in every entry: each was written once and read once more,
+	// a pass over thousands of cold entries a frame.)
+	std::deque<std::pair<uint64_t, uint64_t>> m_gpu_write_stamps;
+	[[nodiscard]] uint64_t                    GpuWriteTick(size_t index) const;
+	// Per 64 KiB granule (hashed into the counters), 1 + the number (m_gpu_writes_base + index) of the last small write
+	// there; a write over more than GpuWriteSpan granules is in m_gpu_big_writes instead. The in-flight writes are the
+	// log's tail: a range whose granules' last write completed overlaps no in-flight small write, and the walk for one
+	// that may starts at that last write, not at the log's end (thousands of entries a frame at 1-1). (Counting the
+	// writes per granule, up at each write and down at its completion, cost a random read-modify-write per granule.)
+	static constexpr uint32_t   GpuWriteGranuleBits = 16, GpuWriteCounters = 1u << 16u, GpuWriteSpan = 64;
+	std::unique_ptr<uint64_t[]> m_gpu_write_last = std::make_unique<uint64_t[]>(GpuWriteCounters);
+	// The numbers of the big writes, oldest first (the completed ones dropped at queries): a query looks for an
+	// overlapping one in them (one in flight, a 4-8 MiB copy every frame, made every query walk the log from its end).
+	std::deque<uint64_t>        m_gpu_big_writes;
+	uint64_t                    m_gpu_writes_base = 0; // the number of m_gpu_writes[0]
+	[[nodiscard]] static uint32_t GpuWriteCounter(uint64_t granule) {
+		return static_cast<uint32_t>((granule * 0x9e3779b97f4a7c15ull) >> (64u - 16u));
+	}
+	void ResetGpuWrites();
+	enum class GpuWriteOrigin : uint32_t { WritableBinding = 1, CpuUpload = 2, BufferJoin = 3, ImageDownload = 4 };
+	void NoteGpuWrite(uint64_t vaddr, uint64_t size, GpuWriteOrigin origin = GpuWriteOrigin::WritableBinding);
 	[[nodiscard]] uint64_t InflightWriteTick(uint64_t begin, uint64_t end, uint64_t completed,
 	                                         bool between_commands);
 	// The graphics tick a transfer-queue copy of `ranges` ({begin, end}) waits for; false when
@@ -350,24 +477,13 @@ private:
 	size_t                m_gpu_writes_head    = 0;
 	size_t                m_gpu_writes_stamped = 0;
 	bool                  m_gpu_writes_on      = false;
-	// Optional fixed hashed lookup: 65,536 64-bit absolute sequence stamps (512 KiB).
-	// Lazily allocated; hash collisions only move the backward scan's start later.
-	using GpuWriteIndex = std::array<uint64_t, 1u << 16u>;
-	std::unique_ptr<GpuWriteIndex> m_gpu_write_index;
-	uint64_t m_gpu_write_sequence = 0;
-	bool m_gpu_write_index_on = false;
-	bool m_gpu_write_index_safe = true;
-	size_t m_gpu_write_large_count = 0;
+	bool                  m_gpu_write_index_safe = true;
 	// Writes before this tick were not noted (UINT64_MAX: set at the next stamp).
 	uint64_t              m_gpu_writes_from    = UINT64_MAX;
 	// Last copy-engine value, and last graphics tick, that wrote each download slot: a detached
 	// request's copy may still be pending on either queue when its slot is reused.
 	std::array<uint64_t, GuestReadbackSlots> m_download_queue_values {};
 	std::array<uint64_t, GuestReadbackSlots> m_download_ticks {};
-	// Mode 3 (verification): the same bytes copied on the graphics queue, compared on use.
-	std::array<std::unique_ptr<Buffer>, GuestReadbackSlots> m_verify_downloads {};
-	void VerifyReadback(uint64_t address, const uint8_t* fast, const uint8_t* reference, uint64_t size,
-	                    const char* path, uint64_t waited);
 
 	// Last member: destroyed (queue idle) before the buffers its copies use.
 	std::unique_ptr<ReadbackQueue::Queue> m_readback_queue;

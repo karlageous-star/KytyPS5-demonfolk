@@ -316,7 +316,7 @@ bool NativeFMinMax() {
 }
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
-	if (NativeFMinMax()) {
+	if (state.program.native_float_min_max && NativeFMinMax()) {
 		const auto ret = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    {OpExtInst, TypeF32(state), ret, GlslStd450(state), max_value ? GlslNMax : GlslNMin, lhs, rhs});

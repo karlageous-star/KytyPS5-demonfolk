@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/guest_gpu/superResolution.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -124,6 +125,11 @@ public:
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 	[[nodiscard]] bool IsRendering() const noexcept { return m_rendering; }
+	// The render pass `state` again after an interruption (a copy of an attachment): its attachments loaded, not
+	// cleared, and `state` kept as the current one, so that the next BeginRendering with it continues the pass.
+	void ResumeRendering(const RenderState& state) const;
+	// The render pass in progress is `state`'s, as BeginRendering compares them.
+	[[nodiscard]] bool RenderingWith(const RenderState& state) const;
 	// Raw internal graphics operations must invalidate the values recorded by
 	// the ordinary draw path. Compute and transfer commands do not alter them.
 	void InvalidateGraphicsState() const noexcept;
@@ -174,6 +180,20 @@ public:
 	// most 1,024): KYTY_UPLOAD_BATCH's uploads from the staging ring. False: not batched.
 	[[nodiscard]] bool BatchCopies(const Buffer& source, const Buffer& destination,
 	                               std::span<const vk::BufferCopy> regions) const;
+	// Guest buffer copies in a row (Buffer::CopyInRun): one barrier before the run and one after it, recorded before
+	// the next other command (Handle, ChainHandle; a full barrier covers it). A copy that reads what an earlier copy of
+	// the run writes, or writes what one reads or writes, starts a new run.
+	[[nodiscard]] vk::CommandBuffer CopyRunHandle(vk::Buffer source, uint64_t source_offset, vk::Buffer destination,
+	                                              uint64_t destination_offset, uint64_t size) const;
+	// A run is open: everything recorded since its barrier is its copies (any other command flushes it first).
+	[[nodiscard]] bool InCopyRun() const noexcept { return !m_copy_run.empty(); }
+	// A copy of what the open run wrote (a copy-feedback snapshot, BufferCache::ScheduleCopyFeedback): recorded when the
+	// run ends, after its copies, behind one transfer barrier, then made available to the host. A copy of the run that
+	// writes its source range starts a new run, which records it first.
+	void CopyAfterRun(vk::Buffer source, uint64_t source_offset, vk::Buffer destination, uint64_t destination_offset,
+	                  uint64_t size) const;
+	// The recorded work count after this buffer's last global barrier (CommandProcessor::EmitGlobalBarrier).
+	[[nodiscard]] uint64_t& BarrierWork() const noexcept { return m_barrier_work; }
 
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
@@ -191,6 +211,18 @@ private:
 
 	void Begin();
 	void End() const;
+	void FlushCopyRun() const;
+	void FlushRunTail() const;
+
+	struct CopyRunRange {
+		VkBuffer buffer;
+		uint64_t begin, end;
+		bool     written;
+	};
+	struct RunTailCopy {
+		VkBuffer source, destination;
+		uint64_t source_offset, destination_offset, size;
+	};
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
@@ -220,6 +252,8 @@ private:
 	mutable std::vector<BatchedCopyBuffers> m_copy_batch_buffers;
 	mutable std::vector<TransferAccess>     m_copy_batch_access;
 	void                                    FlushCopyBatch() const;
+	mutable std::vector<CopyRunRange> m_copy_run; // a run's ranges (not empty: its after barrier is owed)
+	mutable std::vector<RunTailCopy>  m_run_tail; // CopyAfterRun's copies, owed with the run's end
 	mutable uint64_t    m_graphics_generation    = 0;
 	vk::CommandBuffer   m_buffer          = nullptr;
 	uint32_t            m_timestamp_slot  = UINT32_MAX; // live trace GPU timestamps
@@ -231,6 +265,7 @@ private:
 	uint32_t            m_debug_arg3      = 0;
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
+	mutable uint64_t    m_barrier_work = UINT64_MAX;
 	mutable bool        m_rendering   = false;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
@@ -247,6 +282,8 @@ public:
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
 	                    uint64_t indirect_args = 0);
+	// An R_SUPER_RESOLUTION packet's upscale (graphics/guest_gpu/superResolution.h; renderSuperResolution.cpp).
+	void RunSuperResolution(CommandBuffer& buffer, const SuperResolution::Packet& packet);
 
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
 	void PrepareBindingsInto(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
@@ -366,6 +403,10 @@ private:
 	                                        std::span<const std::pair<uint32_t, uint32_t>> images,
 	                                        std::span<const std::pair<uint32_t, uint32_t>> buffers);
 	void NativeXprCollect();
+	void NativeXprSweepStates(NativeXprCache& cache, uint64_t frame);
+	// A draw state's dynamic state, only what differs from what the emissions recorded in the command buffer.
+	static void NativeXprEmitDynamic(NativeXprCache& cache, vk::CommandBuffer vk_buffer, const NativeXprDrawState& draw_state,
+	                                 bool same_command);
 	void NativeXprLearn(const NativeXprRecord& stale, NativeXprRecord& fresh);
 	void NativeXprStore(CommandBuffer& buffer, const DrawRenderState& state,
 	                    vk::PrimitiveTopology topology, bool primitive_restart_enable,
@@ -389,11 +430,13 @@ private:
 
 public:
 	// Runtime entry points for the command processor (kyty_local_native_xpr_mode).
-	// A direct indexed draw (DRAW_INDEX_2 / DRAW_INDEX_OFFSET_2): its indices, count and instances.
+	// A direct indexed draw (DRAW_INDEX_2 / DRAW_INDEX_OFFSET_2): its indices, count and instances; or a direct draw
+	// of vertices (DRAW_INDEX_AUTO, not `indexed`: the count is of vertices; table draws only).
 	struct NativeXprDirectDraw {
 		uint64_t index_address  = 0;
 		uint32_t index_count    = 0;
 		uint32_t instance_count = 1;
+		bool     indexed        = true;
 	};
 	// `direct`: that draw instead of the DRAW_INDEX_INDIRECT run `commands`.
 	[[nodiscard]] bool NativeXprTry(CommandBuffer& buffer, bool clean, std::span<const uint64_t> commands,
@@ -411,22 +454,30 @@ public:
 	                                 uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct);
 	// Table dispatches (KYTY_TABLE_DISPATCH): a dispatch drawn the table way, and the normal path's dispatches.
 	[[nodiscard]] bool TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
-	                                 uint64_t indirect_args);
-	void TableDispatchSeen(const HW::ComputeShaderInfo& cs, bool special);
+	                                 uint64_t indirect_args, bool thread_dimensions);
+	// (`special`: the special path that took the dispatch; null: none.)
+	void TableDispatchSeen(const HW::ComputeShaderInfo& cs, const char* special, bool thread_dimensions);
 
 private:
 	// Table draws (src/local/table-xpr.inc).
 	struct TableXpr;
 	struct TablePair;
+	struct TableFlatStage;
 	struct TableVariant;
+	void TablePack(TablePair& pair, const std::array<TableFlatStage, 2>& flat);
 	struct TableImageSet;
-	enum class TableResult { Drawn, Native, Store };
+	// Deferred: the pair's table variant is on its way (TableTry): the normal path draws, storing no native record.
+	enum class TableResult { Drawn, Native, Store, Deferred };
 	std::shared_ptr<TableXpr> m_table_xpr;
+	// The executor's table state (made at its first use).
+	TableXpr&                     OwnTable();
+	void                          TableForgetStates();
+	void                          TableSweepPairs();
 	// The linear copy shader the normal path last copied with (DemonsSouls::TryLinearCopy), the shader map generation
 	// before its program was prepared, and its dispatches since (every 64th takes the normal path again).
-	uint64_t m_linear_copy_shader = 0, m_linear_copy_generation = 0;
-	uint32_t m_linear_copy_uses   = 0;
-	bool     m_linear_copy_masked = false; // its kernel (DemonsSouls::LinearCopyMasked)
+	std::atomic<uint64_t> m_linear_copy_shader {0}, m_linear_copy_generation {0};
+	uint32_t              m_linear_copy_uses = 0;
+	bool m_linear_copy_masked = false; // retained for the USA 1.004 copy shader
 	TableResult TableTry(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
 	                     uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct);
 	TableResult TableDraw(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,
@@ -439,6 +490,7 @@ private:
 	void                         TableRuns(TablePair& pair);
 	void                         TableReset(TablePair& pair);
 	[[nodiscard]] bool           TableEvaluate(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
+	void                         TableGather(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
 	[[nodiscard]] TableImageSet* TableSet(CommandBuffer& buffer, TablePair& pair, const TableVariant* variant,
 	                                      const NativeXprDrawState* draw_state);
 	[[nodiscard]] bool           TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,

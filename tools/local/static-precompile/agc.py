@@ -8,13 +8,14 @@ AGC header (`struct Shader` in src/graphics/shader/shader.h; AgcCreateShader in 
   80 u32 num_input_semantics   84 u16 scratch_dw_per_thread   86 u16 num_output_semantics
   88 u16 special_sizes_bytes   90 u8 type (Prospero::ShaderBinaryType)   91 u8 n_cx   92 u8 n_sh
 
-A CSDR bundle is a table of entries, each the shader code followed by its AGC header (layout checked
-the same way as tools/local/extract-game-shaders.py). eboot.bin carries a further array of AGC headers
+A CSDR bundle is a table of entries, each the shader code followed by its AGC header. eboot.bin carries a further array of AGC headers
 in its data segment with the code laid out after it, one blob per header in header order, each
 256-byte aligned (the relocations that pair a header with its code confirm the rule).
 """
 import struct
 from pathlib import Path
+
+import gamefs
 
 MAGIC = 0x34333231
 VERSION = 0x18
@@ -153,7 +154,45 @@ def parse_bundle(data):
 
 def csdr_files(game):
     """The PS5 bundles the emulator loads (the '_trinity' twins are the PS5 Pro variants)."""
-    return [f for f in sorted(Path(game).rglob('*.csdr')) if not f.stem.endswith('_trinity')]
+    return [f for f in sorted(gamefs.game_path(game).rglob('*.csdr')) if not f.stem.endswith('_trinity')]
+
+
+SELF_MAGICS = (b'\x4f\x15\x3d\x1d', b'\x54\x14\xf5\xee')
+
+
+def plain_elf(data):
+    """The ELF image of an eboot.bin: the file when it is one, else the ELF of its SELF with plaintext segments (a
+    fake-signed one, as the emulator's loader reads it: src/loader/elf.cpp). Each segment flagged 0x800 holds the
+    file bytes of program header (type >> 20) & 0xfff; the image puts them back at that header's file offset."""
+    if data[:4] == b'\x7fELF':
+        return data
+    if len(data) < 32 or data[:4] not in SELF_MAGICS:
+        raise AgcError('not an ELF file nor a SELF')
+    file_size = struct.unpack_from('<Q', data, 16)[0]
+    count = struct.unpack_from('<H', data, 24)[0]
+    ehdr = 32 + 32 * count
+    if len(data) < ehdr + 64 or data[ehdr:ehdr + 4] != b'\x7fELF':
+        raise AgcError('SELF without an ELF header')
+    phoff = struct.unpack_from('<Q', data, ehdr + 32)[0]
+    phentsize, phnum = struct.unpack_from('<HH', data, ehdr + 54)
+    table_end = phoff + phnum * phentsize
+    phdrs = [struct.unpack_from('<IIQQQQQQ', data, ehdr + phoff + i * phentsize) for i in range(phnum)]
+    image = bytearray(max([table_end] + [p[2] + p[5] for p in phdrs]))
+    image[:table_end] = data[ehdr:ehdr + table_end]
+    for i in range(count):
+        kind, offset, stored, size = struct.unpack_from('<4Q', data, 32 + 32 * i)
+        index = (kind >> 20) & 0xfff
+        if not kind & 0x800 or index >= phnum:
+            continue
+        if kind & 0x2 or stored != size or size != phdrs[index][5] or offset + size > len(data):
+            raise AgcError('an encrypted or compressed SELF: the emulator needs the decrypted game (its plain '
+                           'eboot.bin or a fake-signed SELF)')
+        image[phdrs[index][2]:phdrs[index][2] + size] = data[offset:offset + size]
+    # (A header whose bytes no segment holds: what follows the SELF's own bytes, when they are its size.)
+    for p in phdrs:
+        if p[5] != 0 and p[5] == len(data) - file_size and not any(image[p[2]:p[2] + p[5]]):
+            image[p[2]:p[2] + p[5]] = data[file_size:]
+    return bytes(image)
 
 
 def _elf_loads(elf):
@@ -199,11 +238,14 @@ def _relative_relocations(elf, loads):
 
 def embedded_shaders(game):
     """The AGC headers in eboot.bin's data segment with their code: list of dicts (index, agc, header, code).
-    Needs the plain ELF (decrypted/eboot.bin); returns [] without it."""
-    path = Path(game) / 'decrypted' / 'eboot.bin'
+    From decrypted/eboot.bin when the game has one, else the eboot.bin the emulator runs (a plain ELF or a SELF
+    with plaintext segments, plain_elf); [] without either."""
+    path = gamefs.game_path(game) / 'decrypted' / 'eboot.bin'
+    if not path.is_file():
+        path = gamefs.game_path(game) / 'eboot.bin'
     if not path.is_file():
         return []
-    elf = path.read_bytes()
+    elf = plain_elf(path.read_bytes())
     loads = _elf_loads(elf)
     first = elf.find(HEADER_MAGIC)
     if first < 0:

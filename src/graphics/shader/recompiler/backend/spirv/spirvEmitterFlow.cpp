@@ -36,6 +36,58 @@ static bool IsWaveOrScanRead(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	return false;
 }
+// Cooperative halves (IR::WaveFlags, Program::lane_cooperative): the wave's answer from both 32-lane halves, the
+// workgroup's two subgroups, through workgroup memory. Every lane stores its word in its slot of the current phase,
+// a barrier, then each reads the slots it needs. The phase alternates (two of 128 words), so an exchange's stores
+// never overwrite words of the one before that another invocation has still to read: a barrier lies between.
+static bool CooperativeWave(const ValueEmitContext& ctx, const IR::Inst& inst) {
+	return ctx.state.lane_count == 1 && ctx.state.program.lane_cooperative && inst.Flags<IR::WaveFlags>().cooperative;
+}
+
+struct WaveExchange {
+	uint32_t base = 0; // the phase's first slot
+	uint32_t lane = 0; // the invocation's GCN lane: its slot
+};
+
+static WaveExchange BeginWaveExchange(EmitterState& state) {
+	if (state.wave_exchange_variable == 0) {
+		state.wave_exchange_variable = state.builder.DefineGlobalVariable(
+		    TypeU32ArrayPointer(state, StorageClassWorkgroup, 256), StorageClassWorkgroup);
+		state.builder.AddName(state.wave_exchange_variable, "wave_exchange");
+		state.wave_phase_variable = state.builder.DefineInitializedVariable(
+		    TypePointer(state, StorageClassPrivate, TypeU32(state)), StorageClassPrivate, ConstantU32(state, 0));
+		state.builder.AddName(state.wave_phase_variable, "wave_phase");
+	}
+	const auto phase = state.builder.AllocateId();
+	state.builder.AddFunction({OpLoad, TypeU32(state), phase, state.wave_phase_variable});
+	state.builder.AddFunction(
+	    {OpStore, state.wave_phase_variable, EmitBinaryU32(state, OpBitwiseXor, phase, ConstantU32(state, 1))});
+	return {EmitBinaryU32(state, OpShiftLeftLogical, phase, ConstantU32(state, 7)),
+	        EmitBinaryU32(state, OpBitwiseAnd, EmitLocalInvocationIndex(state), ConstantU32(state, 63))};
+}
+
+static uint32_t WaveSlot(EmitterState& state, uint32_t base, uint32_t offset) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction({OpAccessChain, TypePointer(state, StorageClassWorkgroup, TypeU32(state)), pointer,
+	                           state.wave_exchange_variable, EmitAddU32(state, base, offset)});
+	return pointer;
+}
+
+static void StoreWaveSlot(EmitterState& state, uint32_t base, uint32_t offset, uint32_t value) {
+	state.builder.AddFunction({OpStore, WaveSlot(state, base, offset), value});
+}
+
+static uint32_t LoadWaveSlot(EmitterState& state, uint32_t base, uint32_t offset) {
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction({OpLoad, TypeU32(state), value, WaveSlot(state, base, offset)});
+	return value;
+}
+
+static void WaveBarrier(EmitterState& state) {
+	state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup), ConstantU32(state, ScopeWorkgroup),
+	                           ConstantU32(state, MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory)});
+}
+
 namespace {
 
 bool UserDataDwordIndex(const EmitterState& state, IR::ScalarReg reg, uint32_t& dword_index) {
@@ -641,17 +693,60 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto high   = state.builder.AllocateId();
 			state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, ballot, 0});
 			state.builder.AddFunction({OpCompositeExtract, TypeU32(state), high, ballot, 1});
-			ctx.Emit(inst, OpINotEqual, IR::Type::U1,
-			         {EmitBinaryU32(state, OpBitwiseOr, low, high), ConstantU32(state, 0)});
+			auto bits = EmitBinaryU32(state, OpBitwiseOr, low, high);
+			if (CooperativeWave(ctx, inst)) {
+				// (Each half's lanes, as every lane of the half stored them: the wave's.)
+				const auto exchange = BeginWaveExchange(state);
+				StoreWaveSlot(state, exchange.base, exchange.lane, bits);
+				WaveBarrier(state);
+				bits = EmitBinaryU32(state, OpBitwiseOr, LoadWaveSlot(state, exchange.base, ConstantU32(state, 0)),
+				                     LoadWaveSlot(state, exchange.base, ConstantU32(state, 32)));
+			}
+			ctx.Emit(inst, OpINotEqual, IR::Type::U1, {bits, ConstantU32(state, 0)});
 			return true;
 		}
 		case IR::ValueOpcode::ReadFirstLane: {
 			const auto ballot = ctx.Ballot(inst.Arg(1));
+			if (CooperativeWave(ctx, inst)) {
+				// The wave's first active lane (none: lane 0), from both halves' active lanes.
+				const auto active   = state.builder.AllocateId();
+				state.builder.AddFunction({OpCompositeExtract, TypeU32(state), active, ballot, 0});
+				const auto exchange = BeginWaveExchange(state);
+				StoreWaveSlot(state, exchange.base, exchange.lane, ctx.Arg(inst, 0));
+				StoreWaveSlot(state, exchange.base, EmitAddU32(state, exchange.lane, ConstantU32(state, 64)), active);
+				WaveBarrier(state);
+				const auto low       = LoadWaveSlot(state, exchange.base, ConstantU32(state, 64));
+				const auto high      = LoadWaveSlot(state, exchange.base, ConstantU32(state, 96));
+				const auto low_lane  = state.builder.AllocateId();
+				const auto high_lane = state.builder.AllocateId();
+				state.builder.AddFunction({OpExtInst, TypeU32(state), low_lane, GlslStd450(state), GlslFindILsb, low});
+				state.builder.AddFunction({OpExtInst, TypeU32(state), high_lane, GlslStd450(state), GlslFindILsb, high});
+				const auto in_low  = state.builder.AllocateId();
+				const auto in_high = state.builder.AllocateId();
+				state.builder.AddFunction({OpINotEqual, TypeBool(state), in_low, low, ConstantU32(state, 0)});
+				state.builder.AddFunction({OpINotEqual, TypeBool(state), in_high, high, ConstantU32(state, 0)});
+				const auto high_or_none = state.builder.AllocateId();
+				const auto first        = state.builder.AllocateId();
+				state.builder.AddFunction({OpSelect, TypeU32(state), high_or_none, in_high,
+				                           EmitAddU32(state, high_lane, ConstantU32(state, 32)), ConstantU32(state, 0)});
+				state.builder.AddFunction({OpSelect, TypeU32(state), first, in_low, low_lane, high_or_none});
+				ctx.Define(inst, LoadWaveSlot(state, exchange.base, first));
+				return true;
+			}
 			const auto lane   = ctx.FirstLane(ballot);
 			ctx.Define(inst, ctx.Shuffle(inst, 0, lane));
 			return true;
 		}
 		case IR::ValueOpcode::ReadLane:
+			if (CooperativeWave(ctx, inst)) {
+				// The value lane L stored, whichever half it is in.
+				const auto exchange = BeginWaveExchange(state);
+				StoreWaveSlot(state, exchange.base, exchange.lane, ctx.Arg(inst, 0));
+				WaveBarrier(state);
+				const auto lane = EmitBinaryU32(state, OpBitwiseAnd, ctx.Arg(inst, 1), ConstantU32(state, 63));
+				ctx.Define(inst, LoadWaveSlot(state, exchange.base, lane));
+				return true;
+			}
 			if (IsWaveOrScanRead(ctx, inst)) {
 				static std::atomic<uint32_t> logged {0};
 				if (logged.fetch_add(1) < 64)

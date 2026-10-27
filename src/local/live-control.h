@@ -1,7 +1,7 @@
 #pragma once
 // Local measurement hook (KYTY_LIVE_FILE): one boot, many same-process A/B experiments.
 // A side thread polls the command file every 100 ms and runs its commands once per new
-// "id N" first line, printing LIVE_* lines to stdout (tools/local/live-bench.py).
+// "id N" first line, printing LIVE_* lines to stdout (tools/local/bench-windows.py).
 //   poke32 <host address> <hex>   write a switch (live-bench resolves `sym NAME VALUE`)
 //   peek <host address> <bytes>   hex dump (<= 256 bytes)
 //   measure <seconds> <label>     presented frames, fps, per-frame CPU of the render and
@@ -14,17 +14,26 @@
 // A sample is 16 words: pc, the word at rsp, then up to 14 frame-pointer return addresses
 // (process mode: pc, thread id | 1 << 63, zeros).
 //   timecensus <seconds>          time-related HLE calls per guest caller (time-census.h)
+//   glide <x> <y> <z> <speed>     Demon's Souls 01.007.000: the player walks there (warp requests, no input)
+//   pad <lx> <ly> <rx> <ry> <buttons> <seconds>   scripted pad input (sticks 0..255, -1 the host's; buttons hex)
+//   screenshot <path>             the next frame shown, read back from the GPU, as a PPM file (screenshot.h)
+//   set <name> <value>            a live switch (live-switch.h), e.g. fsr_jitter_mode 1
 //   sleep <seconds>
 // Without KYTY_LIVE_FILE nothing runs; the flip hook is one relaxed increment.
 
 #include "common/assert.h"
 #include "loader/demonsSoulsCollisionGuard.h"
 #include "frame-capture.h"
+#include "kernel/memory.h"
 #include "live-census.h"
 #include "live-counters.h"
 #include "live-trace.h"
+#include "libs/controller.h"
 #include "loader/demonsSoulsWarp.h"
 #include "local-platform.h"
+#include "perf-overlay.h"
+#include "screenshot.h"
+#include "live-switch.h"
 #include "slow-log.h"
 #include "time-census.h"
 
@@ -98,14 +107,15 @@ inline void NoteRenderIdle(int64_t now_ns) {
 }
 
 // Render thread. With KYTY_HITCH_LOG_MS (or KYTY_SLOW_LOG_MS), a frame (flip to flip) that long and
-// at least 50 ms is a SLOW line too, on the same TSC timeline: the hitch the slow calls before it explain.
+// at least 20 ms is a SLOW line too, on the same TSC timeline: the hitch the slow calls before it explain.
 // The line also has the frame's render-thread wait for guest work, what some counters did in it and its
 // wall-clock time.
 inline void Flip() {
 	Loader::DemonsSoulsCollisionGuard::Report();
 	const auto flip = g_flips.load(std::memory_order_relaxed);
-	g_flip_times[flip % FlipTimes].store(std::chrono::steady_clock::now().time_since_epoch().count(),
-	                                     std::memory_order_relaxed);
+	const auto flip_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	g_flip_times[flip % FlipTimes].store(flip_ns, std::memory_order_relaxed);
+	PerfOverlay::NoteFlip(flip_ns, g_render_idle_ns);
 	g_flips.store(flip + 1, std::memory_order_release);
 	// KYTY_CAPTURE_AT_FLIP=<n>: a frame capture (frame-capture.h) armed at flip n without the live thread,
 	// into KYTY_CAPTURE_DIR, KYTY_CAPTURE_FRAMES frames (default 1), with the constants of the shaders in
@@ -223,20 +233,36 @@ inline void Flip() {
 		                                     C::BufferRegistrations, C::RegionSyncs, C::SyncDownloads, C::AsyncReadbacks,
 		                                     C::ReadbackParts, C::ReadbackRegions, C::RbQueueDone, C::RbQueueInflight,
 		                                     C::RbQueueVerified, C::RbQueueMismatch, C::SyncReadsRender, C::SyncReadsGuest,
-		                                     C::SrtWatchedReads, C::GuestCommands, C::TextureUnmaps, C::AsyncPipelines};
-		static constexpr const char* waits[] = {"gpu_wait", "readback_wait", "download_wait", "compile"};
+		                                     C::SrtWatchedReads, C::GuestCommands, C::TextureUnmaps, C::AsyncPipelines,
+		                                     C::TableDraws, C::TableStores, C::TableStoreVariant, C::TableStoreTargets,
+		                                     C::TableRefusedSets, C::TableNoSet, C::TableDrawNative, C::TableEvaluations,
+		                                     C::TableStoreDeferred};
+		static constexpr const char* waits[] = {"gpu_wait", "readback_wait", "download_wait", "compile", "record_wait"};
 		static std::chrono::steady_clock::time_point     last {};
 		static int64_t                                   last_idle = 0;
+		static int64_t                                   last_upload_wait = 0;
 		static std::array<int64_t, LiveCensus::Waits>    last_waits {};
 		static std::array<uint64_t, counted.size()>      last_counts {};
+		// The render thread's run time (TSC ticks) and a TSC rate from the first flip on: busy wall time
+		// (the frame less idle) well over cpu is time the thread was ready but not running (preempted).
+		static const uint64_t                            first_tsc  = __rdtsc();
+		static const auto                                first_time = std::chrono::steady_clock::now();
+		static uint64_t                                  last_cycles = 0;
+		const uint64_t                                   cycles      = LocalPlatform::CurrentThreadCycles();
 		const auto                                       now = std::chrono::steady_clock::now();
 		const double ms = std::chrono::duration<double, std::milli>(now - last).count();
-		if (last != std::chrono::steady_clock::time_point {} && ms >= std::max(50.0, SlowLog::HitchThreshold())) {
+		if (last != std::chrono::steady_clock::time_point {} && ms >= std::max(20.0, SlowLog::HitchThreshold())) {
 			std::printf("[tsc %llu] SLOW Frame %.1f ms idle=%.1f", static_cast<unsigned long long>(__rdtsc()), ms,
 			            static_cast<double>(g_render_idle_ns - last_idle) / 1e6);
+			if (const double since = std::chrono::duration<double, std::milli>(now - first_time).count();
+			    cycles != 0 && last_cycles != 0 && since > 1000.0)
+				std::printf(" cpu=%.1f", static_cast<double>(cycles - last_cycles) * since /
+				                             static_cast<double>(__rdtsc() - first_tsc));
 			for (size_t i = 0; i < LiveCensus::Waits; ++i)
 				if (const auto ns = LiveCensus::g_waits_ns[i] - last_waits[i]; ns != 0)
 					std::printf(" %s=%.1f", waits[i], static_cast<double>(ns) / 1e6);
+			if (const auto ns = LiveCensus::g_upload_wait_ns.load(std::memory_order_relaxed) - last_upload_wait; ns != 0)
+				std::printf(" upload_wait=%.1f", static_cast<double>(ns) / 1e6);
 			for (size_t i = 0; i < counted.size(); ++i) {
 				const auto delta = LiveCounters::Value(counted[i]) - last_counts[i];
 				if (delta != 0) std::printf(" %s=%llu", LiveCounters::Names[counted[i]], static_cast<unsigned long long>(delta));
@@ -247,8 +273,10 @@ inline void Flip() {
 			                                   .count()));
 			std::fflush(stdout);
 		}
-		last      = now;
-		last_idle = g_render_idle_ns;
+		last        = now;
+		last_idle   = g_render_idle_ns;
+		last_upload_wait = LiveCensus::g_upload_wait_ns.load(std::memory_order_relaxed);
+		last_cycles = cycles;
 		for (size_t i = 0; i < LiveCensus::Waits; ++i) last_waits[i] = LiveCensus::g_waits_ns[i];
 		for (size_t i = 0; i < counted.size(); ++i) last_counts[i] = LiveCounters::Value(counted[i]);
 	}
@@ -471,8 +499,25 @@ inline void Run(uint64_t id, const std::string& line) {
 		std::printf("LIVE_PEEK id=%" PRIu64 " va=%s bytes=%s\n", id, arg1, hex.c_str());
 	} else if (cmd == "measure" && n >= 2) {
 		Measure(id, std::strtod(arg1, nullptr), n == 3 ? arg2 : "-");
+	} else if (cmd == "flips" && n == 3) {
+		// flips <count> <path>: the last flips' intervals (us), oldest first, one a line (periodic slow frames).
+		const auto last  = g_flips.load();
+		const auto count = std::min<uint64_t>({std::strtoull(arg1, nullptr, 10), FlipTimes - 1, last ? last - 1 : 0});
+		if (auto* out = std::fopen(arg2, "w")) {
+			for (auto flip = last - count; flip < last; ++flip)
+				std::fprintf(out, "%lld\n", static_cast<long long>((g_flip_times[flip % FlipTimes].load() -
+				                                                    g_flip_times[(flip - 1) % FlipTimes].load()) / 1000));
+			std::fclose(out);
+		}
+		std::printf("LIVE_FLIPS id=%" PRIu64 " count=%llu path=%s\n", id, static_cast<unsigned long long>(count), arg2);
 	} else if ((cmd == "prof" || cmd == "profp" || cmd == "profw") && n == 3) {
 		Profile(id, std::strtod(arg1, nullptr), arg2, cmd == "profp", cmd == "profw");
+	} else if (cmd == "profbg" && n == 3) {
+		// profbg <seconds> <path>: prof on a thread of its own, while the next commands run (a trace of the same
+		// seconds: the samples' TSC stamps place them in its frames).
+		std::thread([id, seconds = std::strtod(arg1, nullptr), path = std::string(arg2)] {
+			Profile(id, seconds, path.c_str(), false, false);
+		}).detach();
 #if defined(_WIN32)
 	} else if (cmd == "pinthread" && n == 3) {
 		// pinthread <tid> <cpus>: any thread's affinity (placement A/B of the worker threads).
@@ -481,10 +526,20 @@ inline void Run(uint64_t id, const std::string& line) {
 		LocalPlatform::CloseThreadForSampling(handle);
 		std::printf("LIVE_PIN id=%" PRIu64 " thread=%s cpus=%s ok=%d\n", id, arg1, arg2, ok ? 1 : 0);
 	} else if (cmd == "proft" && n == 3) {
-		// proft <tid> <seconds> <path>: sample that thread (the file name follows the seconds).
+		// proft <tid|name> <seconds> <path>: sample that thread (the file name follows the seconds); a name takes the
+		// first thread of that name (e.g. Kyty.Record).
 		char path[256] {};
-		if (std::sscanf(line.c_str(), "%*s %*s %*s %255s", path) == 1)
-			Profile(id, std::strtod(arg2, nullptr), path, false, false, static_cast<uint32_t>(std::strtoul(arg1, nullptr, 10)));
+		auto tid = static_cast<uint32_t>(std::strtoul(arg1, nullptr, 10));
+		if (tid == 0)
+			for (const auto& [thread, name]: LocalPlatform::ProcessThreads())
+				if (name == arg1) {
+					tid = thread;
+					break;
+				}
+		if (tid == 0)
+			std::printf("LIVE_ERROR id=%" PRIu64 " line=proft %s (no such thread)\n", id, arg1);
+		else if (std::sscanf(line.c_str(), "%*s %*s %*s %255s", path) == 1)
+			Profile(id, std::strtod(arg2, nullptr), path, false, false, tid);
 #endif
 	} else if ((cmd == "trace" || cmd == "tracew" || cmd == "tracem") && n == 3) {
 		LiveTrace::EnsureRecords();
@@ -506,9 +561,17 @@ inline void Run(uint64_t id, const std::string& line) {
 			LiveTrace::g_read_marks(std::min(LiveTrace::g_mark_next.load(), LiveTrace::MarkSlots));
 		LiveTrace::Dump(arg2);
 		const double seconds = std::chrono::duration<double>(clock1 - clock0).count();
-		std::printf("LIVE_TRACE id=%" PRIu64 " records=%" PRIu64 " tsc_hz=%.0f path=%s\n", id,
+		// (The executable's load address: live-trace.py names the code addresses of the capture with it.)
+		uint64_t base = 0;
+#if defined(_WIN32)
+		if (!LocalPlatform::ModuleOf(reinterpret_cast<const void*>(&Flip), &base, nullptr, 0)) base = 0;
+#else
+		Dl_info self {};
+		if (dladdr(reinterpret_cast<void*>(&Flip), &self) != 0) base = reinterpret_cast<uint64_t>(self.dli_fbase);
+#endif
+		std::printf("LIVE_TRACE id=%" PRIu64 " records=%" PRIu64 " tsc_hz=%.0f base=%016" PRIx64 " path=%s\n", id,
 		            std::min<uint64_t>(LiveTrace::g_count.load(), LiveTrace::Capacity),
-		            static_cast<double>(tsc1 - tsc0) / seconds, arg2);
+		            static_cast<double>(tsc1 - tsc0) / seconds, base, arg2);
 	} else if (cmd == "census" && n >= 2) {
 		// census <seconds>: render-thread time per call kind and shader over the window.
 		LiveCensus::g_on.store(false);
@@ -654,6 +717,62 @@ inline void Run(uint64_t id, const std::string& line) {
 			written = !LiveCounters::g_cache_map_due.load(std::memory_order_acquire);
 		}
 		std::printf("LIVE_CACHEMAP id=%" PRIu64 " path=%s written=%d\n", id, arg1, written ? 1 : 0);
+	} else if (cmd == "images" && n >= 2) {
+		// images <path>: the texture cache's images, one tab-separated row each (what the video memory holds).
+		if (LiveCounters::g_image_report != nullptr) LiveCounters::g_image_report(arg1);
+		std::printf("LIVE_IMAGES id=%" PRIu64 " path=%s written=%d\n", id, arg1, LiveCounters::g_image_report != nullptr ? 1 : 0);
+	} else if (cmd == "ranges" && n >= 2) {
+		// ranges <path>: the guest's virtual ranges with the names the game gave them (Memory::WriteGuestRanges).
+		const bool ok = Libs::LibKernel::Memory::WriteGuestRanges(arg1);
+		std::printf("LIVE_RANGES id=%" PRIu64 " path=%s written=%d\n", id, arg1, ok ? 1 : 0);
+	} else if (cmd == "buffers" && n >= 2) {
+		// buffers <path>: the buffer cache's buffers, one tab-separated row each (what stays registered).
+		if (LiveCounters::g_buffer_report != nullptr) LiveCounters::g_buffer_report(arg1);
+		std::printf("LIVE_BUFFERS id=%" PRIu64 " path=%s written=%d\n", id, arg1, LiveCounters::g_buffer_report != nullptr ? 1 : 0);
+	} else if (cmd == "heapstats" && n >= 2) {
+		// heapstats <path>: the process heaps' busy blocks by size (LocalPlatform::WriteHeapHistogram).
+		const auto begin = std::chrono::steady_clock::now();
+		const bool ok    = LocalPlatform::WriteHeapHistogram(arg1);
+		std::printf("LIVE_HEAPSTATS id=%" PRIu64 " path=%s written=%d ms=%.0f\n", id, arg1, ok ? 1 : 0,
+		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
+	} else if (cmd == "alloctrace" && n >= 2) {
+		// alloctrace start <sizes,...> | dump <path>: live heap blocks of those sizes by stack (LocalPlatform::StartAllocTrace).
+		const bool start = std::string_view(arg1) == "start";
+		const bool ok    = n >= 3 && (start ? LocalPlatform::StartAllocTrace(arg2) : LocalPlatform::WriteAllocTrace(arg2));
+		std::printf("LIVE_ALLOCTRACE id=%" PRIu64 " %s ok=%d\n", id, start ? "start" : "dump", ok ? 1 : 0);
+	} else if (cmd == "objects") {
+		// objects: what the pipeline cache keeps (pipelines, unoptimized ones replaced, programs) and modules alive.
+		if (LiveCounters::g_objects_report != nullptr) LiveCounters::g_objects_report(id);
+		std::printf("LIVE_OBJECTS id=%" PRIu64 " shader_modules=%" PRId64 "\n", id, LiveCounters::g_shader_modules.load());
+	} else if (cmd == "sync") {
+		// sync: GPU timelines, deferred submissions and pending guest readbacks (a stalled GPU thread).
+		if (LiveCounters::g_sync_report != nullptr) LiveCounters::g_sync_report();
+		std::printf("LIVE_SYNC id=%" PRIu64 "\n", id);
+	} else if (cmd == "gamecmd" && n >= 2) {
+		// gamecmd <text>: an engine console command on the game's pad-reading thread (loader/demonsSoulsWarp.h), e.g.
+		// gamecmd +cp11_unlockAllArchstones, gamecmd +cp11_loadLevel 2 1 (world, level: what archstone travel runs).
+		auto text = line.substr(line.find("gamecmd") + 7);
+		text.erase(0, text.find_first_not_of(' '));
+		while (!text.empty() && (text.back() == '\r' || text.back() == ' ')) text.pop_back();
+		const bool ok = Loader::DemonsSoulsWarp::QueueCommand(text);
+		std::printf("LIVE_GAMECMD id=%" PRIu64 " queued=%d text=%s\n", id, ok ? 1 : 0, text.c_str());
+	} else if (cmd == "gamekill" && n >= 2) {
+		// gamekill <radius m>: the characters within it of the player die (loader/demonsSoulsWarp.h; log "Game kill: ...").
+		using Mode    = Loader::DemonsSoulsWarp::KillMode;
+		const auto mode = n == 3 && std::string_view(arg2) == "hp"      ? Mode::HpZero
+		                  : n == 3 && std::string_view(arg2) == "death" ? Mode::Death
+		                                                                : Mode::Suicide;
+		const bool ok   = Loader::DemonsSoulsWarp::QueueKill(std::strtof(arg1, nullptr), mode);
+		std::printf("LIVE_GAMEKILL id=%" PRIu64 " queued=%d radius=%s\n", id, ok ? 1 : 0, arg1);
+	} else if (cmd == "gamestrike" && n >= 2) {
+		// gamestrike <radius m>: the characters within it killed by the player's own (deadly) hits, nearest first; blocks
+		// until done (loader/demonsSoulsWarp.h).
+		const auto report = Loader::DemonsSoulsWarp::Strike(std::strtof(arg1, nullptr));
+		std::printf("LIVE_GAMESTRIKE id=%" PRIu64 " %s\n", id, report.c_str());
+	} else if (cmd == "gamesweep" && n >= 2) {
+		// gamesweep <seconds> [radius m]: the nearest living character killed, again and again (loader/demonsSoulsWarp.h).
+		const auto report = Loader::DemonsSoulsWarp::Sweep(std::strtod(arg1, nullptr), n == 3 ? std::strtof(arg2, nullptr) : 1000.0f);
+		std::printf("LIVE_GAMESWEEP id=%" PRIu64 " %s\n", id, report.c_str());
 	} else if (cmd == "warp" && n >= 2) {
 		// warp <map> <spawn> | warp off: the debug warp (loader/demonsSoulsWarp.h).
 		const bool off = std::string_view(arg1) == "off";
@@ -661,9 +780,33 @@ inline void Run(uint64_t id, const std::string& line) {
 		                     : n == 3 && Loader::DemonsSoulsWarp::Arm(arg1, arg2);
 		std::printf("LIVE_WARP id=%" PRIu64 " map=%s spawn=%s ok=%d spawns=%zu\n", id, arg1, n == 3 ? arg2 : "-",
 		            ok ? 1 : 0, Loader::DemonsSoulsWarp::Spawns().size());
+	} else if (cmd == "glide") {
+		// glide X Y Z SPEED: the player walked there in a straight line (loader/demonsSoulsWarp.h), at once; seconds = the
+		// time it takes (-1: no player).
+		float      x = 0, y = 0, z = 0, speed = 0;
+		const bool parsed  = std::sscanf(line.c_str(), "%*s %f %f %f %f", &x, &y, &z, &speed) == 4;
+		const auto seconds = parsed ? Loader::DemonsSoulsWarp::Glide(x, y, z, speed) : -1.0;
+		std::printf("LIVE_GLIDE id=%" PRIu64 " seconds=%.2f\n", id, seconds);
+	} else if (cmd == "pad") {
+		// pad LX LY RX RY BUTTONS SECONDS: what the game reads from the pad for SECONDS (libs/controller.h).
+		int          axes[4] {-1, -1, -1, -1};
+		unsigned int buttons = 0;
+		double       seconds = 0;
+		const bool   parsed  = std::sscanf(line.c_str(), "%*s %d %d %d %d %x %lf", &axes[0], &axes[1], &axes[2], &axes[3],
+		                                   &buttons, &seconds) == 6;
+		if (parsed) Libs::Controller::SetScriptedInput(axes[0], axes[1], axes[2], axes[3], buttons, seconds);
+		std::printf("LIVE_PAD id=%" PRIu64 " ok=%d\n", id, parsed ? 1 : 0);
 	} else if (cmd == "fatal") {
 		// fatal: a fatal error on this thread, the path a crash takes (log, then the process ends).
 		EXIT("live fatal: a test of the fatal-error exit\n");
+	} else if (cmd == "screenshot" && n >= 2) {
+		// screenshot <path>: the next frame shown, as a PPM file (screenshot.h; "SCREENSHOT <path>" once written).
+		Libs::Graphics::Screenshot::Request(arg1);
+		std::printf("LIVE_SCREENSHOT id=%" PRIu64 " path=%s\n", id, arg1);
+	} else if (cmd == "set" && n >= 3) {
+		// set <name> <value>: a live switch (live-switch.h).
+		const bool ok = LiveSwitch::Set(arg1, std::strtoll(arg2, nullptr, 10));
+		std::printf("LIVE_SET id=%" PRIu64 " %s=%s ok=%d\n", id, arg1, arg2, ok ? 1 : 0);
 	} else if (cmd == "sleep" && n >= 2) {
 		std::this_thread::sleep_for(std::chrono::duration<double>(std::strtod(arg1, nullptr)));
 	} else if (cmd == "capture" && n >= 2) {
@@ -719,7 +862,7 @@ inline void StallWatch(int64_t threshold_ns) {
 		              static_cast<double>(idle) / 1e6, dumps, static_cast<double>(since - last) / 1e6);
 		out += line;
 		for (const auto& [tid, name]: LocalPlatform::ProcessThreads()) {
-			if (tid == self || name.rfind("Kyty.", 0) == 0 || name.rfind("SDLAudio", 0) == 0) continue;
+			if (tid == self || (std::getenv("KYTY_STALL_DUMP_ALL") == nullptr && name.rfind("Kyty.", 0) == 0) || name.rfind("SDLAudio", 0) == 0) continue;
 			const auto handle = LocalPlatform::OpenThreadForSampling(tid);
 			if (handle == 0) continue;
 			uint64_t words[SampleWords] {};

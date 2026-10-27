@@ -69,20 +69,48 @@ stone pillar) the cause was in the original emulator:
   Validate title id, app version and process name; find the module base by searching the first
   non-zero `off` pattern in loadable segments; verify every `off` sequence before writing; allocate a
   code cave for writes outside the module; flush the instruction cache; apply when the module loads.
+- Several game versions: never hard-code RVAs. Locate sites by masked signatures (wildcards for rel32 targets,
+  RIP displacements, frame sizes) and require a unique match; keep shader-hash tables and caches per version.
 - Emulator-side guest hooks (instead of patches): verify each audited function by RVA, size and hash
   before redirecting call sites; fall back to the original behaviour if any differs.
-- Examples that paid: skipping boot logos/character creation for benchmarking, removing
-  over-conservative compute barriers, a faster memmove, sleeping instead of spinning. Always keep
-  them title+version-exact.
+- Examples that paid: skipping boot logos/character creation for benchmarking, removing over-conservative compute
+  barriers, a faster memmove, sleeping or backing off instead of spinning, the render setup's aspect, null-child
+  guards in scene traversals. Always keep them title+version-exact.
+
+## Recurring bug classes (check these first)
+
+| Symptom | Cause | How it was found |
+|---|---|---|
+| Random guest crashes with garbage `this`/RIP, corrupted lock wait blocks, asserts | host code (exception dispatch ~5 KiB, HLE calls, a 40 KiB temporary) ran on the game's back-to-back 16/64 KiB fiber stacks and overflowed into a neighbour | every crash's RSP was within 3 KiB of a fiber stack top; painted stacks; fix: emulator-owned fiber stacks with guards |
+| Silent exit, only a WER dump | a recursive helper (one level per range, 866 ranges) exhausted a fiber stack; a no-access guard cannot dispatch on an exhausted stack | PAGE_GUARD guards + an overflow reporter; make the helper iterative |
+| Job-worker crash 1-2 ms after a readback wrote back GPU data | Windows partial unmap = whole view unmapped + parts remapped: windows where trackers' protection or the map entry were missing | crash report listing recent write-backs onto pages the registers point at |
+| Null-child crashes in scene traversals | the game's own race, exposed by different timing | write-back ring, mappings and allocator ruled out the emulator; teleport tours reproduced it in 1-3 min |
+| Stale ranges after guest unmap | caches/records read an unmapped tail | per-16 KiB-granule unmap epochs (a "last N unmaps" epoch invalidated too much) |
+| Frozen or detached models ("out-of-body") | lost write protection after partial unmap/remap: guest writes untracked | protection restored under the lock for watched runs |
+| Missing or floating geometry | per-draw data read at the wrong index (START_INST_LOC ignored; a cache key without the start-instance SGPR) | see "Missing or floating geometry" |
+| Black world / flicker after a fast path | reads before a pending CP copy; skipped publication epochs; a fast path bypassing the normal binder | slot-hash diff of the same segment fast vs normal; screenshots (verify modes miss these) |
+| Device lost | kept descriptor sets holding destroyed buffers (handles recycled as addresses); a barrier recorded before Begin; BDA residency skipped for pointer loads; buffer freed while a download waited only on the last write | validation layer with errors printed and packet caller tags; VK_EXT_device_fault addresses vs live/destroyed BDA buffers; "in use" errors after a loss are symptoms |
+| Dirty/wrong textures | GPU BC compressors write blocks through uint views kept as separate images | decode the textures; ground truth from the game's own thumbnails |
+| Default "?" models | file ids = path hash (13 collisions in 250K paths) | engine log hook printed the failed resource |
+| Exit on garbage descriptors while loading | invalid DCC metadata, unknown formats, T# outside guest memory, SRT address -1 | bind null / read zero instead of exiting |
+| Hang in the crash reporter, lock recursion | reporter blocked behind a blocking read; re-acquiring a shared lock behind a waiting writer | external stack dump of all threads of the hung process |
+| Emulator silently loses temp-file writes | a Low integrity label inherited from a sandboxed tool | icacls on the exe and folders |
+| Guest locals corrupted after a host-handled fault | Windows exception dispatch writes below RSP into the guest's SysV red zone | patch guest code at load |
+| Wrong data recurring with a fixed period (~2 s) | slots reused across queues without ownership | suspect reuse whenever the error is periodic |
+| Caches never hit across runs | nondeterministic ids or keys (hash/pointer order) | diff the modules of two runs |
+| Random host crashes; the compiler crashes too | unstable CPU cores (two P-cores here, disabled in BIOS) | crashes clustered on those cores; pin work away to test |
 
 ## Crash triage
 
 1. Crash report must include: faulting thread name, guest registers, code bytes around pc, stack
    words, the host frames (Windows: RtlLookupFunctionEntry/RtlVirtualUnwind from the fault context;
-   the walk stops at guest code) and the fault page's state/protection (reserved vs committed tells
-   "unmapped since" bugs apart).
-2. Symbolize host frames with the linker map of that exact build.
-3. Classify: host access violation on guest memory (stale range after unmap, missing protection),
-   guest fault on a red-zone access (Windows exception dispatch), lock/queue deadlock (dump all thread
-   stacks of the hung process), driver crash (reduce to the shader/pipeline).
-4. Reproduce with the save + route that triggered it before claiming a fix.
+   the walk stops at guest code), the fault page's state/protection (reserved vs committed tells
+   "unmapped since" bugs apart), 24 words around each register pointer, the recent GPU write-backs onto those pages,
+   and how close RSP is to a fiber/thread stack top.
+2. Symbolize host frames with the linker map of that exact build (fixed base: RVA = address - base; offline,
+   llvm-symbolizer needs the exe and PDB copied under their original names).
+3. Classify with the table above: host access violation on guest memory, stack overflow, guest fault on a red-zone
+   access (Windows exception dispatch), a game race, lock/queue deadlock (dump all thread stacks), driver/device loss
+   (reduce to the shader/pipeline).
+4. Reproduce with the save + route (teleport tour) that triggered it before claiming a fix; then soak.
+5. Keep a crash census: grep every run log for the crash marker after each tour; crashes outrank fps.

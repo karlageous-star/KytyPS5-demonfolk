@@ -218,7 +218,7 @@ uint32_t EmitFMinMax3(EmitterState& state, uint32_t a, uint32_t b, uint32_t c, b
 }
 
 uint32_t EmitFMed3(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
-	if (NativeFMinMax()) {
+	if (state.program.native_float_min_max && NativeFMinMax()) {
 		// max(min(a, b), min(max(a, b), c)): the median of ordered values (the driver's v_med3_f32 pattern).
 		const auto low  = EmitMinMaxF32Value(state, a, b, false);
 		const auto high = EmitMinMaxF32Value(state, EmitMinMaxF32Value(state, a, b, true), c, false);

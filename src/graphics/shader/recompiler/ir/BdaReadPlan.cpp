@@ -192,8 +192,8 @@ bool EvaluateBdaReadPlan(const BdaReadPlan& plan, const ResourceSnapshot& snapsh
                          std::vector<GuestRange>& output) {
 	if (!plan.complete || plan.spans.empty() || plan.spans.size() > BdaReadPlan::Capacity)
 		return false;
-	// Pure, non-recursive evaluation: retain this thread's bounded scratch
-	// capacity instead of allocating it on every draw/dispatch.
+	// Pure, non-recursive evaluation: reuse this thread's bounded scratch capacity instead of allocating it on every
+	// draw or dispatch; a dispatch's or table draw's reads are evaluated at every use.
 	thread_local std::vector<GuestRange> ranges;
 	ranges.clear();
 	const auto word = [&](BdaReadWord source, uint32_t& value) {

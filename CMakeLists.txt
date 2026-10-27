@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.12...4.3)
+cmake_minimum_required(VERSION 3.18...4.3)
 
 if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
 	set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "Minimum policy version for bundled dependencies")
@@ -134,8 +134,6 @@ endif()
 project(Kyty${KYTY_PROJECT_NAME}${CMAKE_BUILD_TYPE}${KYTY_COMPILER} VERSION 0.3.0)
 
 include_directories(
-	${KYTY_THIRD_PARTY_DIR}/gtest/include
-	${KYTY_THIRD_PARTY_DIR}/gtest
 	${KYTY_THIRD_PARTY_DIR}/fmt/include
 	${KYTY_THIRD_PARTY_DIR}/magic_enum/include/magic_enum
 	${PROJECT_BINARY_DIR}
@@ -180,6 +178,14 @@ endif()
 
 option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 
+# A build for the Steam Deck (tools/local/deck/build-deck.sh: -march=znver2, Linux): KYTY_STEAM_DECK=1 in the code
+# selects its defaults and code paths: four Zen 2 cores, an RDNA 2 GPU of 8 compute units, 16 GB of memory the two
+# share.
+option(KYTY_STEAM_DECK "Build for the Steam Deck" OFF)
+if(KYTY_STEAM_DECK)
+	add_compile_definitions(KYTY_STEAM_DECK=1)
+endif()
+
 config_compiler_and_linker()
 
 if(KYTY_CLANG_CL)
@@ -213,6 +219,18 @@ if(KYTY_CLANG_CL)
 		add_compile_options(-fprofile-instr-generate)
 		add_compile_definitions(KYTY_PGO_GENERATE=1)
 		link_libraries("${kyty_profile_runtime}")
+	elseif(KYTY_PGO_USE)
+		add_compile_options("-fprofile-instr-use=${KYTY_PGO_USE}" -Wno-profile-instr-unprofiled
+		                    -Wno-profile-instr-out-of-date -Wno-backend-plugin)
+	endif()
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+	# Linux: the same PGO switches. The profile must be made on Linux (tools/pgo is clang-cl's).
+	option(KYTY_PGO_GENERATE "Instrumented build; the live command `pgo <file>` writes the profile" OFF)
+	set(KYTY_PGO_USE "" CACHE FILEPATH "llvm-profdata output to optimize with (empty: none)")
+	if(KYTY_PGO_GENERATE)
+		add_compile_options(-fprofile-instr-generate)
+		add_link_options(-fprofile-instr-generate)
+		add_compile_definitions(KYTY_PGO_GENERATE=1)
 	elseif(KYTY_PGO_USE)
 		add_compile_options("-fprofile-instr-use=${KYTY_PGO_USE}" -Wno-profile-instr-unprofiled
 		                    -Wno-profile-instr-out-of-date -Wno-backend-plugin)
@@ -273,63 +291,61 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 find_program(KYTY_GLSLANG_VALIDATOR glslangValidator REQUIRED)
 set(gpu_tiler_shader_dir "${KYTY_SOURCE_DIR}/graphics/host_gpu/shaders")
 set(gpu_tiler_generated_dir "${PROJECT_BINARY_DIR}/gpu_tiler_shaders")
-set(gpu_tiler_shader_names
-	standard256
-	standard4
-	standard4_3d
-	standard64
-	standard64_3d
-	prt
-	prt_3d
-	render_target
-	depth
-	promote_d16
-	demote_d16
-	swap_bgra16
-)
 file(GLOB gpu_tiler_shader_includes CONFIGURE_DEPENDS "${gpu_tiler_shader_dir}/gpu_tiler_*.inc")
-foreach(shader_name IN LISTS gpu_tiler_shader_names)
-	set(shader_source "${gpu_tiler_shader_dir}/gpu_tiler_${shader_name}.comp")
-	set(shader_spv "${gpu_tiler_generated_dir}/gpu_tiler_${shader_name}.spv")
-	set(shader_header "${gpu_tiler_generated_dir}/gpu_tiler_${shader_name}_spv.h")
-	string(TOUPPER "GPU_TILER_${shader_name}_SPV" shader_symbol)
+# A SPIR-V module of gpu_tiler_<source>.comp compiled with the defines that follow, embedded as GPU_TILER_<NAME>_SPV.
+function(kyty_gpu_tiler_shader name source)
+	set(shader_source "${gpu_tiler_shader_dir}/gpu_tiler_${source}.comp")
+	set(shader_spv "${gpu_tiler_generated_dir}/gpu_tiler_${name}.spv")
+	set(shader_header "${gpu_tiler_generated_dir}/gpu_tiler_${name}_spv.h")
+	string(TOUPPER "GPU_TILER_${name}_SPV" shader_symbol)
 	add_custom_command(
 		OUTPUT "${shader_header}"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
-		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os ${ARGN}
 		        "-I${gpu_tiler_shader_dir}" -o "${shader_spv}" "${shader_source}"
 		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
 		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
 		DEPENDS "${shader_source}" ${gpu_tiler_shader_includes}
 		VERBATIM
 	)
-	list(APPEND gpu_tiler_shader_headers "${shader_header}")
-endforeach()
-# The 3D families are also built with the element size fixed at compile time. The AMD Windows
-# driver crashed compiling the specialization-constant form (standard64_3d, 8-byte elements;
-# Demon's Souls); the fixed forms give it plain constant code. The 2D PRT family too: its
-# vector select on the specialization constant (OpSpecConstantOp Select, v4uint) produced wrong
-# addresses on Mesa lavapipe (GpuTilerCpuParity, all element sizes).
-foreach(shader_name IN ITEMS standard4_3d standard64_3d prt_3d prt)
-	foreach(element_bytes IN ITEMS 1 2 4 8 16)
-		set(shader_source "${gpu_tiler_shader_dir}/gpu_tiler_${shader_name}.comp")
-		set(shader_spv "${gpu_tiler_generated_dir}/gpu_tiler_${shader_name}_e${element_bytes}.spv")
-		set(shader_header "${gpu_tiler_generated_dir}/gpu_tiler_${shader_name}_e${element_bytes}_spv.h")
-		string(TOUPPER "GPU_TILER_${shader_name}_E${element_bytes}_SPV" shader_symbol)
-		add_custom_command(
-			OUTPUT "${shader_header}"
-			COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
-			COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
-			        "-DFIXED_ELEMENT_BYTES=${element_bytes}u" "-I${gpu_tiler_shader_dir}"
-			        -o "${shader_spv}" "${shader_source}"
-			COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
-			        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
-			DEPENDS "${shader_source}" ${gpu_tiler_shader_includes}
-			VERBATIM
-		)
-		list(APPEND gpu_tiler_shader_headers "${shader_header}")
+	set(gpu_tiler_shader_headers ${gpu_tiler_shader_headers} "${shader_header}" PARENT_SCOPE)
+endfunction()
+# The tile/detile modules: one per direction, block family (TileBlockFamily's order) and element size, listed in
+# gpu_tiler_variants.h in TileManager's pipeline slot order. Constants, not specialization constants (issue #43).
+set(gpu_tiler_families standard256 standard4 standard4_3d standard64 standard64_3d prt prt_3d render_target depth)
+set(gpu_tiler_variant_includes "")
+set(gpu_tiler_variant_entries "")
+foreach(tile 0 1)
+	foreach(family IN LISTS gpu_tiler_families)
+		foreach(element 1 2 4 8 16)
+			set(variant "${family}_e${element}_t${tile}")
+			kyty_gpu_tiler_shader(${variant} ${family} -DTILER_ELEMENT_BYTES=${element}u -DTILER_TILE=${tile}u)
+			string(TOUPPER "GPU_TILER_${variant}_SPV" variant_symbol)
+			string(APPEND gpu_tiler_variant_includes "#include \"gpu_tiler_shaders/gpu_tiler_${variant}_spv.h\"\n")
+			string(APPEND gpu_tiler_variant_entries "\t{${variant_symbol}, std::size(${variant_symbol})},\n")
+		endforeach()
 	endforeach()
 endforeach()
+file(MAKE_DIRECTORY "${gpu_tiler_generated_dir}")
+file(CONFIGURE OUTPUT "${gpu_tiler_generated_dir}/gpu_tiler_variants.h" @ONLY CONTENT
+"#pragma once
+// Generated by CMakeLists.txt: the tiler's modules in TileManager's pipeline slot order.
+#include <cstddef>
+#include <cstdint>
+#include <iterator>
+${gpu_tiler_variant_includes}
+struct GpuTilerModule {
+	const uint32_t* code;
+	size_t          words;
+};
+inline constexpr GpuTilerModule GPU_TILER_VARIANTS[] = {
+${gpu_tiler_variant_entries}};
+")
+kyty_gpu_tiler_shader(promote_d16_to_d24 promote_d16 -DTILER_D32=0u)
+kyty_gpu_tiler_shader(promote_d16_to_d32 promote_d16 -DTILER_D32=1u)
+kyty_gpu_tiler_shader(demote_d24_to_d16 demote_d16 -DTILER_D32=0u)
+kyty_gpu_tiler_shader(demote_d32_to_d16 demote_d16 -DTILER_D32=1u)
+kyty_gpu_tiler_shader(swap_bgra16 swap_bgra16)
 
 set(fault_buffer_shader_source "${gpu_tiler_shader_dir}/fault_buffer_process.comp")
 set(fault_buffer_shader_spv "${gpu_tiler_generated_dir}/fault_buffer_process.spv")
@@ -338,7 +354,7 @@ add_custom_command(
 	OUTPUT "${fault_buffer_shader_header}"
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
 	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
-	        -DCACHING_PAGEBITS=14 -DMAX_PAGE_FAULTS=1024
+	        -DCACHING_PAGEBITS=14 -DMAX_PAGE_FAULTS=1024 -DFAULT_WORDS_PER_INVOCATION=16u
 	        -o "${fault_buffer_shader_spv}" "${fault_buffer_shader_source}"
 	COMMAND ${CMAKE_COMMAND} -DINPUT=${fault_buffer_shader_spv} -DOUTPUT=${fault_buffer_shader_header}
 	        -DSYMBOL=FAULT_BUFFER_PROCESS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
@@ -379,11 +395,28 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${copy_batch_header}")
+# The game's exposure on the upscaled image of its super resolution path (renderSuperResolution.cpp).
+set(sr_exposure_source "${KYTY_SOURCE_DIR}/local/sr-exposure.comp")
+set(sr_exposure_spv "${gpu_tiler_generated_dir}/sr_exposure.spv")
+set(sr_exposure_header "${gpu_tiler_generated_dir}/sr_exposure_spv.h")
+add_custom_command(
+	OUTPUT "${sr_exposure_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${sr_exposure_spv}" "${sr_exposure_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${sr_exposure_spv} -DOUTPUT=${sr_exposure_header}
+	        -DSYMBOL=SR_EXPOSURE_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${sr_exposure_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${sr_exposure_header}")
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
 set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
 	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
+	"${gpu_tiler_shader_dir}/gpu_imgui_hdr.frag"
+	"${gpu_tiler_shader_dir}/fsr_hud_mask.frag"
 )
 foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	get_filename_component(shader_name "${shader_source}" NAME_WE)
@@ -411,6 +444,22 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
+	"${KYTY_SOURCE_DIR}/local/frame-gen-hudless.h"
+	"${KYTY_SOURCE_DIR}/local/frame-gen-hudless.cpp"
+	"${KYTY_SOURCE_DIR}/local/screenshot.h"
+	"${KYTY_SOURCE_DIR}/local/screenshot.cpp"
+	"${KYTY_SOURCE_DIR}/local/anti-lag.h"
+	"${KYTY_SOURCE_DIR}/local/anti-lag.cpp"
+	"${KYTY_SOURCE_DIR}/local/fsr-native.h"
+	"${KYTY_SOURCE_DIR}/local/fsr-native.cpp"
+	"${KYTY_SOURCE_DIR}/local/debug-snapshot.h"
+	"${KYTY_SOURCE_DIR}/local/debug-snapshot.cpp"
+	"${KYTY_SOURCE_DIR}/local/perf-overlay.h"
+	"${KYTY_SOURCE_DIR}/local/perf-overlay.cpp"
+	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.h"
+	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.cpp"
+	"${KYTY_SOURCE_DIR}/local/jit-arena.h"
+	"${KYTY_SOURCE_DIR}/local/jit-arena.cpp"
 )
 list(REMOVE_DUPLICATES kyty_emulator_src)
 
@@ -418,7 +467,12 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus libzstd_static)
+# Linux and Windows: AMD FidelityFX FSR 3 built from source (3rdparty/fidelityfx) for KYTY_UPSCALER=fsr
+# (src/local/fsr-native.h); Windows' FSR frame generation loads AMD's runtime instead (frame-gen.cpp).
+if (LINUX OR WIN32)
+	list(APPEND kyty_emulator_link_libraries kyty_fidelityfx)
+endif()
 
 # Linux system libraries required by the static FFmpeg archive.
 if(LINUX)
@@ -468,11 +522,18 @@ function(add_kyty_full_emulator_test target source)
 	add_executable(${target} EXCLUDE_FROM_ALL ${source} ${kyty_emulator_src})
 	target_link_libraries(${target} ${kyty_emulator_link_libraries})
 	target_include_directories(${target} PRIVATE ${inc_headers})
+	# These targets share the emulator's sources: give them its linker too, or ThinLTO objects
+	# fail to resolve on a stock toolchain (GNU ld has no ThinLTO without the LLVM plugin).
+	if(KYTY_LD_OPTIONS)
+		target_link_options(${target} PRIVATE ${KYTY_LD_OPTIONS})
+	endif()
 	if (WIN32)
 		target_link_libraries(${target} iphlpapi)
 	endif()
 	if (KYTY_CLANG_CL)
 		target_link_libraries(${target} onecore)
+		# The threads' stacks as the emulator's (below): the driver compiles pipelines on the calling thread.
+		target_link_options(${target} PRIVATE "/STACK:16777216")
 		add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:${target}>/libwinpthread-1.dll)
 	endif()
 	# The macOS x86_64 guest address space needs its .zerofill segments anchored
@@ -496,12 +557,31 @@ add_kyty_full_emulator_test(xpr_replay_tests "${KYTY_TESTS_DIR}/XprReplayTests.c
 # sources, built like the emulator (the same SPIR-V), with the precompile code of pipelineCache.cpp.
 add_kyty_full_emulator_test(kyty_shader_precompile "${KYTY_SOURCE_DIR}/local/shader-precompile.cpp")
 target_compile_definitions(kyty_shader_precompile PRIVATE KYTY_STATIC_PRECOMPILE=1)
-target_sources(kyty_shader_precompile PRIVATE
-	"${KYTY_SOURCE_DIR}/local/static-seeds.cpp"
-	"${KYTY_SOURCE_DIR}/local/static-seeds.h")
+# --make-seeds: the seed file from the game's files (the port of tools/local/static-precompile/precompile.py
+# seeds); in the precompile program only, the emulator does not read the game's shader bundles.
+target_sources(kyty_shader_precompile PRIVATE "${KYTY_SOURCE_DIR}/local/static-seeds.h"
+	"${KYTY_SOURCE_DIR}/local/static-seeds.cpp")
+# --make-hints and --apply-hints: the specialization hints a release ships (zstd-compressed, as .zar games are).
+target_sources(kyty_shader_precompile PRIVATE "${KYTY_SOURCE_DIR}/local/shader-hints.h"
+	"${KYTY_SOURCE_DIR}/local/shader-hints.cpp")
+target_link_libraries(kyty_shader_precompile libzstd_static)
 if (WIN32)
 	target_link_libraries(kyty_shader_precompile opengl32 setupapi ws2_32)
 endif()
+
+add_executable(lane_local_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LaneLocalTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/cfg/ShaderCFG.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ExportOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ImageOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/MemoryOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ScalarAluOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ShaderDecoder.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/VectorAluOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/translate/LaneLocal.cpp"
+)
+target_link_libraries(lane_local_tests fmt::fmt)
+target_include_directories(lane_local_tests PRIVATE ${inc_headers})
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
@@ -509,6 +589,7 @@ add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/local/jit-arena.cpp"
 )
 target_link_libraries(scalar_provenance_tests fmt::fmt xbyak::xbyak)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
@@ -519,6 +600,12 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
+
+add_executable(archive_file_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ArchiveFileTests.cpp"
+)
+target_link_libraries(archive_file_tests common ZArchive::zarchive)
+target_include_directories(archive_file_tests PRIVATE ${inc_headers})
 
 add_executable(demons_souls_copy_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DemonsSoulsCopyTests.cpp")
@@ -579,6 +666,7 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/local/jit-arena.cpp"
 )
 target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
@@ -616,6 +704,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/local/jit-arena.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/WaterfallDescriptor.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
@@ -643,9 +732,14 @@ target_include_directories(event_queue_lifetime_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(kernel_file_system_tests
 	"${KYTY_TESTS_DIR}/KernelFileSystemTests.cpp")
+add_kyty_full_emulator_test(pad_input_tests "${KYTY_TESTS_DIR}/PadInputTests.cpp")
 add_executable(save_data_capacity_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataCapacityTests.cpp")
 target_include_directories(save_data_capacity_tests PRIVATE ${inc_headers})
+add_executable(save_data_backup_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SaveDataBackupTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/saveDataBackup.cpp")
+target_include_directories(save_data_backup_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(fiber_migration_tests
 	"${KYTY_TESTS_DIR}/FiberMigrationTests.cpp")
 
@@ -718,6 +812,7 @@ if(BUILD_TESTING)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
+	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME demons_souls_copy COMMAND $<TARGET_FILE:demons_souls_copy_tests>)
 	add_test(NAME demons_souls_idle COMMAND $<TARGET_FILE:demons_souls_idle_tests>)
 	add_test(NAME demons_souls_collision_guard COMMAND $<TARGET_FILE:demons_souls_collision_guard_tests>)
@@ -729,7 +824,9 @@ if(BUILD_TESTING)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
+	add_test(NAME pad_input COMMAND $<TARGET_FILE:pad_input_tests>)
 	add_test(NAME save_data_capacity COMMAND $<TARGET_FILE:save_data_capacity_tests>)
+	add_test(NAME save_data_backup COMMAND $<TARGET_FILE:save_data_backup_tests>)
 	add_test(NAME fiber_migration COMMAND $<TARGET_FILE:fiber_migration_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
@@ -796,6 +893,7 @@ if(BUILD_TESTING)
 		image_page_table_tests
 		memory_tracker_tests
 		page_manager_tests
+		archive_file_tests
 		demons_souls_copy_tests
 		demons_souls_idle_tests
 		demons_souls_collision_guard_tests
@@ -808,8 +906,10 @@ if(BUILD_TESTING)
 		resource_tracking_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
+		pad_input_tests
 		fiber_migration_tests
 		save_data_capacity_tests
+		save_data_backup_tests
 		sync_on_address_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
@@ -820,6 +920,46 @@ endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)
+
+# Windows: the programs' version information (src/kyty.rc.in; a program without any looked more like a trojan to
+# antivirus programs' machine learning, issue #135).
+if(WIN32)
+	string(REPLACE "." "," KYTY_RC_VERSION_COMMAS "${KYTY_VERSION}.0")
+	foreach(program kyty_emulator kyty_shader_precompile)
+		if(TARGET ${program})
+			# (The precompile program runs as the emulator, a link named kyty_emulator.exe - precompile-windows.ps1: AMD's
+			# driver keys its pipelines by the program's name -, so it is named the same here too.)
+			set(KYTY_RC_NAME kyty_emulator)
+			if(program STREQUAL "kyty_emulator")
+				set(KYTY_RC_DESCRIPTION "KytyPS5 PS5 emulator")
+			else()
+				set(KYTY_RC_DESCRIPTION "KytyPS5 shader precompile")
+			endif()
+			configure_file("${KYTY_SOURCE_DIR}/kyty.rc.in" "${PROJECT_BINARY_DIR}/${program}.rc" @ONLY)
+			target_sources(${program} PRIVATE "${PROJECT_BINARY_DIR}/${program}.rc")
+		endif()
+	endforeach()
+endif()
+
+if(LINUX)
+	set_property(SOURCE
+		"${KYTY_SOURCE_DIR}/graphics/guest_gpu/graphicsRun.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandScheduler.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/textureCache.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/image/tiler.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+		"${KYTY_SOURCE_DIR}/local/jit-arena.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/shader/shader.cpp"
+		"${KYTY_SOURCE_DIR}/loader/redZonePatcher.cpp"
+		"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
+		"${KYTY_SOURCE_DIR}/local/static-seeds.cpp"
+		"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"
+		"${KYTY_SOURCE_DIR}/libs/libKernel.cpp"
+		"${KYTY_SOURCE_DIR}/kernel/syncOnAddress.cpp"
+		APPEND PROPERTY COMPILE_OPTIONS -fexceptions)
+endif()
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
 if (WIN32)
@@ -838,8 +978,8 @@ endif()
 target_link_libraries(kyty_emulator ${CMAKE_DL_LIBS})
 target_include_directories(kyty_emulator PRIVATE ${inc_headers})
 
-# Local frame generation experiments (src/local/frame-gen.cpp): the NVIDIA Streamline SDK when it
-# was unpacked under _Build/deps (never part of the repository). Its DLLs are loaded at run time.
+# Frame generation (src/local/frame-gen.cpp): the NVIDIA Streamline SDK when it was unpacked under _Build/deps
+# (never part of the repository). Its DLLs are loaded at run time.
 if (WIN32)
 	set(KYTY_STREAMLINE_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/streamline/sdk" CACHE PATH
 	    "NVIDIA Streamline SDK for KYTY_FRAMEGEN (local only)")
@@ -849,6 +989,22 @@ if (WIN32)
 		set_property(SOURCE "${KYTY_SOURCE_DIR}/local/frame-gen.cpp" APPEND PROPERTY
 		             COMPILE_DEFINITIONS KYTY_FRAMEGEN_STREAMLINE=1)
 	endif()
+	# KYTY_FRAMEGEN_BACKEND=fsr: AMD FidelityFX SDK 1.1.4's API headers (ffx-api/include, MIT) when unpacked under
+	# _Build/deps/fidelityfx; its runtime (amd_fidelityfx_vk.dll, signed by AMD) goes next to the emulator.
+	set(KYTY_FIDELITYFX_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/fidelityfx" CACHE PATH
+	    "AMD FidelityFX SDK (ffx-api) for KYTY_FRAMEGEN_BACKEND=fsr")
+	if (EXISTS "${KYTY_FIDELITYFX_SDK}/include/ffx_api/ffx_api.h")
+		set_property(SOURCE "${KYTY_SOURCE_DIR}/local/frame-gen.cpp" APPEND PROPERTY
+		             INCLUDE_DIRECTORIES "${KYTY_FIDELITYFX_SDK}/include")
+		set_property(SOURCE "${KYTY_SOURCE_DIR}/local/frame-gen.cpp" APPEND PROPERTY
+		             COMPILE_DEFINITIONS KYTY_FRAMEGEN_FSR=1)
+	endif()
+elseif (LINUX)
+	# Linux has no Streamline: DLSS (KYTY_UPSCALER=dlss) through NVIDIA's NGX, by the bridge libkyty_dlss.so that
+	# tools/local/dlss-bridge/build-dlss-linux.sh builds apart; loaded at run time (dlopen), the emulator links no NVIDIA
+	# code.
+	set_property(SOURCE "${KYTY_SOURCE_DIR}/local/frame-gen.cpp" APPEND PROPERTY
+	             COMPILE_DEFINITIONS KYTY_FRAMEGEN_NGX=1)
 endif()
 
 clang_tidy_check(kyty_emulator "" "${check_headers}" "${inc_headers}")
@@ -861,7 +1017,12 @@ set(KYTY_EMULATOR_MAP_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/${KYTY_EMULATOR_MAP
 set(KYTY_EMULATOR_PDB_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/kyty_emulator.pdb")
 
 if(KYTY_CLANG_CL)
+	# /STACK: 16 MiB reserved for each thread that does not ask for a size (committed only as it is used), not
+	# Windows' 1 MiB. The driver compiles a pipeline on the thread that creates it: NVIDIA 566.07's compiler ran a
+	# wave64 compute shader's cooperative halves (9935d547) past 1 MiB (STATUS_STACK_OVERFLOW in nvoglv64.dll, a
+	# precompile shard on an RTX 3080 Laptop) and through it at 16 MiB.
 	target_link_options(kyty_emulator PRIVATE
+		"/STACK:16777216"
 		"/DYNAMICBASE:NO"
 		"/DEBUG:FULL"
 		"/PDB:${KYTY_EMULATOR_PDB_LINK_PATH}"
@@ -887,8 +1048,7 @@ endif()
 install(TARGETS kyty_emulator DESTINATION .)
 
 # x86_64 Linux and Windows: the Vulkan recording worker (KYTY_VULKAN_RECORDING, with the
-# native XPR draws built on it) and the native resource preparation tests (the
-# ahead-of-time SRT library is loaded with dlopen on Linux, LoadLibrary on Windows).
+# native XPR draws built on it) and the native resource preparation tests.
 if((LINUX OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 	find_package(Python3 REQUIRED COMPONENTS Interpreter)
 	set(recording_generated "${CMAKE_CURRENT_BINARY_DIR}/local-vulkan-recording.inc")
@@ -900,7 +1060,8 @@ if((LINUX OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 			"${recording_generated}"
 		DEPENDS "${recording_generator}" "${vulkan_registry}" "${vulkan_hpp}"
 		VERBATIM)
-	foreach(recording_target kyty_emulator kyty_shader_precompile shader_recompiler_compute_tests xpr_replay_tests)
+	foreach(recording_target kyty_emulator kyty_shader_precompile shader_recompiler_compute_tests xpr_replay_tests
+			virtual_memory_allocation_tests pad_input_tests)
 		target_sources(${recording_target} PRIVATE
 			"${KYTY_SOURCE_DIR}/local/vulkan-recording.cpp" "${recording_generated}")
 		target_include_directories(${recording_target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
@@ -913,10 +1074,9 @@ if((LINUX OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 	target_link_libraries(vulkan_recording_tests PRIVATE Threads::Threads Vulkan::Headers)
 
 	foreach(native_resource_target kyty_emulator kyty_shader_precompile shader_recompiler_compute_tests shader_cfg_tests
-			resource_tracking_tests resource_materialization_tests)
+			resource_tracking_tests resource_materialization_tests virtual_memory_allocation_tests pad_input_tests)
 		target_sources(${native_resource_target} PRIVATE "${lod_stats_pack_header}")
 		target_compile_definitions(${native_resource_target} PRIVATE KYTY_LOCAL_NATIVE_RESOURCES=1)
-		target_link_libraries(${native_resource_target} ${CMAKE_DL_LIBS})
 	endforeach()
 	if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_LINKER MATCHES "ld.lld$")
 		# Clang otherwise selected GNU ld/LLVMgold despite CMAKE_LINKER, which
@@ -952,6 +1112,14 @@ endif()
 
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
+endif()
+# The Linux settings window (launcher-linux/): SDL2 and Dear ImGui, linked statically; build-linux.sh builds it with the
+# emulator and the Linux package carries it.
+if(LINUX)
+	option(KYTY_BUILD_LINUX_LAUNCHER "Build the Linux settings window (launcher-linux)" ON)
+	if(KYTY_BUILD_LINUX_LAUNCHER)
+		add_subdirectory(launcher-linux)
+	endif()
 endif()
 if(KYTY_CLANG_CL)
 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)

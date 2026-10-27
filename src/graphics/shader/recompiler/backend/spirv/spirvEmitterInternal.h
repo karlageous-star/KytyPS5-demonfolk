@@ -325,6 +325,8 @@ enum : uint32_t {
 	GlslUnpackHalf2x16  = 62,
 	GlslFindILsb        = 73,
 	GlslFindUMsb        = 75,
+	GlslNMin            = 79,
+	GlslNMax            = 80,
 };
 
 struct InputBinding {
@@ -409,6 +411,7 @@ struct EmitterState {
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> table_lengths {};
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> table_strides {};
 	bool table_guarded = false; // a table mode subword store inside its bounds check (StoreSubwordInBounds)
+	uint32_t table_block = 0;   // the block's device address (EmitTableBlockLoad)
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -421,6 +424,10 @@ struct EmitterState {
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
+	// Cooperative halves (IR::Program::lane_cooperative): the lanes' exchange slots (two phases of 128 words,
+	// workgroup memory) and the phase an invocation is at (private).
+	uint32_t                                         wave_exchange_variable  = 0;
+	uint32_t                                         wave_phase_variable     = 0;
 	uint32_t                                         compact_lds_dwords      = 0;
 	std::unordered_map<const IR::Inst*, uint32_t>      function_lds_slots;
 	std::unordered_map<uint32_t, uint32_t>             function_lds_index_slots;
@@ -704,6 +711,8 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 
 void EmitMemoryOffsets(EmitterState& state);
 void EmitTableMode(ValueEmitContext& ctx);
+// Table mode: the block's dword `index` (an id: an indirect image's key mapping), by its device address.
+uint32_t EmitTableBlockLoad(EmitterState& state, uint32_t index);
 
 // The buffer word (IR::BufferWord) of a buffer access's resource, loaded at function entry.
 uint32_t RuntimeBufferWord(const EmitterState& state, const IR::MemoryInfo& mem);

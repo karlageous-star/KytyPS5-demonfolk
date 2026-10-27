@@ -192,6 +192,12 @@ bool ReadLinearTestMemorySpan(void *userdata, uint64_t address, uint32_t *values
   return true;
 }
 
+uint64_t LinearTestMappingEnd(void *userdata, uint64_t address) {
+  const auto *memory = static_cast<const LinearTestMemory *>(userdata);
+  const auto end = memory->base + memory->words.size() * sizeof(uint32_t);
+  return address >= memory->base && address < end ? end : 0;
+}
+
 std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
                          bool memory_backed_material = false,
@@ -2002,9 +2008,14 @@ void TestReadLaneProbeIndirectImage(bool first_lane = false, bool loop_mask = fa
   Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
         "address probe table did not materialize");
   if (spans) {
-    // The records' keys read a span at a time: what word by word reads give.
-    auto span_runtime = runtime;
-    span_runtime.try_read_memory_span = ReadLinearTestMemorySpan;
+	// The records' keys read a span at a time; a stale key past the table's mapping is a null candidate without reading
+	// its entry. Both paths must match the word-by-word result.
+	memory_image.words[(0xc00u + 31u * 144u) / 4u] = 0x12345u;
+	Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+	      "address probe table with a stale key did not materialize");
+	auto span_runtime = runtime;
+	span_runtime.try_read_memory_span = ReadLinearTestMemorySpan;
+	span_runtime.mapping_end = LinearTestMappingEnd;
     ResourceSnapshot span_snapshot;
     ResourceSpecialization span_specialization;
     Check(MaterializeResources(resource_plan, span_runtime, span_snapshot,
@@ -2017,6 +2028,20 @@ void TestReadLaneProbeIndirectImage(bool first_lane = false, bool loop_mask = fa
       Check(span_snapshot.images[i].dwords == snapshot.images[i].dwords,
             "address probe span reads found other candidates");
     }
+	// A refused T# span (one word of key 1's T# unreadable) falls back to reads by key: the same candidates.
+    memory_image.fail_address = memory_image.base + 0x20e0u + 32u + 4u;
+    {
+      ResourceSnapshot word_table, span_table;
+      ResourceSpecialization word_table_specialization, span_table_specialization;
+      const bool word_ok = MaterializeResources(resource_plan, runtime, word_table,
+                                                word_table_specialization);
+      const bool span_ok = MaterializeResources(resource_plan, span_runtime, span_table,
+                                                span_table_specialization);
+      Check(word_ok == span_ok &&
+                (!word_ok || (word_table.flattened_srt == span_table.flattened_srt &&
+                              word_table_specialization == span_table_specialization)),
+		          "address probe T# span reads differ where a T# is unreadable");
+	}
     // A refused span (one record's key unreadable) falls back to word reads: the same outcome as word reads.
     memory_image.fail_address = memory_image.base + 0xc00u + 7u * 144u;
     ResourceSnapshot word_failed, span_failed;
@@ -3535,10 +3560,7 @@ void TestLinearSrtReads() {
 
 int main(int argc, char** argv) {
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
-  // The same cases through the compiled SRT paths.
-  if (const char* mode = std::getenv("KYTY_SRT_NATIVE")) {
-    kyty_local_srt_native_mode.store(std::strtoul(mode, nullptr, 10));
-  }
+  // KYTY_SRT_PREDICATES: the same cases with or without the compiled SRT predicates.
   if (const char* mode = std::getenv("KYTY_SRT_PREDICATES")) {
     kyty_local_srt_predicate_mode.store(std::strtoul(mode, nullptr, 10));
   }

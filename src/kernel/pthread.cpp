@@ -36,6 +36,8 @@
 #if defined(_M_X64) || defined(__x86_64__)
 #include <intrin.h>
 #endif
+#include <cstdarg>
+#include <cstdio>
 #include <windows.h>
 #endif
 
@@ -91,6 +93,9 @@ constexpr size_t   PTHREAD_STACK_INITIAL   = 0x200000;
 constexpr size_t   PTHREAD_STACK_EXTRA     = 0x100000;
 constexpr uint64_t PTHREAD_STACK_TOP       = 0x7efff8000ull;
 constexpr uint64_t PTHREAD_STACK_BOTTOM    = 0x0000040000ull;
+// (The TEB's stack range on guest stacks, KYTY_GUEST_TEB_STACK_RANGE_ASM, which spells the numbers out.)
+static_assert(PTHREAD_STACK_TOP == Common::HostException::GuestStacksHigh &&
+              PTHREAD_STACK_BOTTOM == Common::HostException::GuestStacksLow);
 constexpr uint32_t SIGNAL_APC_POLL_MICROS  = 10000;
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -773,6 +778,160 @@ static size_t RoundStackSize(size_t size) {
 	return ((size + PTHREAD_STACK_PAGE - 1) / PTHREAD_STACK_PAGE) * PTHREAD_STACK_PAGE;
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// A guest stack's guard is made of guard pages on the host (the guest still sees no access). An overflow's first touch
+// raises a guard-page violation that GuestStackOverflow reports, with the return addresses on the stack, before it
+// ends the process. With plain no-access pages Windows could not dispatch the access violation on the exhausted stack
+// and the process ended with no report (twice in the Nexus, 10-12). The report's own frames may reach the guard's
+// lower pages: those touches are let through (the page is accessible once touched).
+static char   g_overflow_text[32768];
+static size_t g_overflow_at = 0;
+
+[[gnu::format(printf, 1, 2)]] static void OverflowAdd(const char* format, ...) {
+	if (g_overflow_at + 1 >= sizeof(g_overflow_text)) return;
+	va_list args;
+	va_start(args, format);
+	const int n = std::vsnprintf(g_overflow_text + g_overflow_at, sizeof(g_overflow_text) - g_overflow_at, format, args);
+	va_end(args);
+	if (n > 0) g_overflow_at = std::min(sizeof(g_overflow_text) - 1, g_overflow_at + static_cast<size_t>(n));
+}
+
+struct OverflowModule {
+	const char* name;
+	uint64_t    begin, end;
+};
+static OverflowModule g_overflow_modules[2] {{"exe", 0, 0}, {"ntdll", 0, 0}};
+
+static void OverflowAddress(uint64_t value) {
+	for (const auto& module: g_overflow_modules)
+		if (value >= module.begin && value < module.end) return OverflowAdd(" %s+0x%llx", module.name, static_cast<unsigned long long>(value - module.begin));
+	OverflowAdd(" 0x%llx", static_cast<unsigned long long>(value));
+}
+
+static bool IsOverflowCode(uint64_t value) {
+	for (const auto& module: g_overflow_modules)
+		if (value >= module.begin && value < module.end) return true;
+	// Guest code: executable guest pages (the last region asked for kept).
+	static uint64_t region_begin = 0, region_end = 0;
+	static bool     region_code  = false;
+	if (value < 0x800000000ull || value >= 0x10000000000ull) return false;
+	if (value < region_begin || value >= region_end) {
+		MEMORY_BASIC_INFORMATION region {};
+		if (VirtualQuery(reinterpret_cast<const void*>(value), &region, sizeof(region)) == 0) return false;
+		region_begin = reinterpret_cast<uint64_t>(region.BaseAddress);
+		region_end   = region_begin + region.RegionSize;
+		region_code  = region.State == MEM_COMMIT &&
+		              (region.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+	}
+	return region_code;
+}
+
+static bool GuestStackOverflow(uint64_t address, void* native_context) {
+	if (address < PTHREAD_STACK_BOTTOM || address >= PTHREAD_STACK_TOP || native_context == nullptr) return false;
+	thread_local bool reporting = false;
+	if (reporting) return true;
+	reporting = true;
+	static std::atomic<bool> first {false};
+	if (first.exchange(true)) {
+		for (;;) Sleep(1000); // (another thread reports and ends the process)
+	}
+	const auto* context = static_cast<const CONTEXT*>(native_context);
+	const auto  rsp     = static_cast<uint64_t>(context->Rsp);
+	// The stack: from rsp up to where its pages end (the guard of the stack above).
+	uint64_t                 top = rsp;
+	MEMORY_BASIC_INFORMATION region {};
+	if (VirtualQuery(reinterpret_cast<const void*>(rsp), &region, sizeof(region)) != 0 && region.State == MEM_COMMIT &&
+	    (region.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0)
+		top = std::min(reinterpret_cast<uint64_t>(region.BaseAddress) + region.RegionSize, rsp + (uint64_t {8} << 20u));
+	const auto* self = g_pthread_self;
+	OverflowAdd("GUEST STACK OVERFLOW: thread %lu '%s' touched the stack guard at 0x%llx: rip", GetCurrentThreadId(),
+	            self != nullptr ? self->name.c_str() : "?", static_cast<unsigned long long>(address));
+	OverflowAddress(context->Rip);
+	OverflowAdd(" rsp 0x%llx rbp 0x%llx; stack 0x%llx..0x%llx (%llu KiB)", static_cast<unsigned long long>(rsp),
+	            static_cast<unsigned long long>(context->Rbp), static_cast<unsigned long long>(rsp),
+	            static_cast<unsigned long long>(top), static_cast<unsigned long long>((top - rsp) >> 10u));
+	if (self != nullptr && self->attr != nullptr) {
+		const auto begin = reinterpret_cast<uint64_t>(self->attr->stack_addr);
+		OverflowAdd("; the thread's own stack 0x%llx+0x%llx%s\n", static_cast<unsigned long long>(begin),
+		            static_cast<unsigned long long>(self->attr->stack_size),
+		            rsp >= begin && rsp < begin + self->attr->stack_size ? "" : " (rsp outside: a fiber's stack)");
+	} else {
+		OverflowAdd("\n");
+	}
+	// Code addresses on the stack (return-address candidates): the deepest, the outermost and the most frequent ones.
+	static uint64_t values[8192];
+	static uint32_t counts[8192];
+	static uint64_t outer[32];
+	uint32_t        total = 0, deepest = 0;
+	OverflowAdd("deepest code addresses (from rsp):");
+	for (auto at = rsp; at + 8 <= top; at += 8) {
+		const auto value = *reinterpret_cast<const uint64_t*>(at);
+		if (!IsOverflowCode(value)) continue;
+		if (deepest < 96) {
+			if (deepest % 8 == 0) OverflowAdd("\n  [rsp+0x%llx]", static_cast<unsigned long long>(at - rsp));
+			OverflowAddress(value);
+			++deepest;
+		}
+		outer[total % 32] = value;
+		++total;
+		for (uint32_t slot = static_cast<uint32_t>((value * 0x9E3779B97F4A7C15ull) >> 51u);; slot = (slot + 1) & 8191u) {
+			if (values[slot] == value) {
+				++counts[slot];
+				break;
+			}
+			if (values[slot] == 0) {
+				values[slot] = value;
+				counts[slot] = 1;
+				break;
+			}
+		}
+	}
+	OverflowAdd("\noutermost code addresses (%u in all):", total);
+	for (uint32_t i = total > 32 ? total - 32 : 0; i < total; ++i) OverflowAddress(outer[i % 32]);
+	OverflowAdd("\nmost frequent:");
+	for (int n = 0; n < 32; ++n) {
+		uint32_t best = 0;
+		for (uint32_t slot = 0; slot < 8192; ++slot)
+			if (counts[slot] > counts[best]) best = slot;
+		if (counts[best] < 2) break;
+		OverflowAddress(values[best]);
+		OverflowAdd(" x%u", counts[best]);
+		counts[best] = 0;
+	}
+	OverflowAdd("\n");
+	DWORD written = 0;
+	(void)WriteFile(GetStdHandle(STD_ERROR_HANDLE), g_overflow_text, static_cast<DWORD>(g_overflow_at), &written, nullptr);
+	(void)WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), g_overflow_text, static_cast<DWORD>(g_overflow_at), &written, nullptr);
+	Sleep(1000); // (the standard output's pipe drained to the log)
+	TerminateProcess(GetCurrentProcess(), 0xC00000FDu);
+	return true;
+}
+
+static void ArmGuestStackGuard(uint64_t guard_addr, size_t guard_size) {
+	static const bool installed = [] {
+		const auto module_range = [](const char* name, OverflowModule* module) {
+			const auto* base = reinterpret_cast<const uint8_t*>(GetModuleHandleA(name));
+			if (base == nullptr) return;
+			const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+			module->begin  = reinterpret_cast<uint64_t>(base);
+			module->end    = module->begin + nt->OptionalHeader.SizeOfImage;
+		};
+		module_range(nullptr, &g_overflow_modules[0]);
+		module_range("ntdll.dll", &g_overflow_modules[1]);
+		Common::HostException::SetGuardPageHandler(GuestStackOverflow);
+		return true;
+	}();
+	(void)installed;
+	DWORD old = 0;
+	if (VirtualProtect(reinterpret_cast<void*>(guard_addr), guard_size, PAGE_READWRITE | PAGE_GUARD, &old) == 0) {
+		static std::atomic<uint32_t> failures {0};
+		if (failures.fetch_add(1, std::memory_order_relaxed) == 0)
+			std::printf("guest stack guard at 0x%llx: no guard pages (error %lu), an overflow ends with no report\n",
+			            static_cast<unsigned long long>(guard_addr), GetLastError());
+	}
+}
+#endif
+
 // Maps stack_size bytes of guest stack above a guard of guard_size that faults (both rounded up to
 // whole stack pages), reusing a released stack of the same shape. Returns the start of the
 // mapping (the guard), 0 when the stack area is exhausted.
@@ -820,6 +979,9 @@ static uint64_t MapGuestStackWithGuard(size_t stack_size, size_t guard_size) {
 		Memory::KernelMunmap(stack_addr, map_size);
 		return 0;
 	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (guard_size != 0) ArmGuestStackGuard(stack_addr, guard_size);
+#endif
 	return stack_addr;
 }
 
@@ -958,6 +1120,8 @@ bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_addr
 
 static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func, void* stack_top) {
 #if defined(__x86_64__) || defined(_M_X64)
+	// Keeps the prologue before the host RSP snapshot below (PGO shrink-wrapping moved it after).
+	asm volatile("" ::: "rbx", "r12", "r13", "memory");
 	void*      ret = nullptr;
 	const auto aligned_stack_top =
 	    reinterpret_cast<uintptr_t>(stack_top) & ~static_cast<uintptr_t>(0x0f);
@@ -1036,9 +1200,7 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	             "movq %%gs:0x08, %%r14\n\t"
 	             "movq %%gs:0x10, %%r15\n\t"
-	             "xorq %%rcx, %%rcx\n\t"
-	             "movq %%rcx, %%gs:0x08\n\t"
-	             "movq %%rcx, %%gs:0x10\n\t"
+	             KYTY_GUEST_TEB_STACK_RANGE_ASM("10")
 #endif
 	             "movq %%rsp, %%r12\n\t"
 	             "movq %%rbp, %%r13\n\t"
@@ -3505,6 +3667,14 @@ static void CleanupThread(void* arg) {
 /// priority, then runs the guest entry function on the guest stack and cleans up afterwards.
 /// @param arg the Pthread that this host thread runs
 /// @return the value the guest entry function returned
+// KYTY_GUEST_THREAD_LOG=1: report each guest thread's name, stack, CPU mask and priority.
+static bool GuestThreadLog() {
+	static const bool log = [] {
+		const char* value = std::getenv("KYTY_GUEST_THREAD_LOG");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return log;
+}
 static void* RunThread(void* arg) {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
@@ -3527,6 +3697,18 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	// The game's name for the thread on the host's (15 characters on Linux): profiles, top and the Deck's
+	// tools/local/deck/deckprof.py tell its threads apart.
+	if (!thread->name.empty()) (void)pthread_setname_np(pthread_self(), thread->name.substr(0, 15).c_str());
+#endif
+	if (GuestThreadLog())
+		std::printf("GUEST-THREAD start %s (tid %" PRIu64 "): cpumask 0x%llx priority %d policy %d stack 0x%llx+0x%llx %s\n",
+		            thread->name.c_str(), os_thread_id, static_cast<unsigned long long>(thread->attr->affinity),
+		            thread->attr->guest_priority, thread->attr->policy,
+		            static_cast<unsigned long long>(reinterpret_cast<uint64_t>(thread->attr->stack_addr)),
+		            static_cast<unsigned long long>(thread->attr->stack_size),
+		            thread->attr->stack_user ? "(the game's, no guard)" : "(guarded)");
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	// Apply the guest's priority to this thread directly. The attribute carries it as well, but
@@ -3708,6 +3890,8 @@ int KYTY_SYSV_ABI PthreadSetaffinity(Pthread thread, KernelCpumask mask) {
 	}
 
 	auto result = PthreadAttrSetaffinity(&thread->attr, mask);
+	if (GuestThreadLog())
+		std::printf("GUEST-THREAD affinity %s: cpumask 0x%llx\n", thread->name.c_str(), static_cast<unsigned long long>(mask));
 
 	return result;
 }
@@ -3830,6 +4014,8 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 #endif
 
 	thread->attr->guest_priority = prio;
+	if (GuestThreadLog())
+		std::printf("GUEST-THREAD priority %s: %d\n", thread->name.c_str(), prio);
 	LOGF("\t PthreadSetprio: %d, %d\n", thread->unique_id, prio);
 	return OK;
 }

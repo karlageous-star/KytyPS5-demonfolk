@@ -50,6 +50,7 @@ struct ConfigOptions {
 	PresentMode            present_mode                = PresentMode::Fifo;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
+	bool                   hdr_enabled                 = false;
 	uint32_t               vblank_frequency            = 60;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -83,6 +84,7 @@ int32_t  GetUserId();
 PresentMode GetPresentMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
+bool     HdrEnabled();
 uint32_t GetVblankFrequency();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
@@ -104,6 +106,8 @@ inline bool g_graphics_debug_dump_enabled = false;
 inline bool GraphicsDebugDumpEnabled() {
 	return Detail::g_graphics_debug_dump_enabled;
 }
+bool SyncValidationEnabled();
+bool VulkanObjectNamesEnabled();
 
 OutputDirection       GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();

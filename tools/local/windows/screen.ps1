@@ -1,8 +1,9 @@
-param([string]$Out, [double]$Scale = 0.5, [switch]$Client)
+param([string]$Out, [double]$Scale = 0.5, [switch]$Client, [int]$ClientWidth = 640)
 # Focus the emulator window and capture the visible part of the screen (physical pixels),
 # scaled down for reading. Prints the window title (frame and fps counters).
 # -Client: only the emulator window's client area (the game image), scaled to 640x360, so
 # pixel positions do not depend on the display's resolution or where the window is.
+# -ClientWidth: another width for it (the window's aspect; 640: 640x360).
 Add-Type @"
 using System; using System.Runtime.InteropServices;
 public class S { [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
@@ -30,7 +31,7 @@ if ($Client -and $p) {
 	if ([S]::GetClientRect($p.MainWindowHandle, [ref]$rect) -and [S]::ClientToScreen($p.MainWindowHandle, [ref]$origin) -and
 	    $rect.Right -gt 0 -and $rect.Bottom -gt 0) {
 		$x = $origin.X; $y = $origin.Y; $w = $rect.Right; $h = $rect.Bottom
-		$outW = 640; $outH = 360
+		$outW = $ClientWidth; $outH = if ($ClientWidth -eq 640) { 360 } else { [int]($ClientWidth * $h / $w) }
 	}
 }
 Add-Type -AssemblyName System.Drawing

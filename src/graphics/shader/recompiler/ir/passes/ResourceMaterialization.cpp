@@ -22,7 +22,7 @@
 #include <unordered_set>
 
 extern "C" {
-volatile std::atomic<uint32_t> kyty_local_specialization_guard_mode {0};
+volatile std::atomic<uint32_t> kyty_local_specialization_guard_mode {1};
 }
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -579,18 +579,44 @@ bool MaterializeAddressProbeIndirectImage(const DescriptorSource::IndirectImage&
 
 	IndirectImage next;
 	next.keys = keys.Take();
-	// The probed entries are made readable first, one sync per run of adjacent entries (the same bytes as one sync
-	// an entry: consecutive keys are consecutive descriptors), then read. Nothing records GPU work in between.
 	constexpr uint64_t EntryBytes = 8u * sizeof(uint32_t);
 	const auto entry_of = [&](uint32_t key) {
 		return heap_base + indirect.table_offset + (static_cast<uint64_t>(key) << DenseDescriptorShift);
 	};
+	std::vector<DescriptorValue> probed;
+	probed.reserve(next.keys.size());
+	// The T#s of the keys below a bound from one clean read of the table's start (a light table's keys are light
+	// indices: its ~30 T# reads, each with its own GPU-ownership checks, became one), the others one at a time, as all
+	// of them where that read is refused (only then is a T# the GPU wrote synchronized first).
+	constexpr uint32_t SpanKeys = 128; // (4 KiB of T#s: ReadShaderMemorySpan's limit for clean reads)
+	uint32_t           span_keys = 0;
+	for (const auto key: next.keys)
+		if (key < SpanKeys) span_keys = std::max(span_keys, key + 1u);
+	thread_local std::vector<uint32_t> table_span;
+	bool                               spanned = false;
+	if (runtime.try_read_memory_span != nullptr && span_keys > 1u) {
+		const auto first = heap_base + indirect.table_offset;
+		const auto words = span_keys << (DenseDescriptorShift - 2u);
+		if (first <= AddressMask - uint64_t {words} * sizeof(uint32_t)) {
+			table_span.resize(words);
+			spanned = runtime.try_read_memory_span(runtime.userdata, first, table_span.data(), words, true);
+		}
+	}
+	// A stale record's key (records past the light count hold anything: half of a light table's keys, 0xfffffffe and
+	// pointers) names an entry past the mapping the table starts in: not the table's, a null candidate without a read
+	// (each was a clean read attempt of memory far away, ~0.4 us).
+	const auto table_end = runtime.mapping_end != nullptr
+	                           ? runtime.mapping_end(runtime.userdata, heap_base + indirect.table_offset)
+	                           : AddressMask + 1u;
+	// Synchronize only entries not covered by the successful clean span, coalescing adjacent descriptors into one range.
+	// If the bulk read was refused, this preserves the word-read path while avoiding one ownership sync per T#.
 	{
 		thread_local std::vector<uint64_t> entries;
 		entries.clear();
 		for (const auto key: next.keys) {
+			if (spanned && key < span_keys) continue;
 			const auto entry = entry_of(key);
-			if (entry + EntryBytes <= AddressMask) entries.push_back(entry);
+			if (entry + EntryBytes <= std::min(AddressMask, table_end)) entries.push_back(entry);
 		}
 		std::sort(entries.begin(), entries.end());
 		for (size_t i = 0; i < entries.size();) {
@@ -600,14 +626,15 @@ bool MaterializeAddressProbeIndirectImage(const DescriptorSource::IndirectImage&
 			MakeRangeReadable(runtime, begin, end - begin);
 		}
 	}
-	std::vector<DescriptorValue> probed;
-	probed.reserve(next.keys.size());
 	for (const auto key: next.keys) {
 		DescriptorValue candidate;
 		candidate.dword_count = 8u;
 		const auto entry      = entry_of(key);
-		bool readable = entry + candidate.dword_count * sizeof(uint32_t) <= AddressMask;
-		if (readable) {
+		bool readable = entry + candidate.dword_count * sizeof(uint32_t) <= std::min(AddressMask, table_end);
+		if (readable && spanned && key < span_keys) {
+			std::copy_n(table_span.begin() + (static_cast<size_t>(key) << (DenseDescriptorShift - 2u)),
+			            candidate.dword_count, candidate.dwords.begin());
+		} else if (readable) {
 			readable = ReadSpecializationDescriptor(runtime, entry, candidate.dwords);
 		}
 		if (!readable || NullImageDescriptor(candidate) ||
@@ -887,9 +914,53 @@ bool PortableShaders() {
 	return enabled;
 }
 
+bool EnumerateAddressProbe(const DescriptorSource::IndirectImage& probe, const ImageResource& root,
+                           uint64_t records_base, uint64_t heap_base, const SrtRuntime& runtime,
+                           AddressProbeCandidates& result) {
+	DescriptorValue records {.dword_count = 2u}, heap {.dword_count = 2u};
+	records.dwords[0] = static_cast<uint32_t>(records_base);
+	records.dwords[1] = static_cast<uint32_t>(records_base >> 32u);
+	heap.dwords[0]    = static_cast<uint32_t>(heap_base);
+	heap.dwords[1]    = static_cast<uint32_t>(heap_base >> 32u);
+	IndirectImage enumerated;
+	if (!MaterializeAddressProbeIndirectImage(probe, root, records, heap, runtime, enumerated, nullptr)) return false;
+	result.keys        = std::move(enumerated.keys);
+	result.candidates  = std::move(enumerated.candidates);
+	result.descriptors = std::move(enumerated.descriptors);
+	return true;
+}
+
+bool TableIndirectForm(ResourceSpecialization& specialization, std::vector<DescriptorValue>* snapshot_images) {
+	auto&    images = specialization.images;
+	uint32_t root = ImageResource::NoIndirectImage, candidates = 0;
+	for (uint32_t index = 0; index < images.size(); index++) {
+		if (images[index].fmask) return false;
+		if (images[index].indirect_root == index) {
+			if (root != ImageResource::NoIndirectImage) return false;
+			root = index;
+		} else if (images[index].indirect_root != ImageResource::NoIndirectImage) {
+			candidates++;
+		}
+	}
+	if (root == ImageResource::NoIndirectImage) return true;
+	constexpr uint32_t capacity = TablePlan::IndirectCapacity;
+	// (The candidates follow every other image: BuildResourceSpecialization appends them.)
+	if (candidates == 0 || candidates + 1u > capacity || images.size() < candidates + 1u ||
+	    (snapshot_images != nullptr && snapshot_images->size() != images.size()))
+		return false;
+	for (size_t index = images.size() - candidates; index < images.size(); index++)
+		if (images[index].indirect_root != root) return false;
+	const auto candidate = images.back();
+	images.resize(images.size() + (capacity - 1u - candidates), candidate);
+	images[root].indirect_mapping_offset    = 0; // (EnterTableMode names the block's mapping)
+	images[root].indirect_search_iterations = ImageResource::RuntimeIndirectSearch;
+	if (snapshot_images != nullptr) snapshot_images->resize(images.size(), DescriptorValue {.dword_count = 8u});
+	return true;
+}
+
 // A null texture reads zero whatever its type. Bound as a 1x1 image of the type the shader declares
-// (NullTextureDesc), it takes the module of the texture bound other times; without portable
-// modules, and when multisampled, a 2D one.
+// (NullTextureDesc), it takes the module of the texture bound other times; when multisampled, a 2D
+// one.
 static Decoder::ImageDimension NullImageDimension(Decoder::ImageDimension declared) {
 	switch (declared) {
 		case Decoder::ImageDimension::Dim1D:
@@ -1151,9 +1222,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 	next_snapshot.images.reserve(image_count);
 	next_snapshot.flattened_srt.reserve(next_snapshot.flattened_srt.size() + mapping_words);
 	const auto header = static_cast<uint32_t>(next_snapshot.flattened_srt.size());
-	if (portable) {
-		next_snapshot.flattened_srt.resize(header + snapshot.indirect_images.size());
-	}
+	if (portable) next_snapshot.flattened_srt.resize(header + snapshot.indirect_images.size());
 	next_specialization.images.reserve(image_count);
 	for (const auto& image: program.info.images) {
 		next_specialization.images.push_back({
@@ -1778,7 +1847,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	return result;
 }
 
-ResourcePlan ExtractResourcePlan(const Program& program) {
+ResourcePlan ExtractResourcePlan(const Program& program, bool linear) {
 	ResourcePlan plan;
 	plan.stage                      = program.stage;
 	plan.shader_hash                = program.shader_hash;
@@ -1875,7 +1944,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			                   plan.clean_flat_slots);
 		}
 	}
-	BuildLinearSrtPlan(plan);
+	if (linear) BuildLinearSrtPlan(plan);
 	return plan;
 }
 

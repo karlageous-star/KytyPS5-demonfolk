@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <fmt/format.h>
@@ -22,6 +23,18 @@ namespace Libs::Graphics {
 
 uint32_t render_target_mask_slot(uint32_t mask, uint32_t slot) {
 	return (mask >> (slot * 4u)) & 0x0fu;
+}
+
+uint32_t render_target_write_mask_slot(uint32_t target_mask, uint32_t shader_mask, uint32_t slot) {
+	static const bool ignore_shader_mask = [] {
+		const char* value = std::getenv("KYTY_IGNORE_CB_SHADER_MASK");
+		return value != nullptr && value[0] == '1';
+	}();
+	const auto slot_mask = render_target_mask_slot(target_mask, slot);
+	if (ignore_shader_mask || render_target_mask_slot(shader_mask, slot) != 0) {
+		return slot_mask;
+	}
+	return 0;
 }
 
 static bool RenderTargetMaskHasMrt(uint32_t mask) {
@@ -511,14 +524,6 @@ static void BcPrint(const char* func, const HW::BlendControl& c, const HW::Blend
 
 static void BcCheck(const HW::BlendControl& /*c*/, const HW::BlendColor& color,
                     const HW::ColorControl& cc) {
-	// EXIT_NOT_IMPLEMENTED(c.color_srcblend != 0);
-	// EXIT_NOT_IMPLEMENTED(c.color_comb_fcn != 0);
-	// EXIT_NOT_IMPLEMENTED(c.color_destblend != 0);
-	// EXIT_NOT_IMPLEMENTED(c.alpha_srcblend != 0);
-	// EXIT_NOT_IMPLEMENTED(c.alpha_comb_fcn != 0);
-	// EXIT_NOT_IMPLEMENTED(c.alpha_destblend != 0);
-	// EXIT_NOT_IMPLEMENTED(c.separate_alpha_blend != false);
-	// EXIT_NOT_IMPLEMENTED(c.enable != false);
 	if (color.red != 0.0f || color.green != 0.0f || color.blue != 0.0f || color.alpha != 0.0f) {
 		static bool logged = false;
 		if (!logged) {
@@ -581,28 +586,8 @@ static void DPrint(const char* func, const HW::DepthControl& c, const HW::Stenci
 	     sm.stencil_opval_bf);
 }
 
-static void DCheck(const HW::DepthControl& c, const HW::StencilControl& s,
-                   const HW::StencilMask& /*sm*/) {
-	// EXIT_NOT_IMPLEMENTED(c.stencil_enable != false);
-	// EXIT_NOT_IMPLEMENTED(c.z_enable != false);
-	// EXIT_NOT_IMPLEMENTED(c.z_write_enable != false);
-	// EXIT_NOT_IMPLEMENTED(c.zfunc != 0);
-	// Back-face stencil state is handled separately when enabled.
-	// EXIT_NOT_IMPLEMENTED(c.stencilfunc != 0);
-	// EXIT_NOT_IMPLEMENTED(c.stencilfunc_bf != 0);
-	// EXIT_NOT_IMPLEMENTED(s.stencil_fail != 0);
-	// EXIT_NOT_IMPLEMENTED(s.stencil_zpass != 0);
-	// EXIT_NOT_IMPLEMENTED(s.stencil_zfail != 0);
-	// Back-face stencil ops may legitimately differ from the front-face ops.
-	// EXIT_NOT_IMPLEMENTED(sm.stencil_testval != 0);
-	// EXIT_NOT_IMPLEMENTED(sm.stencil_mask != 0);
-	// EXIT_NOT_IMPLEMENTED(sm.stencil_writemask != 0);
-	// EXIT_NOT_IMPLEMENTED(sm.stencil_opval != 0);
-	// EXIT_NOT_IMPLEMENTED(sm.stencil_testval_bf != 0);
-	// EXIT_NOT_IMPLEMENTED(sm.stencil_mask_bf != 0);
-	// EXIT_NOT_IMPLEMENTED(sm.stencil_writemask_bf != 0);
-	// EXIT_NOT_IMPLEMENTED(sm.stencil_opval_bf != 0);
-}
+static void DCheck(const HW::DepthControl& /*c*/, const HW::StencilControl& /*s*/,
+                   const HW::StencilMask& /*sm*/) {}
 
 static void EqaaPrint(const char* func, const HW::EqaaControl& c) {
 	LOGF("%s\n", func);

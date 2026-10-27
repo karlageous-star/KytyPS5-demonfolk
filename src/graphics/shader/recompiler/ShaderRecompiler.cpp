@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -12,6 +13,7 @@
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/LaneBranches.h"
 #include "graphics/shader/recompiler/ir/passes/MaskedSelectForwarding.h"
+#include "graphics/shader/recompiler/ir/passes/ExecSelects.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -112,11 +114,14 @@ void DumpShaderIr(const CompileOptions& options, const IR::Program& ir) {
 	for (size_t i = 0; i < ir.info.images.size(); ++i) {
 		const auto& image = ir.info.images[i];
 		text += fmt::format("image[{}] source={} class={} numeric={} dim={} mips={} read={} written={} "
-		                    "atomic={} depth_compare={} cube={} first_pc=0x{:x}\n",
+		                    "atomic={} depth_compare={} cube={} first_pc=0x{:x} max_layer={}\n",
 		                    i, image.source, static_cast<int>(image.resource_class),
 		                    static_cast<int>(image.numeric_class), static_cast<int>(image.dimension),
 		                    image.mip_count, image.read, image.written, image.atomic,
-		                    image.depth_compare, image.cube, image.first_use_pc);
+		                    image.depth_compare, image.cube, image.first_use_pc,
+		                    image.max_array_index == IR::ImageResource::NoArrayIndexBound
+		                        ? std::string("-")
+		                        : std::to_string(image.max_array_index));
 	}
 	for (size_t i = 0; i < ir.info.buffers.size(); ++i) {
 		const auto& buffer = ir.info.buffers[i];
@@ -603,7 +608,18 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(code.size()));
 
+	// The decoded instructions go in the thread's vector of its last program's, its capacity kept (up to 8 MiB): a new one
+	// of ~0.8 MiB for every program was memory the system had to zero-fill (the shader prefetch's threads: 5 GB a minute).
+	static thread_local std::vector<Decoder::Instruction> t_instructions;
 	Decoder::Program decoded;
+	decoded.instructions = std::move(t_instructions);
+	struct KeepInstructions {
+		Decoder::Program& program;
+		~KeepInstructions() {
+			if (program.instructions.capacity() * sizeof(Decoder::Instruction) <= (size_t {8} << 20u))
+				t_instructions = std::move(program.instructions);
+		}
+	} keep_instructions {decoded};
 	std::vector<uint32_t> joined_code;
 	if (!options.back_code.empty()) {
 		decoded = DecodeFusedProgram(code, options.back_code, joined_code);
@@ -769,6 +785,14 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::ApplyResourceSpecialization(ir, specialization);
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
+	if ((Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureExecSelects) != 0) {
+		const auto selects = IR::EliminateExecSelects(ir.blocks);
+		if (selects.bypassed != 0 || selects.dropped != 0) {
+			LOGF("%s exec selects: bypassed=%" PRIu32 " dropped=%" PRIu32 "\n", GetDumpLabel(options), selects.bypassed,
+			     selects.dropped);
+			IR::EliminateDeadCode(ir.blocks);
+		}
+	}
 	// KYTY_EXEC_SELECT_FORWARD (default 1; 0: off): inside a divergent region every vector register write was a select on
 	// the region's exec value; values only observed where exec holds read the unmasked values instead, leaving one select
 	// per register where the region ends (IR::ForwardMaskedSelects). Demon's Souls' hottest compute shader had 2,359 such
@@ -816,7 +840,12 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	info_options.pixel   = pixel;
 	info_options.compute = compute;
 	IR::CollectShaderInfo(ir, info_options);
-	if (options.table_mode) IR::EnterTableMode(ir);
+	if (options.table_mode) {
+		IR::EnterTableMode(ir);
+		ir.table_slots_at_use = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureTableSlotsAtUse) != 0;
+	}
+	ir.native_float_min_max =
+	    (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureNativeFloatMinMax) != 0;
 	IR::AllocateBindings(ir, push_data_start_dword, options.enable_lod_stats);
 	DumpShaderIr(options, ir);
 	Spirv::AnalyzeProgramRequirements(ir);
@@ -892,6 +921,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		result.ir_dump      = std::move(ir_dump);
 	}
 	return result;
+}
+
+void RecycleSpirv(std::vector<uint32_t>&& spirv) {
+	Spirv::Builder::Recycle(std::move(spirv));
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler
