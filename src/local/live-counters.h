@@ -49,6 +49,9 @@ enum Id : uint32_t {
 	RbRejectImage,         // ... an image overlaps the window
 	RbRejectCapacity,      // ... more than the download capacity
 	RbQueueDone,           // guest readbacks on the copy engine: no GPU write of the bytes in flight
+	RbQueueInflight,       // checkpoint's in-flight readback diagnostics
+	RbQueueVerified,
+	RbQueueMismatch,
 	IndirectTables,        // indirect register tables / command buffers synchronized before parsing
 	DirectDraws,           // prepared draws recorded directly (not as a recording packet)
 	MeshDraws,             // ... of them, mesh-shader draws
@@ -210,7 +213,7 @@ inline constexpr const char* Names[Count] = {
     "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices", "buffer_registrations",
     "bda_rebuilds", "region_syncs", "region_skips", "bda_full_syncs", "bda_range_calls",
     "bda_ranges", "bda_range_mib", "protect_calls_gfx", "sync_reads_guest", "sync_reads_render",
-    "rb_reject_size", "rb_reject_backing", "rb_reject_image", "rb_reject_capacity", "rb_queue_done",
+    "rb_reject_size", "rb_reject_backing", "rb_reject_image", "rb_reject_capacity", "rb_queue_done", "rb_queue_inflight", "rb_queue_verified", "rb_queue_mismatch",
     "indirect_tables", "direct_draws", "mesh_draws", "backing_read_bytes", "backing_read_us",
     "xpr_tries", "xpr_hits", "xpr_miss_key", "xpr_miss_state", "xpr_miss_target",
     "xpr_miss_validate", "xpr_stores", "vblanks", "async_image_bytes", "backing_lock_waits",

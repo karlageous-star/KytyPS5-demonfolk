@@ -3078,6 +3078,7 @@ void BufferCache::ForwardCopy(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t s
 	}
 	LiveCounters::Add(LiveCounters::CopyForwards);
 	LiveCounters::Add(LiveCounters::CopyForwardBytes, size);
+}
 
 // Copies from this size on compare their pages on helper threads too (ParallelPages): below it, waking them costs about
 // what they would take off this thread.
