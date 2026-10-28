@@ -891,8 +891,7 @@ void TextureCache::NoteGuestAlias(const ImageInfo& requested, Image& kept) {
 
 // An image a write binding found: the guest-texture aliases at its address go (written, it no longer holds what they
 // read from the guest's bytes).
-void TextureCache::FreeGuestAliases(ImageId written) {
-	const auto                address = m_slot_images[written].info.data.address;
+void TextureCache::FreeGuestAliases(ImageId written, uint64_t address) {
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(address, 1, pages)) return;
 	ImageIds others;
@@ -4378,7 +4377,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool may_fai
 			}
 		}
 		if (m_guest_aliases != 0 && desc.type != BindingType::Texture) {
-			FreeGuestAliases(result);
+			const auto image_address = m_slot_images[result].info.data.address;
+			FreeGuestAliases(result, image_address);
+			// A write can resolve to an interior mip of a larger image. Guest aliases
+			// may have been registered at the requested mip's address instead.
+			if (desc.info.data.address != image_address) FreeGuestAliases(result, desc.info.data.address);
 		}
 		auto& image = m_slot_images[result];
 		if (desc.info.tile_mode == Prospero::TileMode::kDepth &&

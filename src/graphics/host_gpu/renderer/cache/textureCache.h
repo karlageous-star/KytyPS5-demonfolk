@@ -280,7 +280,7 @@ void                      DeleteImage(ImageId id, bool now = false);
 	[[nodiscard]] static bool GuestTexture(const Image& image);
 	[[nodiscard]] static bool GuestTextureRequest(BindingType type, const ImageInfo& info);
 	void                      NoteGuestAlias(const ImageInfo& requested, Image& kept);
-	void                      FreeGuestAliases(ImageId written);
+	void                      FreeGuestAliases(ImageId written, uint64_t address);
 	void                      ParkImage(ImageId id);
 	[[nodiscard]] ImageId     TakeParkedImage(const ImageInfo& info);
 	void                      FreeImage(ImageId id, const char* site = "");
